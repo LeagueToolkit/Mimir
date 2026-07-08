@@ -1,0 +1,21 @@
+[package]
+name = "ltk_mimir_cache"
+description = "Shared cache directory, manifest, versioned publishing, and update lock for League Toolkit .lhdb hash tables"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ltk_hashdb.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

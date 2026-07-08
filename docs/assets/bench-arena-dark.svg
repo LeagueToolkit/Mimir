@@ -1,0 +1,41 @@
+<svg width="720" height="190" viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg">
+<text x="0" y="4" dy="0.76em" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="11.290322580645162" opacity="1" fill="#E6EDF3" font-weight="bold">
+String-arena compression by layout
+</text>
+<text x="0" y="25" dy="0.76em" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#898781">
+game table arena, 162.5 MiB of raw paths · zstd level 19, 16 KiB seekable frames · lower is better
+</text>
+<text x="190" y="64" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+key-order arena
+</text>
+<rect x="200" y="56" width="372" height="16" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="572" cy="64" r="8" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="586" y="64" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+45.7 MiB
+</text>
+<text x="190" y="98" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+key-order + trained dict
+</text>
+<rect x="200" y="90" width="242" height="16" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="442" cy="98" r="8" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="456" y="98" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+30.0 MiB
+</text>
+<text x="190" y="132" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+solid stream (no seeking)
+</text>
+<rect x="200" y="124" width="137" height="16" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="337" cy="132" r="8" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="351" y="132" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+17.5 MiB
+</text>
+<text x="190" y="166" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+path-order arena (mimir)
+</text>
+<rect x="200" y="158" width="78" height="16" opacity="1" fill="#3987E5" stroke="none"/>
+<circle cx="278" cy="166" r="8" opacity="1" fill="#3987E5" stroke="none" stroke-width="1"/>
+<text x="292" y="166" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+10.4 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#44443F" stroke-width="1" points="200,52 200,178 "/>
+</svg>

@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/LeagueToolkit/mimir"
+authors = ["League Toolkit contributors"]
+
+[workspace.dependencies]
+# Internal crates (path-linked within this workspace)
+ltk_hashdb = { path = "crates/ltk_hashdb" }
+ltk_mimir_cache = { path = "crates/ltk_mimir_cache" }
+ltk_mimir_gen = { path = "crates/ltk_mimir_gen" }
+
+# Format / IO
+memmap2 = "0.9"
+zeekstd = "0.4"
+zstd = "0.13"
+bytemuck = { version = "1", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+
+# Errors / serde
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Cache / IO policy
+directories = "5"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# CLI
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+
+# Hunt engine
+rayon = "1"
+regex = "1"
+memchr = "2"
+
+# league-toolkit primitives
+ltk_hash = { git = "https://github.com/LeagueToolkit/league-toolkit" }
+ltk_wad = { git = "https://github.com/LeagueToolkit/league-toolkit" }
+ltk_meta = { git = "https://github.com/LeagueToolkit/league-toolkit" }
+
+# dev
+[workspace.dependencies.plotters]
+version = "0.3"
+default-features = false
+features = ["svg_backend"]
+
+[workspace.dependencies.proptest]
+version = "1"
+
+[workspace.dependencies.insta]
+version = "1"
+features = ["ron"]
+
+[workspace.dependencies.criterion]
+version = "0.5"
+
+[workspace.lints.clippy]
+# Keep in sync with the main league-toolkit workspace as it stabilizes.
+all = { level = "warn", priority = -1 }

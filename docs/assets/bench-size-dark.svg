@@ -1,0 +1,68 @@
+<svg width="720" height="240" viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg">
+<text x="0" y="4" dy="0.76em" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="11.290322580645162" opacity="1" fill="#E6EDF3" font-weight="bold">
+Disk footprint
+</text>
+<text x="0" y="25" dy="0.76em" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#898781">
+8 CommunityDragon tables, ~2.97 M entries · snapshot 2026-07-07 · lower is better
+</text>
+<text x="720" y="12" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+.hashdb (zstd)
+</text>
+<rect x="618" y="7" width="10" height="10" opacity="1" fill="#3987E5" stroke="none"/>
+<text x="602" y="12" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+hashes.*.txt
+</text>
+<rect x="512" y="7" width="10" height="10" opacity="1" fill="#898781" stroke="none"/>
+<text x="120" y="71" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+game
+</text>
+<rect x="130" y="56" width="429" height="14" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="559" cy="63" r="7" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="572" y="63" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+198.3 MiB
+</text>
+<rect x="130" y="72" width="77" height="14" opacity="1" fill="#3987E5" stroke="none"/>
+<circle cx="207" cy="79" r="7" opacity="1" fill="#3987E5" stroke="none" stroke-width="1"/>
+<text x="220" y="79" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+38.3 MiB (19%)
+</text>
+<text x="120" y="117" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+binentries
+</text>
+<rect x="130" y="102" width="54" height="14" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="184" cy="109" r="7" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="197" y="109" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+27.9 MiB
+</text>
+<rect x="130" y="118" width="5" height="14" opacity="1" fill="#3987E5" stroke="none"/>
+<circle cx="135" cy="125" r="7" opacity="1" fill="#3987E5" stroke="none" stroke-width="1"/>
+<text x="148" y="125" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+5.5 MiB (20%)
+</text>
+<text x="120" y="163" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+lcu
+</text>
+<rect x="130" y="148" width="28" height="14" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="158" cy="155" r="7" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="171" y="155" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+16.1 MiB
+</text>
+<rect x="130" y="164" width="5" height="14" opacity="1" fill="#3987E5" stroke="none"/>
+<text x="141" y="171" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+2.7 MiB (17%)
+</text>
+<text x="120" y="209" dy="0.5ex" text-anchor="end" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="9.67741935483871" opacity="1" fill="#C3C2B7">
+other (5 tables)
+</text>
+<rect x="130" y="194" width="31" height="14" opacity="1" fill="#898781" stroke="none"/>
+<circle cx="161" cy="201" r="7" opacity="1" fill="#898781" stroke="none" stroke-width="1"/>
+<text x="174" y="201" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+17.6 MiB
+</text>
+<rect x="130" y="210" width="5" height="14" opacity="1" fill="#3987E5" stroke="none"/>
+<circle cx="135" cy="217" r="7" opacity="1" fill="#3987E5" stroke="none" stroke-width="1"/>
+<text x="148" y="217" dy="0.5ex" text-anchor="start" font-family="-apple-system, &apos;Segoe UI&apos;, system-ui, sans-serif" font-size="8.870967741935484" opacity="1" fill="#C3C2B7">
+5.7 MiB (32%)
+</text>
+<polyline fill="none" opacity="1" stroke="#44443F" stroke-width="1" points="130,52 130,228 "/>
+</svg>

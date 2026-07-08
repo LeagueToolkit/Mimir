@@ -1,0 +1,69 @@
+//! Small filesystem helpers shared by the manifest and store: atomic replace,
+//! sibling temp paths, and streaming sha256.
+
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+/// A sibling temp path next to `path` (same directory / volume, so a subsequent
+/// rename is a cheap in-volume move). We append `.tmp` rather than replacing the
+/// extension so `manifest.json` → `manifest.json.tmp`, not `manifest.tmp`.
+pub fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Write `bytes` to `path` atomically: fill a sibling temp file, `fsync` it, then
+/// rename over the destination. `fs::rename` replaces an existing file on both POSIX
+/// and Windows (`MoveFileExW` with `REPLACE_EXISTING`), so readers see either the old
+/// or new file whole, never a partial write.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = tmp_sibling(path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Copy `src` into `dst` atomically (temp copy in `dst`'s directory + fsync + rename),
+/// so a partially copied table is never visible under its final versioned name.
+pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    let tmp = tmp_sibling(dst);
+    fs::copy(src, &tmp)?;
+    // Re-open for writing to fsync: on Windows `FlushFileBuffers` needs write access,
+    // so a read-only handle would fail with `ERROR_ACCESS_DENIED`.
+    fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, dst)
+}
+
+/// Streaming sha256 of a file, returned as lowercase hex.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}

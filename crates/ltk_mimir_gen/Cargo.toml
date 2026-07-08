@@ -1,0 +1,18 @@
+[package]
+name = "ltk_mimir_gen"
+description = "Hash-discovery (hunt) engine: derives new hash->path mappings from WAD/bin inputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ltk_hashdb.workspace = true
+ltk_meta.workspace = true
+ltk_wad.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

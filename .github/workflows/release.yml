@@ -1,0 +1,183 @@
+# Release publishing: build every `.lhdb` hash table + `manifest.json` from the
+# source data repo and upload them as GitHub release assets.
+#
+# The txt hash lists stay the canonical, mergeable source of truth in the
+# source repo - CommunityDragon/Data by default, overridable per
+# dispatch with any GitHub `owner/repo` or git URL that mirrors its
+# `hashes/lol/*.txt` layout. The binaries produced here are derived artifacts,
+# rebuilt from scratch each run and never committed anywhere. Only the latest
+# `hashes-*` release is kept - older ones are pruned after a successful publish,
+# since a superseded table set has no consumers (`releases/latest` is the stable
+# download URL) and the txt history already lives in the data repo.
+name: Release tables
+
+on:
+  schedule:
+    # Weekly; the run exits early when the source inputs are unchanged.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label (default: today, UTC, YYYY-MM-DD)'
+        required: false
+        type: string
+      source_repo:
+        description: 'Hash-list source: GitHub owner/repo or a git URL (layout: hashes/lol/*.txt)'
+        required: false
+        type: string
+        default: 'CommunityDragon/Data'
+      force:
+        description: 'Publish even if the source inputs are unchanged (e.g. after a builder change)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-tables
+  cancel-in-progress: false
+
+jobs:
+  tables:
+    runs-on: ubuntu-latest
+    steps:
+      # Scheduled runs have no inputs, so the default is re-applied here.
+      - name: Resolve source repo
+        id: source
+        env:
+          INPUT_REPO: ${{ inputs.source_repo }}
+        run: |
+          repo="${INPUT_REPO:-CommunityDragon/Data}"
+          case "$repo" in
+            *://*|*@*) url="$repo" ;;
+            *)         url="https://github.com/$repo.git" ;;
+          esac
+          sha=$(git ls-remote "$url" HEAD | cut -f1)
+          test -n "$sha"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Fingerprint-skip: the latest release's manifest records the source repo and
+      # commit it was built from; both unchanged means identical inputs.
+      - name: Compare against the latest release
+        id: fingerprint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern manifest.json \
+            --output prev-manifest.json 2>/dev/null || true
+          prev_repo=$(jq -r '.source.repo // empty' prev-manifest.json 2>/dev/null || true)
+          prev_commit=$(jq -r '.source.commit // empty' prev-manifest.json 2>/dev/null || true)
+          echo "latest release: ${prev_repo:-none}@${prev_commit:-none}; upstream: ${{ steps.source.outputs.repo }}@${{ steps.source.outputs.sha }}"
+          if [ "$prev_repo" = "${{ steps.source.outputs.repo }}" ] \
+             && [ "$prev_commit" = "${{ steps.source.outputs.sha }}" ] \
+             && [ "$FORCE" != "true" ]; then
+            echo "inputs unchanged - nothing to publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out mimir
+        if: steps.fingerprint.outputs.changed == 'true'
+        uses: actions/checkout@v4
+
+      # A manual sparse clone rather than actions/checkout so arbitrary git URLs
+      # work, not just GitHub repos. The commit actually checked out is the one
+      # recorded as provenance (it can trail the ls-remote sha by a push race).
+      - name: Fetch hash lists
+        if: steps.fingerprint.outputs.changed == 'true'
+        id: data
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            "${{ steps.source.outputs.url }}" source-data
+          git -C source-data sparse-checkout set hashes/lol
+          sha=$(git -C source-data rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: steps.fingerprint.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.fingerprint.outputs.changed == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mimir
+        if: steps.fingerprint.outputs.changed == 'true'
+        run: cargo build --release -p ltk_mimir_cli
+
+      - name: Build tables
+        if: steps.fingerprint.outputs.changed == 'true'
+        id: build
+        run: |
+          version="${{ inputs.version }}"
+          version="${version:-$(date -u +%F)}"
+          target/release/mimir publish \
+            --inputs source-data/hashes/lol \
+            --out dist \
+            --version "$version" \
+            --source-repo "${{ steps.source.outputs.repo }}" \
+            --source-commit "${{ steps.data.outputs.sha }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Full checksum + structure pass over every published table before upload.
+      - name: Verify tables
+        if: steps.fingerprint.outputs.changed == 'true'
+        run: |
+          for f in dist/*.lhdb; do
+            target/release/mimir verify "$f"
+          done
+
+      - name: Create release
+        if: steps.fingerprint.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo='${{ steps.source.outputs.repo }}'
+          sha='${{ steps.data.outputs.sha }}'
+          version='${{ steps.build.outputs.version }}'
+          tag="hashes-$version"
+          if [[ "$repo" != *://* && "$repo" != *@* ]]; then
+            src="[\`$repo@${sha:0:12}\`](https://github.com/$repo/tree/$sha/hashes/lol)"
+          else
+            src="\`$repo@${sha:0:12}\`"
+          fi
+          {
+            echo "League of Legends hash tables in the seekable \`.lhdb\` format, built from $src."
+            echo
+            echo "\`manifest.json\` carries the sha256, entry count, and key width of each table."
+            echo
+            echo "| table | entries | file |"
+            echo "|---|--:|---|"
+            jq -r '.tables | to_entries[] | "| \(.key) | \(.value.entries) | \(.value.file) |"' dist/manifest.json
+          } > notes.md
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Same-day re-run (e.g. --force): replace the existing assets in place.
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "Hash tables $version" --notes-file notes.md
+          fi
+
+      # Superseded table sets have no consumers, so keep only the release that was
+      # just published. Scoped to the `hashes-` prefix so unrelated releases (e.g.
+      # of the mimir binary itself) are never touched.
+      - name: Prune old releases
+        if: steps.fingerprint.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="hashes-${{ steps.build.outputs.version }}"
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName --jq '.[].tagName' \
+            | grep '^hashes-' | grep -Fxv "$tag" \
+            | while read -r old; do
+                echo "pruning $old"
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done

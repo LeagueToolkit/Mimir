@@ -1,0 +1,31 @@
+[package]
+name = "ltk_hashdb"
+description = "The .hashdb binary format: an mmap-backed read-only integer-keyed string table (reader + streaming writer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ltk_hash.workspace = true
+memmap2.workspace = true
+zeekstd.workspace = true
+zstd.workspace = true
+xxhash-rust.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+plotters.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+proptest.workspace = true
+insta.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "real"
+harness = false
+
+[lints]
+workspace = true

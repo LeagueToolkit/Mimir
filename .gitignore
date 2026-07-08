@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local hash inputs / build artifacts
+/tmp
+/scratch
+/data
+*.hashdb
+*.lhdb
+!docs/**/*.hashdb
+!docs/**/*.lhdb
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

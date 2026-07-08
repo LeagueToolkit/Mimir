@@ -1,0 +1,28 @@
+[package]
+name = "ltk_mimir_cli"
+description = "The `mimir` command-line tool: build / get / update / gen / merge / publish / verify / stats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mimir"
+path = "src/main.rs"
+
+[dependencies]
+ltk_hashdb.workspace = true
+ltk_mimir_cache.workspace = true
+ltk_mimir_gen.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+zstd.workspace = true
+indicatif.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

@@ -33,10 +33,13 @@ Docs live in `docs/`: `FORMAT.md` (byte-level spec, format version 1), `CONSUMER
 
 - **Dependencies are workspace-wide.** Add crates to `[workspace.dependencies]` in the root
   `Cargo.toml` and reference them as `foo.workspace = true` in the crate. Same for
-  package metadata (`version.workspace = true`, etc.) and `[lints] workspace = true`.
+  package metadata (`edition.workspace = true`, etc.) and `[lints] workspace = true` —
+  except `version`, which is per-crate so release-plz can bump published crates
+  independently (see `release-plz.toml`; unpublished crates sit at `0.0.0` with
+  `publish = false`).
 - **Lints are strict.** CI runs `cargo clippy --all-targets -- -D warnings` and
   `cargo fmt --all -- --check`. Keep both green; warnings fail the build.
-- **`league-toolkit` crates** (`ltk_hash`, `ltk_wad`, `ltk_meta`) are git deps.
+- **`league-toolkit` crates** (`ltk_hash`, `ltk_wad`, `ltk_meta`) come from crates.io.
   `ltk_ritobin` deliberately stays out (text-format parsing / hashtable name resolution,
   which nothing here needs).
 - Little-endian only; the format targets x86-64 / aarch64.

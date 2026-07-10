@@ -1,0 +1,40 @@
+# Crate releases via release-plz (https://release-plz.dev).
+#
+# ltk_hashdb and ltk_mimir_cache are published to crates.io; the gen crate and
+# the CLI stay unpublished for now. Table releases (`hashes-*`) are a separate
+# pipeline in .github/workflows/release.yml and use a disjoint tag namespace.
+
+[workspace]
+# Opt-in per package: everything is skipped unless listed below.
+release = false
+release_always = false
+# Per-crate changelogs (release-plz's default: crates/<name>/CHANGELOG.md).
+# Deliberately NOT consolidated into one root file via `changelog_path`.
+changelog_update = true
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "{{ package }}-v{{ version }}"
+git_release_name = "{{ package }} v{{ version }}"
+git_release_body = "{{ changelog }}"
+pr_labels = ["release"]
+
+[[package]]
+name = "ltk_hashdb"
+release = true
+publish = true
+
+[[package]]
+name = "ltk_mimir_cache"
+release = true
+publish = true
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""

@@ -1,7 +1,9 @@
 [package]
 name = "ltk_mimir_gen"
 description = "Hash-discovery (hunt) engine: derives new hash->path mappings from WAD/bin inputs"
-version.workspace = true
+# Not on crates.io for now.
+version = "0.0.0"
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

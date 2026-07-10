@@ -1,7 +1,9 @@
 [package]
 name = "ltk_mimir_cli"
 description = "The `mimir` command-line tool: build / get / update / gen / merge / publish / verify / stats"
-version.workspace = true
+# Not on crates.io for now; the lib crates are the public API.
+version = "0.0.0"
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

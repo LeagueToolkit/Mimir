@@ -3,16 +3,16 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LeagueToolkit/mimir"
 authors = ["League Toolkit contributors"]
 
 [workspace.dependencies]
-# Internal crates (path-linked within this workspace)
-ltk_hashdb = { path = "crates/ltk_hashdb" }
-ltk_mimir_cache = { path = "crates/ltk_mimir_cache" }
+# Internal crates (path-linked within this workspace; the published ones also
+# carry a version so `cargo publish` can resolve them - release-plz keeps it bumped)
+ltk_hashdb = { path = "crates/ltk_hashdb", version = "0.1.0" }
+ltk_mimir_cache = { path = "crates/ltk_mimir_cache", version = "0.1.0" }
 ltk_mimir_gen = { path = "crates/ltk_mimir_gen" }
 
 # Format / IO
@@ -44,9 +44,9 @@ regex = "1"
 memchr = "2"
 
 # league-toolkit primitives
-ltk_hash = { git = "https://github.com/LeagueToolkit/league-toolkit" }
-ltk_wad = { git = "https://github.com/LeagueToolkit/league-toolkit" }
-ltk_meta = { git = "https://github.com/LeagueToolkit/league-toolkit" }
+ltk_hash = "0.3"
+ltk_wad = "0.3"
+ltk_meta = "0.6"
 
 # dev
 [workspace.dependencies.plotters]

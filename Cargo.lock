@@ -1041,7 +1041,8 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "ltk_file"
 version = "0.2.9"
-source = "git+https://github.com/LeagueToolkit/league-toolkit#ba130d1fec2e1d21e2f9bad4b35b093fda7713dc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e1fecb09d18694be47efe5175c6ad5a4ec460ddeca28d42b746d9e8c5a6dd03"
 dependencies = [
  "strum",
 ]
@@ -1049,7 +1050,8 @@ dependencies = [
 [[package]]
 name = "ltk_hash"
 version = "0.3.0"
-source = "git+https://github.com/LeagueToolkit/league-toolkit#ba130d1fec2e1d21e2f9bad4b35b093fda7713dc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e083c3c9f859736f07749024a8881029ba02ef012052f98c12e8186fbfbaa8d"
 dependencies = [
  "byteorder",
  "xxhash-rust",
@@ -1057,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "ltk_hashdb"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "insta",
@@ -1076,7 +1078,8 @@ dependencies = [
 [[package]]
 name = "ltk_io_ext"
 version = "0.4.3"
-source = "git+https://github.com/LeagueToolkit/league-toolkit#ba130d1fec2e1d21e2f9bad4b35b093fda7713dc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9128aaf622ca1b7c701f4dd59be83fc9639fa21b9655ea22a950d579965da8f9"
 dependencies = [
  "byteorder",
  "glam",
@@ -1087,7 +1090,8 @@ dependencies = [
 [[package]]
 name = "ltk_meta"
 version = "0.6.0"
-source = "git+https://github.com/LeagueToolkit/league-toolkit#ba130d1fec2e1d21e2f9bad4b35b093fda7713dc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63c651a6b15ae7159778f9547e34cba3392ae86c526e2573c028af766cfa239d"
 dependencies = [
  "byteorder",
  "enum_dispatch",
@@ -1105,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "ltk_mimir_cache"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "directories",
  "ltk_hashdb",
@@ -1147,7 +1151,8 @@ dependencies = [
 [[package]]
 name = "ltk_primitives"
 version = "0.3.4"
-source = "git+https://github.com/LeagueToolkit/league-toolkit#ba130d1fec2e1d21e2f9bad4b35b093fda7713dc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37faa171fd5f1776edf03445c1a7e46569960f112a82a230bd96952705d7313e"
 dependencies = [
  "byteorder",
  "glam",
@@ -1157,7 +1162,8 @@ dependencies = [
 [[package]]
 name = "ltk_wad"
 version = "0.3.0"
-source = "git+https://github.com/LeagueToolkit/league-toolkit#ba130d1fec2e1d21e2f9bad4b35b093fda7713dc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e59f7c0175b44280892d929ac9e8890beaa1df91c4f2d76f2a902a1e303663a2"
 dependencies = [
  "byteorder",
  "camino",

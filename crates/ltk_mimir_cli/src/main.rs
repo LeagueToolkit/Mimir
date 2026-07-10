@@ -3,8 +3,6 @@
 
 mod merge;
 mod publish;
-#[cfg(test)]
-mod testutil;
 mod update;
 
 use std::collections::HashSet;

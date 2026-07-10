@@ -49,6 +49,8 @@ ltk_wad = "0.3"
 ltk_meta = "0.6"
 
 # dev
+tempfile = "3"
+
 [workspace.dependencies.plotters]
 version = "0.3"
 default-features = false

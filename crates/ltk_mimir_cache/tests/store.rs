@@ -3,39 +3,12 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ltk_hashdb::{Compression, HashDbWriter, KeyWidth};
 use ltk_mimir_cache::{HashStore, PublishItem, Table};
-
-/// A self-cleaning unique temp directory (avoids a `tempfile` dependency).
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "mimir-cache-test-{}-{}-{}",
-            std::process::id(),
-            tag,
-            n
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use tempfile::tempdir;
 
 /// Build a raw `.lhdb` at `path` from `entries`, returning the path.
 fn build_table(path: &Path, entries: &[(u64, &str)]) -> PathBuf {
@@ -55,7 +28,7 @@ const ENTRIES: &[(u64, &str)] = &[
 
 #[test]
 fn publish_open_roundtrip() {
-    let tmp = TempDir::new("roundtrip");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
     let src = build_table(&tmp.path().join("game-build.lhdb"), ENTRIES);
@@ -84,7 +57,7 @@ fn publish_open_roundtrip() {
 
 #[test]
 fn publish_new_version_supersedes_and_gc_reclaims() {
-    let tmp = TempDir::new("gc");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
     let v1 = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);
@@ -116,7 +89,7 @@ fn publish_new_version_supersedes_and_gc_reclaims() {
 
 #[test]
 fn gc_without_manifest_is_a_noop() {
-    let tmp = TempDir::new("gc-empty");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
     let report = store.gc().unwrap();
     assert!(report.deleted.is_empty());
@@ -125,7 +98,7 @@ fn gc_without_manifest_is_a_noop() {
 
 #[test]
 fn open_missing_manifest_and_table_error() {
-    let tmp = TempDir::new("missing");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
     // No manifest yet.
@@ -147,7 +120,7 @@ fn open_missing_manifest_and_table_error() {
 
 #[test]
 fn update_lock_is_exclusive_then_reacquirable() {
-    let tmp = TempDir::new("lock");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
     let held = store.try_lock_update().unwrap();
@@ -168,7 +141,7 @@ fn update_lock_is_exclusive_then_reacquirable() {
 
 #[test]
 fn invalid_version_is_rejected() {
-    let tmp = TempDir::new("badver");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
     let src = build_table(&tmp.path().join("g.lhdb"), ENTRIES);
 
@@ -186,7 +159,7 @@ fn invalid_version_is_rejected() {
 /// readers must never observe a torn manifest or a missing file.
 #[test]
 fn readers_never_break_during_publish() {
-    let tmp = TempDir::new("concurrency");
+    let tmp = tempdir().unwrap();
     let store = Arc::new(HashStore::at(tmp.path()));
 
     // Seed an initial version so readers have something to open immediately.
@@ -242,7 +215,7 @@ fn readers_never_break_during_publish() {
 /// working and the active version opens.
 #[test]
 fn gc_handles_mapped_superseded_file() {
-    let tmp = TempDir::new("mapped");
+    let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
     let v1 = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);

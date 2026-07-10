@@ -69,7 +69,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use crate::testutil::TempDir;
+    use tempfile::{tempdir, TempDir};
 
     fn write_lines(path: &Path, lines: &[&str]) {
         fs::write(path, lines.join("\n") + "\n").unwrap();
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn merges_sorted_and_deduped() {
-        let tmp = TempDir::new("merge-basic");
+        let tmp = tempdir().unwrap();
         let out = merged(
             &tmp,
             &[
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn keeps_conflicting_paths_for_the_same_hash() {
-        let tmp = TempDir::new("merge-conflict");
+        let tmp = tempdir().unwrap();
         let out = merged(
             &tmp,
             &["00000000000011aa assets/foo.bin"],
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn preserves_hash_width_and_trailing_spaces() {
-        let tmp = TempDir::new("merge-width");
+        let tmp = tempdir().unwrap();
         // A u32-table list (8-hex-digit hashes) with a path that legitimately
         // ends in a space; only the line terminator may be stripped.
         let out = merged(&tmp, &["811c9dc5 ", "16b3b962 Seed "], &[]);

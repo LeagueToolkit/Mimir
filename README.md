@@ -102,7 +102,7 @@ zstd stream - while making hits faster and directory-local batches frame-coheren
 | Crate | Role |
 |-------|------|
 | `ltk_hashdb`        | The `.hashdb` format: `mmap` reader (`HashDb`) + streaming writer |
-| `ltk_mimir_cache`  | Shared cache dir, manifest, versioned publish, update lock, GC |
+| `ltk_mimir_cache`  | Shared cache dir, manifest, versioned publish, update lock, GC, in-process updater |
 | `ltk_mimir_gen`    | Hash-discovery ("hunt") engine for still-unknown hashes |
 | `ltk_mimir_cli`    | The `mimir` binary |
 

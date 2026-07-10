@@ -4,6 +4,8 @@
 //! - Resolves the cache directory (env → CDragon → platform dir)
 //! - Reads the manifest and opens the active table file read-only
 //! - Publishes new versions atomically under a single-updater lock with lazy GC
+//! - Updates the cache in-process from a published release, through a
+//!   caller-supplied fetcher ([`HashStore::update`])
 
 mod dir;
 mod error;
@@ -11,11 +13,13 @@ mod fsutil;
 mod lock;
 mod manifest;
 mod store;
+mod update;
 
 pub use error::{Error, Result};
 pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{GcReport, HashStore, PublishItem};
+pub use update::{Fetch, FetchError, UpdateOptions, UpdateOutcome, UpdateReport};
 
 /// The logical hash tables, each stored as its own `.lhdb` file.
 ///

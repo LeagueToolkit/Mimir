@@ -10,6 +10,7 @@ The CLI is covered [at the end](#the-cli).
 | You want to… | Depend on |
 |---|---|
 | Resolve hashes against the machine-shared League tables (the common case) | `ltk_mimir_cache` (+ `ltk_hashdb` for the `HashDb` type it hands back) |
+| Keep that shared cache up to date from your app (no CLI) | `ltk_mimir_cache` - `HashStore::update` + your HTTP client |
 | Open a specific `.hashdb`/`.lhdb` file, or bytes you embedded/downloaded yourself | `ltk_hashdb` |
 | Build your own tables (the format is general-purpose: any `u64 → str` map) | `ltk_hashdb` (writer) |
 | Brute-force unknown hashes back into paths | `ltk_mimir_gen` |
@@ -169,45 +170,72 @@ immutable `<table>-<version>.lhdb` plus the `manifest.json` describing them
 (per-table filename, sha256, entry count, key width, and input provenance).
 `releases/latest/download/manifest.json` is the stable URL for the current set.
 
-> `mimir update` does exactly this - download, compare, verify, install - and is the
-> right tool for cron jobs and setup scripts. Library consumers that want the same
-> behavior in-process drive the primitives below with their own HTTP client (the cache
-> crate deliberately doesn't ship one). **Readers need none of this** - they just `open`.
-
-An updater loop looks like:
+The whole loop - fetch the remote manifest, keep every table whose sha256 already
+matches, download and checksum-verify the rest, install atomically, GC superseded
+versions, all under the single-updater lock - is `HashStore::update`. The one thing
+you bring is the transport: the cache crate deliberately ships no HTTP client, so you
+hand it a `Fetch` (any closure from asset filename to bytes) backed by whatever client
+your app already has:
 
 ```rust
-use ltk_mimir_cache::{HashStore, PublishItem, Source, Table};
+use ltk_mimir_cache::{FetchError, HashStore, UpdateOptions, UpdateOutcome};
 
 let store = HashStore::discover()?;
+let fetch = |filename: &str| -> Result<Vec<u8>, FetchError> {
+    let url = format!(
+        "https://github.com/LeagueToolkit/mimir/releases/latest/download/{filename}"
+    );
+    Ok(my_http_get(&url)?)   // reqwest, ureq, curl - your choice
+};
 
-// 1. Become the single updater, or leave it to whoever already is.
-let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
-
-// 2. Fetch the remote manifest; compare per-table sha256 against the local one
-//    (a missing local manifest means "install everything").
-// 3. Download changed tables to temp files and check each sha256.
-
-// 4. Install atomically: files are copied durable first, the manifest pointer
-//    swaps last, so a concurrent reader never sees a half-written table.
-store.publish(
-    &[PublishItem::new(Table::Game, "2026-07-10", tmp_game_path)],
-    Some(Source { repo: Some("CommunityDragon/Data".into()), commit, inputs_sha256 }),
-)?;
-
-// 5. Clean up superseded versions. Files still mapped by a reader are skipped
-//    (reported in `retained`) and retried on a later run - never an error.
-let report = store.gc()?;
+match store.update(&fetch, UpdateOptions::default())? {
+    UpdateOutcome::Locked => {}     // another process is updating; leave it to them
+    UpdateOutcome::Completed(report) => {
+        if report.is_up_to_date() { /* nothing changed */ }
+        for table in &report.installed { /* log the refresh */ }
+    }
+}
 ```
+
+> `mimir update` is exactly this call plus a reqwest-backed `Fetch` - still the right
+> tool for cron jobs and setup scripts. **Readers need none of this** - they just `open`.
 
 Semantics worth relying on:
 
 - **Immutability.** A published `.lhdb` is never modified; updates are new files under
   new names. Concurrent readers keep their mapping until they reopen.
 - **Crash safety.** Both the table copy and the manifest write go through
-  temp-file + fsync + atomic rename; a torn update leaves the old manifest intact.
-- **Single updater, many readers.** `try_lock_update` is a cross-process try-lock;
-  readers never take it.
+  temp-file + fsync + atomic rename; a torn update (or a failed download / checksum
+  mismatch, which errors before anything installs) leaves the old manifest intact.
+- **Single updater, many readers.** The update runs under a cross-process try-lock;
+  a `Locked` outcome means someone else is already on it. Readers never take the lock.
+- **Forward compatibility.** Tables in the remote manifest this build doesn't know are
+  skipped and reported in `report.unknown_tables`, never fatal.
+
+### Custom pipelines: the primitives
+
+`update` is built from public pieces you can drive yourself when your flow differs -
+installing tables you built locally instead of downloading, custom retention, etc.:
+
+```rust
+use ltk_mimir_cache::{HashStore, PublishItem, Source, Table};
+
+let store = HashStore::discover()?;
+
+// Become the single updater, or leave it to whoever already is.
+let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
+
+// Install atomically: files are copied durable first, the manifest pointer
+// swaps last, so a concurrent reader never sees a half-written table.
+store.publish(
+    &[PublishItem::new(Table::Game, "2026-07-10", built_game_path)],
+    Some(Source { repo: Some("CommunityDragon/Data".into()), commit, inputs_sha256 }),
+)?;
+
+// Clean up superseded versions. Files still mapped by a reader are skipped
+// (reported in `retained`) and retried on a later run - never an error.
+let report = store.gc()?;
+```
 
 ### Verifying a table
 

@@ -44,6 +44,11 @@ pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     fs::rename(&tmp, dst)
 }
 
+/// sha256 of an in-memory buffer, returned as lowercase hex.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
 /// Streaming sha256 of a file, returned as lowercase hex.
 pub fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;

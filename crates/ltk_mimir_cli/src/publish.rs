@@ -295,7 +295,7 @@ mod tests {
     use ltk_hashdb::HashDb;
     use ltk_mimir_cache::Manifest;
 
-    use crate::testutil::TempDir;
+    use tempfile::{tempdir, TempDir};
 
     fn options(tmp: &TempDir) -> Options {
         Options {
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn publishes_present_tables_with_manifest() {
-        let tmp = TempDir::new("ok");
+        let tmp = tempdir().unwrap();
         let opts = options(&tmp);
         // Game arrives as split parts, lcu as a single file; the rest are absent.
         write_input(
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn missing_inputs_fail_without_allow_missing() {
-        let tmp = TempDir::new("missing");
+        let tmp = tempdir().unwrap();
         let mut opts = options(&tmp);
         opts.allow_missing = false;
         write_input(
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn refuses_a_stale_staging_dir() {
-        let tmp = TempDir::new("stale");
+        let tmp = tempdir().unwrap();
         let opts = options(&tmp);
         write_input(
             &opts.inputs,

@@ -33,4 +33,21 @@ pub enum Error {
 
     #[error("invalid version label {0:?}: must be non-empty and free of path separators")]
     InvalidVersion(String),
+
+    #[error("fetching {file}")]
+    Fetch {
+        file: String,
+        #[source]
+        source: crate::FetchError,
+    },
+
+    #[error("{file}: sha256 mismatch (manifest {expected}, downloaded {actual})")]
+    ChecksumMismatch {
+        file: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("table {id}: malformed filename {file:?} in the remote manifest")]
+    BadRemoteFilename { id: String, file: String },
 }

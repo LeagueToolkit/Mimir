@@ -9,7 +9,7 @@ use crate::manifest::{Manifest, Source, TableEntry};
 use crate::{dir, fsutil, Error, Result, Table, UpdateLock};
 
 /// The manifest filename inside the cache directory.
-const MANIFEST_FILE: &str = "manifest.json";
+pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 /// The single-updater lock filename.
 const UPDATE_LOCK_FILE: &str = ".update.lock";
 /// Extension for published table files (League Toolkit convention).

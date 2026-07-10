@@ -4,8 +4,10 @@ use std::io::{Seek, Write};
 
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::header::{Header, OffsetWidth, FLAG_ARENA_COMPRESSED, HEADER_SIZE};
-use crate::{Compression, Error, HashKind, KeyWidth, Result};
+use crate::header::{
+    Header, OffsetWidth, FLAG_ARENA_COMPRESSED, FLAG_CASE_INSENSITIVE, HEADER_SIZE,
+};
+use crate::{Casing, Compression, Error, HashKind, KeyWidth, Result};
 
 /// Collects `(key, path)` pairs, then [`HashDbWriter::build`] sorts by key, dedups,
 /// assigns arena offsets, and writes the file.
@@ -13,6 +15,7 @@ pub struct HashDbWriter {
     key_width: KeyWidth,
     compression: Compression,
     hash_kind: HashKind,
+    casing: Casing,
     entries: Vec<(u64, Box<str>)>,
 }
 
@@ -31,6 +34,7 @@ impl HashDbWriter {
             key_width,
             compression,
             hash_kind: HashKind::Unspecified,
+            casing: Casing::Sensitive,
             entries: Vec::new(),
         }
     }
@@ -39,6 +43,13 @@ impl HashDbWriter {
     /// paths via `HashDb::hash_path`.
     pub fn hash_kind(mut self, kind: HashKind) -> Self {
         self.hash_kind = kind;
+        self
+    }
+
+    /// Record whether the keys hash the lowercased path ([`Casing::Insensitive`],
+    /// all League tables) or the path as given. Defaults to [`Casing::Sensitive`].
+    pub fn casing(mut self, casing: Casing) -> Self {
+        self.casing = casing;
         self
     }
 
@@ -123,7 +134,7 @@ impl HashDbWriter {
         }
 
         // The arena as stored: raw, or a zeekstd seekable stream decompressing to it.
-        let (stored_arena, flags) = match self.compression {
+        let (stored_arena, mut flags) = match self.compression {
             Compression::None => (arena, 0),
             Compression::Zeekstd { frame_size, level } => {
                 if frame_size == 0 {
@@ -139,6 +150,9 @@ impl HashDbWriter {
                 (compressed, FLAG_ARENA_COMPRESSED)
             }
         };
+        if self.casing == Casing::Insensitive {
+            flags |= FLAG_CASE_INSENSITIVE;
+        }
 
         // Section offsets. The offsets section is padded to its own width; that only
         // bites when a u32-key table has an odd entry count and spills to u64 offsets.
@@ -155,10 +169,10 @@ impl HashDbWriter {
         hasher.update(&stored_arena);
 
         let header = Header {
-            key_width: self.key_width,
-            flags,
-            offset_width,
             hash_kind: self.hash_kind,
+            flags,
+            key_width: self.key_width,
+            offset_width,
             entry_count: self.entries.len() as u64,
             keys_offset,
             offsets_offset,

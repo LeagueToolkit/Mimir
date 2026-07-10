@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use ltk_hashdb::{HashKind, KeyWidth};
+use ltk_hashdb::{Casing, HashKind, KeyWidth};
 
 use crate::guessers::util::champ_of;
 use crate::UnknownSet;
@@ -51,6 +51,7 @@ const BUILTIN_EXTENSIONS: &[&str] = &[
 /// resolve hashes.
 pub struct GuessContext {
     hash_kind: HashKind,
+    casing: Casing,
     key_width: KeyWidth,
     known: Vec<Box<str>>,
     unknown: UnknownSet,
@@ -61,9 +62,10 @@ pub struct GuessContext {
 }
 
 impl GuessContext {
-    pub fn new(hash_kind: HashKind, key_width: KeyWidth) -> Self {
+    pub fn new(hash_kind: HashKind, casing: Casing, key_width: KeyWidth) -> Self {
         Self {
             hash_kind,
+            casing,
             key_width,
             known: Vec::new(),
             unknown: UnknownSet::new(Vec::new()),
@@ -99,6 +101,10 @@ impl GuessContext {
         self.hash_kind
     }
 
+    pub fn casing(&self) -> Casing {
+        self.casing
+    }
+
     pub fn key_width(&self) -> KeyWidth {
         self.key_width
     }
@@ -111,9 +117,9 @@ impl GuessContext {
         &self.unknown
     }
 
-    /// Hash a candidate with this table's algorithm.
+    /// Hash a candidate with this table's algorithm and casing rule.
     pub fn hash_candidate(&self, candidate: &str) -> u64 {
-        self.hash_kind.hash(candidate, self.key_width)
+        self.hash_kind.hash(candidate, self.casing, self.key_width)
     }
 
     /// Vocabulary mined from the known corpus: path segments split on
@@ -199,6 +205,7 @@ impl GuessContext {
 /// the unknown set, and collects hits. Shared across rayon threads.
 pub struct CandidateSink<'a> {
     hash_kind: HashKind,
+    casing: Casing,
     key_width: KeyWidth,
     unknown: &'a UnknownSet,
     tried: AtomicU64,
@@ -209,6 +216,7 @@ impl<'a> CandidateSink<'a> {
     pub fn new(ctx: &'a GuessContext) -> Self {
         Self {
             hash_kind: ctx.hash_kind,
+            casing: ctx.casing,
             key_width: ctx.key_width,
             unknown: &ctx.unknown,
             tried: AtomicU64::new(0),
@@ -220,7 +228,7 @@ impl<'a> CandidateSink<'a> {
     pub fn check(&self, candidate: &str) {
         self.tried.fetch_add(1, Ordering::Relaxed);
 
-        let hash = self.hash_kind.hash(candidate, self.key_width);
+        let hash = self.hash_kind.hash(candidate, self.casing, self.key_width);
         if !self.unknown.contains(hash) {
             return;
         }

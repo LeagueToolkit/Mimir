@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use ltk_hashdb::{Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
 use ltk_mimir_cache::{HashStore, Table as CacheTable};
 use ltk_mimir_gen::guessers::{
     CharacterSkin, CrossReference, ExtensionSwap, NumericRange, PrefixVariants, RegionLocale,
@@ -52,10 +52,15 @@ impl Table {
 
     fn hash_kind(self) -> HashKind {
         match self {
-            Self::Game | Self::Lcu | Self::Rst => HashKind::Xxh64Lower,
-            Self::RstXxh3 => HashKind::Xxh3Lower,
-            _ => HashKind::Fnv1a32Lower,
+            Self::Game | Self::Lcu | Self::Rst => HashKind::Xxh64,
+            Self::RstXxh3 => HashKind::Xxh3,
+            _ => HashKind::Fnv1a32,
         }
+    }
+
+    /// Every League table hashes the lowercased path.
+    fn casing(self) -> Casing {
+        Casing::Insensitive
     }
 
     /// The corresponding shared-cache table.
@@ -344,7 +349,9 @@ fn read_hash_lines(input: &Path, mut on_entry: impl FnMut(u64, &str, &str)) -> R
 }
 
 fn build(input: PathBuf, table: Table, out: PathBuf, compression: Compression) -> Result<()> {
-    let mut writer = HashDbWriter::new(table.key_width(), compression).hash_kind(table.hash_kind());
+    let mut writer = HashDbWriter::new(table.key_width(), compression)
+        .hash_kind(table.hash_kind())
+        .casing(table.casing());
     read_hash_lines(&input, |hash, _, path| {
         writer.insert(hash, path);
     })?;
@@ -375,7 +382,7 @@ fn gen_hashes(
     max_skin: u32,
     out: PathBuf,
 ) -> Result<()> {
-    let mut ctx = GuessContext::new(table.hash_kind(), table.key_width());
+    let mut ctx = GuessContext::new(table.hash_kind(), table.casing(), table.key_width());
     let mut known_hashes = HashSet::new();
     for input in &known {
         let mut paths = Vec::new();
@@ -562,6 +569,7 @@ fn stats(file: PathBuf) -> Result<()> {
     println!("entries:    {}", db.len());
     println!("key width:  {} bytes", db.key_width().bytes());
     println!("hash kind:  {:?}", db.hash_kind());
+    println!("casing:     {:?}", db.casing());
     println!(
         "arena:      {} B raw, {} B on disk ({})",
         db.arena_decompressed_size(),

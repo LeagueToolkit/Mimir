@@ -41,10 +41,10 @@ stored once).
 |--------|-------|------|-------|
 | 0 | `magic` | `[u8;8]` | `b"HASHDB\0\0"` |
 | 8 | `version` | `u16` | currently `1` |
-| 10 | `key_width` | `u8` | 4 = u32 table, 8 = u64 table |
-| 11 | `flags` | `u8` | bit0: `arena_compressed`; other bits must be 0 |
-| 12 | `off/cset_width` | `u8` | 4 or 8; the writer picks 4 while `arena_decompressed_size` fits in a u32, else 8; the reader honors whatever is declared |
-| 13 | `hash_kind` | `u8` | algorithm that produced the keys, see below |
+| 10 | `hash_kind` | `u8` | algorithm that produced the keys, see below |
+| 11 | `flags` | `u8` | bit0: `arena_compressed`; bit1: `case_insensitive` (see below); other bits must be 0 |
+| 12 | `key_width` | `u8` | 4 = u32 table, 8 = u64 table |
+| 13 | `offset_width` | `u8` | 4 or 8; the writer picks 4 while `arena_decompressed_size` fits in a u32, else 8; the reader honors whatever is declared |
 | 14 | reserved | `[u8;2]` | written as zero, ignored on read |
 | 16 | `entry_count` | `u64` | |
 | 24 | `keys_offset` | `u64` | file offset of the keys section; writers must 8-align it (the reference writer emits 80), readers bounds-check and honor the declared value |
@@ -60,16 +60,39 @@ The lengths section has no header field: it sits immediately after the offsets, 
 
 ### `hash_kind`
 
+The algorithm alone - the casing rule is recorded separately in the
+`case_insensitive` flag, so non-League consumers can use these algorithms over
+case-preserved keys.
+
 | Value | Name | Algorithm | Used by |
 |-------|------|-----------|---------|
-| 0 | unspecified | consumers fall back on key width: u64 → xxh64-lower, u32 → fnv1a32-lower | - |
-| 1 | xxh64-lower | XXH64, seed 0, over the **ASCII**-lowercased path | game, lcu, rst (xxh64 lists) |
-| 2 | fnv1a32-lower | FNV-1a 32 over the **Unicode**-lowercased path (each char through its Unicode lowercase mapping, UTF-8 encoded) | binentries, bintypes, binfields, binhashes |
-| 3 | xxh3-lower | XXH3-64 (no seed) over the **ASCII**-lowercased path | rst (v5+, `.xxh3` lists) |
+| 0 | unspecified | consumers fall back on key width: u64 → xxh64, u32 → fnv1a32 | - |
+| 1 | xxh64 | XXH64, seed 0 | game, lcu, rst (xxh64 lists) |
+| 2 | fnv1a32 | FNV-1a 32 | binentries, bintypes, binfields, binhashes |
+| 3 | xxh3 | XXH3-64, no seed | rst (v5+, `.xxh3` lists) |
 
-The lowercasing rules follow `ltk_hash` (`WadHash` is ASCII-lowercase, `BinHash` is
-Unicode-lowercase); the two coincide for the all-ASCII paths these tables hold in
-practice. RST hashes are stored **full-width** (no truncation/masking).
+RST hashes are stored **full-width** (no truncation/masking).
+
+### `case_insensitive` (flags bit1)
+
+Whether the keys hash the **lowercased** path (bit set) or the path bytes as
+given (bit clear). All League tables set it - the game hashes lowercased
+paths - so a consumer hashing a new path must lowercase it first to match.
+
+Paths are UTF-8 and the lowercasing is Unicode-aware, so non-League tables get
+full UTF-8 case-insensitivity: the path is mapped through the Unicode **full**
+lowercase mapping - Rust's `str::to_lowercase`, which is per-character *plus*
+the context-sensitive final-sigma rule (`Σ` → `ς` at the end of a word, `σ`
+elsewhere) - then UTF-8 encoded and hashed. Implementations in other languages
+must match that mapping exactly, not a per-character-only one. League paths are
+ASCII, where this reduces to plain `A-Z` → `a-z` and coincides with `ltk_hash`'s
+`WadHash`/`BinHash` on all real data.
+
+Stability note: Unicode case mappings can gain entries in new Unicode versions,
+so only the ASCII part of the mapping (`A-Z` → `a-z`) is guaranteed bit-stable
+across toolchains. Hashes of non-ASCII paths could in principle drift when the
+producer's Unicode tables update; publishers of non-ASCII tables who need
+long-term stability should pre-lowercase their paths and hash case-sensitively.
 
 ## Sections
 

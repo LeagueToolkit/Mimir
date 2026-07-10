@@ -15,33 +15,21 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use ltk_hashdb::{Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
 
 #[path = "../utils/mod.rs"]
 mod utils;
 use utils::splitmix64;
 
 const TABLES: &[(&str, KeyWidth, HashKind)] = &[
-    ("hashes.game.txt", KeyWidth::U64, HashKind::Xxh64Lower),
-    ("hashes.lcu.txt", KeyWidth::U64, HashKind::Xxh64Lower),
-    (
-        "hashes.binentries.txt",
-        KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
-    ),
-    (
-        "hashes.binfields.txt",
-        KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
-    ),
-    (
-        "hashes.binhashes.txt",
-        KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
-    ),
-    ("hashes.bintypes.txt", KeyWidth::U32, HashKind::Fnv1a32Lower),
-    ("hashes.rst.xxh64.txt", KeyWidth::U64, HashKind::Xxh64Lower),
-    ("hashes.rst.xxh3.txt", KeyWidth::U64, HashKind::Xxh3Lower),
+    ("hashes.game.txt", KeyWidth::U64, HashKind::Xxh64),
+    ("hashes.lcu.txt", KeyWidth::U64, HashKind::Xxh64),
+    ("hashes.binentries.txt", KeyWidth::U32, HashKind::Fnv1a32),
+    ("hashes.binfields.txt", KeyWidth::U32, HashKind::Fnv1a32),
+    ("hashes.binhashes.txt", KeyWidth::U32, HashKind::Fnv1a32),
+    ("hashes.bintypes.txt", KeyWidth::U32, HashKind::Fnv1a32),
+    ("hashes.rst.xxh64.txt", KeyWidth::U64, HashKind::Xxh64),
+    ("hashes.rst.xxh3.txt", KeyWidth::U64, HashKind::Xxh3),
 ];
 
 fn data_dir() -> Option<PathBuf> {
@@ -81,7 +69,9 @@ fn build_bytes(
     compression: Compression,
     entries: &HashMap<u64, String>,
 ) -> Vec<u8> {
-    let mut w = HashDbWriter::new(key_width, compression).hash_kind(hash_kind);
+    let mut w = HashDbWriter::new(key_width, compression)
+        .hash_kind(hash_kind)
+        .casing(Casing::Insensitive);
     w.extend(entries.iter().map(|(&k, p)| (k, p.as_str())));
     let mut out = Cursor::new(Vec::new());
     w.build(&mut out).expect("build");
@@ -148,7 +138,7 @@ fn golden_parity() {
         // independent xxh64) - so tolerate a handful, not zero.
         let mut mismatches = 0usize;
         for (&k, p) in &entries {
-            if hash_kind.hash(p, key_width) != k {
+            if hash_kind.hash(p, Casing::Insensitive, key_width) != k {
                 mismatches += 1;
                 if mismatches <= 5 {
                     eprintln!("{file}: upstream hash mismatch: {k:#x} {p:?}");

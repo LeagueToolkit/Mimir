@@ -233,7 +233,7 @@ mod tests {
     /// Build a tiny raw `.lhdb` and return its path.
     fn build_table(dir: &Path, name: &str, entries: &[(u64, &str)]) -> PathBuf {
         let mut writer =
-            HashDbWriter::new(KeyWidth::U64, Compression::None).hash_kind(HashKind::Xxh64Lower);
+            HashDbWriter::new(KeyWidth::U64, Compression::None).hash_kind(HashKind::Xxh64);
         for (hash, path) in entries {
             writer.insert(*hash, path);
         }

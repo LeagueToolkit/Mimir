@@ -8,7 +8,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-ltk_hash.workspace = true
 memmap2.workspace = true
 zeekstd.workspace = true
 zstd.workspace = true
@@ -16,6 +15,8 @@ xxhash-rust.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Pins the case-insensitive hashes to ltk_hash's WadHash/BinHash in unit tests.
+ltk_hash.workspace = true
 plotters.workspace = true
 serde.workspace = true
 serde_json.workspace = true

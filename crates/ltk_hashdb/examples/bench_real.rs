@@ -16,7 +16,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ltk_hashdb::{Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
 
 #[path = "../utils/mod.rs"]
 mod utils;
@@ -24,48 +24,43 @@ use utils::{fmt_ns, group_thousands, mib, parse, splitmix64};
 use utils::{BenchReport, Sweep, SweepRow, TableBuild};
 
 const TABLES: &[(&str, &str, KeyWidth, HashKind)] = &[
-    (
-        "game",
-        "hashes.game.txt",
-        KeyWidth::U64,
-        HashKind::Xxh64Lower,
-    ),
-    ("lcu", "hashes.lcu.txt", KeyWidth::U64, HashKind::Xxh64Lower),
+    ("game", "hashes.game.txt", KeyWidth::U64, HashKind::Xxh64),
+    ("lcu", "hashes.lcu.txt", KeyWidth::U64, HashKind::Xxh64),
     (
         "binentries",
         "hashes.binentries.txt",
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
     ),
     (
         "binfields",
         "hashes.binfields.txt",
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
     ),
     (
         "binhashes",
         "hashes.binhashes.txt",
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
     ),
     (
         "bintypes",
         "hashes.bintypes.txt",
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
     ),
     (
         "rst.xxh64",
         "hashes.rst.xxh64.txt",
         KeyWidth::U64,
-        HashKind::Xxh64Lower,
+        HashKind::Xxh64,
     ),
     (
         "rst.xxh3",
         "hashes.rst.xxh3.txt",
         KeyWidth::U64,
-        HashKind::Xxh3Lower,
+        HashKind::Xxh3,
     ),
 ];
 
@@ -273,7 +268,9 @@ fn build(
     compression: Compression,
     out: &Path,
 ) -> (u64, ltk_hashdb::BuildStats) {
-    let mut w = HashDbWriter::new(key_width, compression).hash_kind(hash_kind);
+    let mut w = HashDbWriter::new(key_width, compression)
+        .hash_kind(hash_kind)
+        .casing(Casing::Insensitive);
     w.extend(entries.iter().map(|(k, p)| (*k, p.as_str())));
     let file = BufWriter::new(File::create(out).expect("create output"));
     let stats = w.build(file).expect("build");

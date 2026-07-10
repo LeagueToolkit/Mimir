@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 use std::io::Cursor;
 
-use ltk_hashdb::{Compression, Error, ExtendedHashDb, HashDb, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{
+    Casing, Compression, Error, ExtendedHashDb, HashDb, HashDbWriter, HashKind, KeyWidth,
+};
 
 fn build_with(
     key_width: KeyWidth,
@@ -11,7 +13,10 @@ fn build_with(
     compression: Compression,
     entries: &[(u64, &str)],
 ) -> Vec<u8> {
-    let mut w = HashDbWriter::new(key_width, compression).hash_kind(hash_kind);
+    // The fixtures are League-shaped, so record the League casing rule.
+    let mut w = HashDbWriter::new(key_width, compression)
+        .hash_kind(hash_kind)
+        .casing(Casing::Insensitive);
     w.extend(entries.iter().copied());
     let mut out = Cursor::new(Vec::new());
     let stats = w.build(&mut out).expect("build");
@@ -47,12 +52,12 @@ fn hashdb_is_send_sync() {
 
 #[test]
 fn roundtrip_u64() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
 
     assert_eq!(db.len(), GAME_ENTRIES.len());
     assert_eq!(db.key_width(), KeyWidth::U64);
-    assert_eq!(db.hash_kind(), HashKind::Xxh64Lower);
+    assert_eq!(db.hash_kind(), HashKind::Xxh64);
     for &(k, p) in GAME_ENTRIES {
         assert_eq!(db.get(k).as_deref(), Some(p));
         assert!(db.contains(k));
@@ -67,7 +72,7 @@ fn roundtrip_u32() {
         (0xafd0_71e5, "test"),
         (0xffff_ffff, "SkinCharacterDataProperties"),
     ];
-    let bytes = build(KeyWidth::U32, HashKind::Fnv1a32Lower, entries);
+    let bytes = build(KeyWidth::U32, HashKind::Fnv1a32, entries);
     let db = HashDb::open_bytes(bytes).expect("open");
     for &(k, p) in entries {
         assert_eq!(db.get(k).as_deref(), Some(p));
@@ -79,7 +84,7 @@ fn roundtrip_u32() {
 
 #[test]
 fn misses_return_none() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
     for miss in [0u64, 2, 0xdead_beef_dead_bee0, 0xfeed_face_feed_face] {
         assert_eq!(db.get(miss), None);
@@ -99,14 +104,14 @@ fn empty_table() {
 
 #[test]
 fn get_returns_borrowed_for_raw_arena() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
     assert!(matches!(db.get(1), Some(Cow::Borrowed(_))));
 }
 
 #[test]
 fn iter_and_load_all_match() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
 
     let mut from_iter: Vec<(u64, String)> = db.iter().map(|(k, s)| (k, s.into_owned())).collect();
@@ -127,7 +132,7 @@ fn iter_and_load_all_match() {
 
 #[test]
 fn get_batch_preserves_input_order() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
     let queries = [0xdead_beef_dead_beefu64, 999, 1];
     let results: Vec<_> = db.get_batch(&queries).collect();
@@ -175,7 +180,7 @@ fn compressed_roundtrip() {
     for frame_size in [16u32, 64, 1 << 20] {
         let bytes = build_with(
             KeyWidth::U64,
-            HashKind::Xxh64Lower,
+            HashKind::Xxh64,
             Compression::Zeekstd {
                 frame_size,
                 level: 3,
@@ -224,7 +229,7 @@ fn compressed_empty_table() {
 fn compressed_get_batch() {
     let bytes = build_with(
         KeyWidth::U64,
-        HashKind::Xxh64Lower,
+        HashKind::Xxh64,
         Compression::Zeekstd {
             frame_size: 32,
             level: 3,
@@ -251,7 +256,7 @@ fn compressed_get_batch() {
 fn compressed_corruption_detected_by_verify() {
     let mut bytes = build_with(
         KeyWidth::U64,
-        HashKind::Xxh64Lower,
+        HashKind::Xxh64,
         Compression::Zeekstd {
             frame_size: 32,
             level: 3,
@@ -282,14 +287,28 @@ fn zero_frame_size_rejected() {
 
 #[test]
 fn hash_path_uses_table_algorithm() {
-    let bytes = build(KeyWidth::U32, HashKind::Fnv1a32Lower, &[]);
+    let bytes = build(KeyWidth::U32, HashKind::Fnv1a32, &[]);
     let db = HashDb::open_bytes(bytes).expect("open");
+    assert_eq!(db.casing(), Casing::Insensitive);
     assert_eq!(db.hash_path("TEST"), 0xafd071e5);
+}
+
+/// The casing rule roundtrips through the header flag and drives `hash_path`.
+#[test]
+fn hash_path_respects_recorded_casing() {
+    let w = HashDbWriter::new(KeyWidth::U32, Compression::None).hash_kind(HashKind::Fnv1a32);
+    let mut out = Cursor::new(Vec::new());
+    w.build(&mut out).expect("build");
+
+    let db = HashDb::open_bytes(out.into_inner()).expect("open");
+    assert_eq!(db.casing(), Casing::Sensitive);
+    assert_ne!(db.hash_path("TEST"), 0xafd071e5);
+    assert_eq!(db.hash_path("test"), 0xafd071e5);
 }
 
 #[test]
 fn corruption_is_detected_by_verify() {
-    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff; // flip a bit in the arena
     let db = HashDb::open_bytes(bytes).expect("open still succeeds (lazy)");
@@ -298,7 +317,7 @@ fn corruption_is_detected_by_verify() {
 
 #[test]
 fn truncated_file_rejected_on_open() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     for cut in [0, 10, 79, bytes.len() - 1] {
         assert!(HashDb::open_bytes(bytes[..cut].to_vec()).is_err());
     }
@@ -306,14 +325,14 @@ fn truncated_file_rejected_on_open() {
 
 #[test]
 fn bad_magic_rejected() {
-    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     bytes[0] = b'X';
     assert!(matches!(HashDb::open_bytes(bytes), Err(Error::BadMagic)));
 }
 
 #[test]
 fn extended_overlay_first_then_base() {
-    let bytes = build(KeyWidth::U64, HashKind::Xxh64Lower, GAME_ENTRIES);
+    let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
     let mut ext = ExtendedHashDb::new(db);
 

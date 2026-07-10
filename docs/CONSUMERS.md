@@ -82,8 +82,9 @@ format invariant with a regression test behind it, not an accident.
 ### "Does this path exist?" - hashing strings with the table's algorithm
 
 Each table records which hash algorithm produced its keys (`HashKind`: XXH64,
-FNV-1a-32, or XXH3, each over the lowercased path). `hash_path` uses **that** algorithm,
-so consumers never hard-code one:
+FNV-1a-32, or XXH3) and its casing rule (`Casing` - League tables hash the lowercased
+path). `hash_path` uses **that** algorithm and casing, so consumers never hard-code
+either:
 
 ```rust
 let hash = db.hash_path("assets/characters/ahri/skins/skin11/ahri_skin11.dds");
@@ -224,10 +225,12 @@ The format has nothing League-specific: any `u64 → string` map you want mmap-s
 ship as a `.hashdb`. `HashDbWriter` is a streaming builder:
 
 ```rust
-use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
 
 let mut w = HashDbWriter::new(KeyWidth::U64, Compression::default()) // 16 KiB frames, level 19
-    .hash_kind(HashKind::Xxh64Lower);   // recorded so readers can `hash_path`
+    .hash_kind(HashKind::Xxh64)         // recorded so readers can `hash_path`
+    .casing(Casing::Insensitive);       // keys hash the lowercased path (League rule);
+                                        // defaults to Sensitive (hash bytes as given)
 
 w.insert(hash, "assets/characters/aatrox/aatrox.bin");
 w.extend(pairs);
@@ -255,11 +258,11 @@ for path-shaped tokens), and the chunk table *is* the unknown set:
 ```rust
 use ltk_mimir_gen::guessers::SeedStrings;
 use ltk_mimir_gen::{mine_wad, GuessContext, Hunt};
-use ltk_hashdb::{HashKind, KeyWidth};
+use ltk_hashdb::{Casing, HashKind, KeyWidth};
 
 let mined = mine_wad("Ahri.wad.client".as_ref())?;      // seed strings + chunk hashes
 
-let mut ctx = GuessContext::new(HashKind::Xxh64Lower, KeyWidth::U64);
+let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::Insensitive, KeyWidth::U64);
 ctx.add_known(db.iter().map(|(_, p)| p.into_owned()));  // corpus to mutate from
 ctx.add_unknown(mined.chunk_hashes.into_iter().filter(|&h| !db.contains(h)));
 

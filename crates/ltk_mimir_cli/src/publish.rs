@@ -13,7 +13,7 @@ use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
 use ltk_mimir_cache::{HashStore, PublishItem, Source, Table};
 use sha2::{Digest, Sha256};
 
@@ -77,56 +77,56 @@ const SPECS: [TableSpec; 8] = [
     spec(
         Table::Game,
         KeyWidth::U64,
-        HashKind::Xxh64Lower,
+        HashKind::Xxh64,
         "hashes.game.txt",
         true,
     ),
     spec(
         Table::Lcu,
         KeyWidth::U64,
-        HashKind::Xxh64Lower,
+        HashKind::Xxh64,
         "hashes.lcu.txt",
         false,
     ),
     spec(
         Table::BinEntries,
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
         "hashes.binentries.txt",
         false,
     ),
     spec(
         Table::BinTypes,
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
         "hashes.bintypes.txt",
         false,
     ),
     spec(
         Table::BinFields,
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
         "hashes.binfields.txt",
         false,
     ),
     spec(
         Table::BinHashes,
         KeyWidth::U32,
-        HashKind::Fnv1a32Lower,
+        HashKind::Fnv1a32,
         "hashes.binhashes.txt",
         false,
     ),
     spec(
         Table::Rst,
         KeyWidth::U64,
-        HashKind::Xxh64Lower,
+        HashKind::Xxh64,
         "hashes.rst.xxh64.txt",
         false,
     ),
     spec(
         Table::RstXxh3,
         KeyWidth::U64,
-        HashKind::Xxh3Lower,
+        HashKind::Xxh3,
         "hashes.rst.xxh3.txt",
         false,
     ),
@@ -262,7 +262,10 @@ fn build_table(
     out: &Path,
     compression: Compression,
 ) -> Result<ltk_hashdb::BuildStats> {
-    let mut writer = HashDbWriter::new(spec.key_width, compression).hash_kind(spec.hash_kind);
+    // Every League table hashes the lowercased path.
+    let mut writer = HashDbWriter::new(spec.key_width, compression)
+        .hash_kind(spec.hash_kind)
+        .casing(Casing::Insensitive);
     for file in files {
         read_hash_lines(file, |hash, _, path| {
             writer.insert(hash, path);

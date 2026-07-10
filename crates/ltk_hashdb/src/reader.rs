@@ -11,7 +11,7 @@ use xxhash_rust::xxh3::Xxh3;
 use zeekstd::SeekTable;
 
 use crate::header::Header;
-use crate::{Error, HashKind, KeyWidth, Result};
+use crate::{Casing, Error, HashKind, KeyWidth, Result};
 
 /// A read-only `.hashdb` hash table.
 ///
@@ -185,6 +185,12 @@ impl HashDb {
         self.header.hash_kind
     }
 
+    /// Whether the keys hash the lowercased path (from the `case_insensitive`
+    /// header flag).
+    pub fn casing(&self) -> Casing {
+        self.header.casing()
+    }
+
     /// Whether the arena is zeekstd-compressed on disk.
     pub fn is_compressed(&self) -> bool {
         self.header.arena_compressed()
@@ -200,10 +206,13 @@ impl HashDb {
         self.header.arena_compressed_size
     }
 
-    /// Hash a path string with **this table's** algorithm (from the `hash_kind`
-    /// header field, falling back on key width when unspecified).
+    /// Hash a path string with **this table's** algorithm and casing rule (from
+    /// the `hash_kind` header field - falling back on key width when
+    /// unspecified - and the `case_insensitive` flag).
     pub fn hash_path(&self, path: &str) -> u64 {
-        self.header.hash_kind.hash(path, self.header.key_width)
+        self.header
+            .hash_kind
+            .hash(path, self.header.casing(), self.header.key_width)
     }
 
     /// Iterate entries in arena order (path order, **not** key order) so each frame

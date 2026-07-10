@@ -17,7 +17,7 @@ mod writer;
 
 pub use error::{Error, Result};
 pub use extended::ExtendedHashDb;
-pub use hash::HashKind;
+pub use hash::{Casing, HashKind};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use reader::HashDb;
 pub use writer::{BuildStats, HashDbWriter};

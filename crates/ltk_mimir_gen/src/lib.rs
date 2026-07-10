@@ -10,10 +10,10 @@
 //! build on it.
 //!
 //! ```no_run
-//! use ltk_hashdb::{HashKind, KeyWidth};
+//! use ltk_hashdb::{Casing, HashKind, KeyWidth};
 //! use ltk_mimir_gen::{GuessContext, Hunt};
 //!
-//! let mut ctx = GuessContext::new(HashKind::Xxh64Lower, KeyWidth::U64);
+//! let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::Insensitive, KeyWidth::U64);
 //! ctx.add_known(["assets/characters/ahri/skins/skin01/ahri_tx.dds".to_owned()]);
 //! ctx.add_unknown([0x123456789abcdef0]); // e.g. mined from a WAD's chunk table
 //! let report = Hunt::default_game().run(&mut ctx);

@@ -1,7 +1,7 @@
 //! End-to-end hunts over synthetic corpora: seed a few known paths, hash the
 //! target paths into the unknown set, and assert the guessers rediscover them.
 
-use ltk_hashdb::{HashKind, KeyWidth};
+use ltk_hashdb::{Casing, HashKind, KeyWidth};
 use ltk_mimir_gen::guessers::{
     CharacterSkin, ExtensionSwap, NumericRange, PrefixVariants, RegionLocale, SeedStrings, WordAdd,
     WordSubstitution,
@@ -9,11 +9,11 @@ use ltk_mimir_gen::guessers::{
 use ltk_mimir_gen::{GuessContext, Hunt};
 
 fn xxh64(s: &str) -> u64 {
-    HashKind::Xxh64Lower.hash(s, KeyWidth::U64)
+    HashKind::Xxh64.hash(s, Casing::Insensitive, KeyWidth::U64)
 }
 
 fn ctx_with(known: &[&str], targets: &[&str]) -> GuessContext {
-    let mut ctx = GuessContext::new(HashKind::Xxh64Lower, KeyWidth::U64);
+    let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::Insensitive, KeyWidth::U64);
     ctx.add_known(known.iter().copied().map(Box::from));
     ctx.add_unknown(targets.iter().map(|t| xxh64(t)));
     ctx
@@ -185,7 +185,7 @@ fn dry_round_terminates() {
 
 #[test]
 fn empty_inputs_are_safe() {
-    let mut ctx = GuessContext::new(HashKind::Xxh64Lower, KeyWidth::U64);
+    let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::Insensitive, KeyWidth::U64);
     let report = Hunt::default_game().run(&mut ctx);
     assert!(report.resolved.is_empty());
 
@@ -199,9 +199,9 @@ fn empty_inputs_are_safe() {
 fn fnv1a32_tables_hash_case_insensitively() {
     // Bin tables keep original-case strings but hash lowercased.
     let target = "Data/Spells/AhriOrbMissile.lua";
-    let mut ctx = GuessContext::new(HashKind::Fnv1a32Lower, KeyWidth::U32);
+    let mut ctx = GuessContext::new(HashKind::Fnv1a32, Casing::Insensitive, KeyWidth::U32);
     ctx.add_known(["Data/Spells/AhriOrbMissile.luabin".to_owned()]);
-    ctx.add_unknown([HashKind::Fnv1a32Lower.hash(target, KeyWidth::U32)]);
+    ctx.add_unknown([HashKind::Fnv1a32.hash(target, Casing::Insensitive, KeyWidth::U32)]);
     let report = Hunt::new().with(ExtensionSwap).run(&mut ctx);
 
     assert_eq!(report.resolved.len(), 1);

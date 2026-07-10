@@ -3,7 +3,7 @@
 //!
 //! - Resolves the cache directory (env → CDragon → platform dir)
 //! - Reads the manifest and opens the active table file read-only
-//! - Publishes new versions atomically under a single-updater lock with lazy GC
+//! - Commits new versions atomically under a single-updater lock with lazy GC
 //! - Updates the cache in-process from a published release, through a
 //!   caller-supplied fetcher ([`HashStore::update`])
 
@@ -18,14 +18,13 @@ mod update;
 pub use error::{Error, Result};
 pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
-pub use store::{GcReport, HashStore, PublishItem};
+pub use store::{CommitItem, GcReport, HashStore};
 pub use update::{Fetch, FetchError, UpdateOptions, UpdateOutcome, UpdateReport};
 
 /// The logical hash tables, each stored as its own `.lhdb` file.
 ///
-/// The two RST variants are separate tables: they hash the same strings with
-/// different algorithms (XXH64 vs XXH3 for RST v5+), and per-table files are keyed
-/// by hash kind (see `docs/FORMAT.md`).
+/// The two RST variants hash the same strings with different algorithms (XXH64
+/// vs XXH3 for RST v5+), so they are separate tables (see `docs/FORMAT.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Table {
     Game,

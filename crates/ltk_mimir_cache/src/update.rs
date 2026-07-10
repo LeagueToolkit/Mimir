@@ -1,26 +1,23 @@
 //! In-process cache updates: the compare → download → verify → install loop
 //! behind `mimir update`, exposed as [`HashStore::update`].
 //!
-//! The crate deliberately ships no HTTP client. Callers supply a [`Fetch`]
-//! that maps a release asset filename to its bytes - backed by reqwest, ureq,
-//! a mirror, or a directory in tests - and everything else lives here:
-//! manifest comparison, checksum verification, atomic install under the
-//! single-updater lock, and GC of superseded versions. A GUI app or library
-//! consumer keeps its cache fresh without shelling out to the CLI.
+//! The crate ships no HTTP client; callers supply a [`Fetch`] that maps a
+//! release asset filename to its bytes (reqwest, a mirror, a directory in
+//! tests). Everything else - comparison, verification, atomic install, GC -
+//! lives here.
 
 use std::fs;
 use std::path::PathBuf;
 
-use crate::store::MANIFEST_FILE;
-use crate::{fsutil, Error, GcReport, HashStore, Manifest, PublishItem, Result, Table};
+use crate::store::{validate_version, MANIFEST_FILE};
+use crate::{fsutil, CommitItem, Error, GcReport, HashStore, Manifest, Result, Table};
 
-/// The boxed error a [`Fetch`] implementation may return. It is wrapped into
-/// [`Error::Fetch`] together with the filename that failed.
+/// The boxed error a [`Fetch`] may return; wrapped into [`Error::Fetch`]
+/// with the filename that failed.
 pub type FetchError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Fetch one release asset by filename (`manifest.json`,
-/// `game-<version>.lhdb`, ...) - the single indirection between
-/// [`HashStore::update`] and the network.
+/// `game-<version>.lhdb`, ...).
 ///
 /// For a GitHub release the asset URL is
 /// `https://github.com/<owner>/<repo>/releases/latest/download/<filename>`.
@@ -41,16 +38,14 @@ where
 /// Knobs for [`HashStore::update`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpdateOptions {
-    /// Reinstall every table even when the local copy already matches the
-    /// remote manifest.
+    /// Reinstall every table even when the local copy already matches.
     pub force: bool,
 }
 
 /// What an update run did.
 #[derive(Debug)]
 pub enum UpdateOutcome {
-    /// Another process holds the update lock; nothing was done (not even the
-    /// manifest fetch) - leave the work to it.
+    /// Another process holds the update lock; nothing was done.
     Locked,
 
     /// The run completed; the report says what changed.
@@ -60,16 +55,15 @@ pub enum UpdateOutcome {
 /// What a completed update run installed and cleaned up.
 #[derive(Debug, Default)]
 pub struct UpdateReport {
-    /// Tables that were downloaded, verified, and installed. Empty when every
-    /// remote table already matched the local cache.
+    /// Tables that were downloaded, verified, and installed.
     pub installed: Vec<Table>,
 
-    /// Remote manifest ids this build has no [`Table`] for - a newer release
-    /// publishing tables this version doesn't know. Skipped, never fatal.
+    /// Remote manifest ids this build has no [`Table`] for (a newer release).
+    /// Skipped, never fatal.
     pub unknown_tables: Vec<String>,
 
-    /// What the post-install GC swept. GC only runs after an install, so this
-    /// stays empty on an up-to-date run.
+    /// What GC swept. GC runs even on up-to-date runs, so files a prior run
+    /// had to retain (e.g. still mmap'd on Windows) get another chance.
     pub gc: GcReport,
 }
 
@@ -81,8 +75,7 @@ impl UpdateReport {
 }
 
 /// Downloaded-but-not-yet-installed files, removed on drop so neither success
-/// nor failure litters the cache dir (`gc` would sweep the `.tmp` suffix
-/// eventually anyway).
+/// nor failure litters the cache dir.
 struct Staged(Vec<PathBuf>);
 
 impl Drop for Staged {
@@ -96,17 +89,17 @@ impl Drop for Staged {
 impl HashStore {
     /// Bring the cache up to date with a published release, in-process.
     ///
-    /// Fetches the remote `manifest.json`, keeps every table whose sha256
-    /// already matches the local manifest (unless
-    /// [`force`](UpdateOptions::force)), downloads the rest through `remote`,
-    /// verifies each checksum, installs atomically via
-    /// [`publish`](HashStore::publish), and [`gc`](HashStore::gc)s superseded
-    /// versions - all under the single-updater lock. Readers keep resolving
-    /// throughout: they see either the whole old version or the whole new one.
+    /// Fetches the remote `manifest.json`, downloads every table whose sha256
+    /// differs from the local one (all of them under
+    /// [`force`](UpdateOptions::force)), verifies each checksum, installs
+    /// atomically via [`commit`](HashStore::commit), and [`gc`](HashStore::gc)s
+    /// superseded versions - all under the single-updater lock. Readers see
+    /// either the whole old version or the whole new one.
     ///
-    /// Returns [`UpdateOutcome::Locked`] without touching the network when
-    /// another process is already updating. A failed download or checksum
-    /// mismatch errors out before anything is installed.
+    /// Returns [`UpdateOutcome::Locked`] when another process is already
+    /// updating. Any failure errors out before anything is installed. A release
+    /// published mid-run can fail a fetch or a checksum; that state is transient
+    /// and re-running converges on the new release.
     pub fn update(
         &self,
         remote: &(impl Fetch + ?Sized),
@@ -116,16 +109,15 @@ impl HashStore {
             return Ok(UpdateOutcome::Locked);
         };
 
-        let remote_manifest = Manifest::from_slice(&fetch(remote, MANIFEST_FILE)?)?;
         let local = match self.manifest() {
             Ok(manifest) => Some(manifest),
             Err(Error::MissingManifest(_)) => None,
             Err(e) => return Err(e),
         };
 
-        // Stage a verified download for every table whose content differs from
-        // what the local manifest points at (or whose file has gone missing on
-        // disk).
+        // Stage a verified download for every table that differs from the local
+        // manifest (or whose file went missing); `staged` cleans up on any error.
+        let remote_manifest = Manifest::from_slice(&fetch(remote, MANIFEST_FILE)?)?;
         let mut report = UpdateReport::default();
         let mut items = Vec::new();
         let mut staged = Staged(Vec::new());
@@ -159,18 +151,23 @@ impl HashStore {
 
             let tmp = self.dir().join(format!("{}.download.tmp", entry.file));
             fs::write(&tmp, &bytes)?;
-            items.push(PublishItem::new(table, version, &tmp));
+            items.push(CommitItem::new(table, version, &tmp));
             staged.0.push(tmp);
         }
-        if items.is_empty() {
-            return Ok(UpdateOutcome::Completed(report));
+
+        // Install atomically - table files first, manifest pointer last.
+        if !items.is_empty() {
+            self.commit(&items, remote_manifest.source.clone())?;
+            report.installed = items.iter().map(|item| item.table).collect();
         }
 
-        // Install atomically - table files first, manifest pointer last - then
-        // sweep the versions nothing references anymore.
-        self.publish(&items, remote_manifest.source.clone())?;
-        report.installed = items.iter().map(|item| item.table).collect();
-        report.gc = self.gc()?;
+        // Drop the staged downloads before GC so its report never counts our own
+        // in-flight `.tmp` files.
+        drop(staged);
+
+        // Best-effort: the install is already durable, so a GC hiccup must not
+        // fail the update.
+        report.gc = self.gc().unwrap_or_default();
 
         Ok(UpdateOutcome::Completed(report))
     }
@@ -185,15 +182,15 @@ fn fetch(remote: &(impl Fetch + ?Sized), filename: &str) -> Result<Vec<u8>> {
 }
 
 /// The version label embedded in a release filename (`<id>-<version>.lhdb`).
-/// Rejects anything that is not a single clean path component: the manifest is
-/// remote input, and the filename is reused locally.
+/// The manifest is remote input and the filename is reused locally, so anything
+/// that is not a clean path component is rejected via [`validate_version`].
 fn version_of(table: Table, file: &str) -> Option<&str> {
     let version = file
         .strip_prefix(table.id())?
         .strip_prefix('-')?
         .strip_suffix(".lhdb")?;
 
-    (!version.is_empty() && !version.contains(['/', '\\'])).then_some(version)
+    validate_version(version).ok().map(|()| version)
 }
 
 #[cfg(test)]

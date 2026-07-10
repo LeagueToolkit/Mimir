@@ -52,22 +52,22 @@ if let Some(path) = db.get(0x1234_5678_9abc_def0) {
 `open` validates structure only: it trusts the manifest's download-time sha256 and
 stays cheap and lazy. Use [`HashDb::verify`](../ltk_hashdb) for a full checksum pass.
 
-## Publishing (single updater, atomic)
+## Committing (single updater, atomic)
 
-`publish` is the cache-side primitive: it installs one or more freshly built `.lhdb` files
+`commit` is the cache-side primitive: it installs one or more freshly built `.lhdb` files
 under immutable `<table>-<version>.lhdb` names, then flips the manifest to point at them
 **last**, so a reader mid-lookup sees either the whole old version or the whole new one. The
 table copies and the manifest write are each a temp file + `fsync` + rename.
 
 ```rust
-use ltk_mimir_cache::{HashStore, PublishItem, Table};
+use ltk_mimir_cache::{CommitItem, HashStore, Table};
 
 let store = HashStore::discover()?;
 
 // Serialize updaters (readers need no lock). `None` means another process is updating.
 if let Some(_lock) = store.try_lock_update()? {
-    store.publish(
-        &[PublishItem::new(Table::Game, "2026-07-08", "build/game.lhdb")],
+    store.commit(
+        &[CommitItem::new(Table::Game, "2026-07-08", "build/game.lhdb")],
         None, // optional provenance (source repo + commit / inputs sha256)
     )?;
     store.gc()?; // reclaim superseded versions no reader still maps
@@ -81,7 +81,7 @@ as an error.
 
 > The download-driven `mimir update` flow is built on exactly these primitives: fetch the
 > release manifest, fingerprint-skip per table by sha256, download + verify what changed,
-> then `publish` + `gc` under `try_lock_update`.
+> then `commit` + `gc` under `try_lock_update`.
 
 ## API surface
 
@@ -90,7 +90,7 @@ as an error.
 | `HashStore::discover` / `at` | Resolve the cache dir, or use an explicit one |
 | `HashStore::manifest` / `open` / `path_for` | Read the manifest; open / locate the active table |
 | `HashStore::try_lock_update` → `UpdateLock` | Non-blocking cross-process single-updater lock |
-| `HashStore::publish` | Install versioned files + atomically swap the manifest |
+| `HashStore::commit` | Install versioned files + atomically swap the manifest |
 | `HashStore::gc` → `GcReport` | Reclaim unreferenced, unmapped versions |
 | `Table` | The eight logical tables (`id` / `from_id` / `ALL`) |
 | `Manifest` / `Source` / `TableEntry` | The `manifest.json` schema (serde) |

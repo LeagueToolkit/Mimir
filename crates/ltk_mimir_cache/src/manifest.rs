@@ -108,9 +108,8 @@ pub(crate) fn now_rfc3339() -> String {
     format_rfc3339(secs)
 }
 
-/// Format a UNIX timestamp (seconds) as an RFC-3339 UTC string. The seconds come from a
-/// `SystemTime` since the epoch, so the conversion cannot realistically fail; an
-/// out-of-range value degrades to an empty string rather than panicking.
+/// Format a UNIX timestamp (seconds) as an RFC-3339 UTC string; an out-of-range
+/// value degrades to an empty string rather than panicking.
 fn format_rfc3339(secs: u64) -> String {
     OffsetDateTime::from_unix_timestamp(secs as i64)
         .ok()

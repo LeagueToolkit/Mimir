@@ -24,7 +24,7 @@ Cargo workspace (`resolver = "2"`), four crates under `crates/`:
 | `ltk_hashdb`       | The `.hashdb` format: `mmap` reader (`HashDb`) + streaming writer (`HashDbWriter`), `ExtendedHashDb` overlay |
 | `ltk_mimir_cache` | Shared cache dir, `manifest.json`, versioned publish, update lock, GC, in-process updater (`HashStore`, `HashStore::update`) |
 | `ltk_mimir_gen`   | Hash-discovery ("hunt") engine - guessers that resolve unknown hashes |
-| `ltk_mimir_cli`   | The `mimir` binary (`build` / `get` / `verify` / `stats` / `gen` / `update` / `merge` / `publish`) |
+| `ltk_mimir_cli`   | The `mimir` binary (`build` / `get` / `verify` / `stats` / `gen` / `update` / `merge` / `bundle`) |
 
 Docs live in `docs/`: `FORMAT.md` (byte-level spec, format version 1), `CONSUMERS.md`
 (integration API), `BENCHMARKS.md` (frame-size/compression measurements).
@@ -51,7 +51,7 @@ Docs live in `docs/`: `FORMAT.md` (byte-level spec, format version 1), `CONSUMER
   its comment read as a unit instead of a wall of text. Undocumented fields can stay packed.
 
   ```rust
-  pub struct PublishItem {
+  pub struct CommitItem {
       /// Which logical table this file is.
       pub table: Table,
 

@@ -117,7 +117,7 @@ jobs:
         run: |
           version="${{ inputs.version }}"
           version="${version:-$(date -u +%F)}"
-          target/release/mimir publish \
+          target/release/mimir bundle \
             --inputs source-data/hashes/lol \
             --out dist \
             --version "$version" \

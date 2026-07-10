@@ -1,12 +1,12 @@
-//! `mimir publish`: build every table from a directory of CDragon
+//! `mimir bundle`: build every table from a directory of CDragon
 //! `hashes.*.txt` inputs into a staging directory of immutable
 //! `<table>-<version>.lhdb` files plus a `manifest.json`, ready to upload as
 //! GitHub release assets.
 //!
 //! The txt lists stay the canonical, mergeable source of truth; this
 //! output is a derived artifact, rebuilt from scratch each run. Manifest,
-//! sha256, and atomic installation are delegated to [`HashStore::publish`] so
-//! the release staging dir and the local cache share one publish code path.
+//! sha256, and atomic installation are delegated to [`HashStore::commit`] so
+//! the release staging dir and the local cache share one commit code path.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Read};
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
-use ltk_mimir_cache::{HashStore, PublishItem, Source, Table};
+use ltk_mimir_cache::{CommitItem, HashStore, Source, Table};
 use sha2::{Digest, Sha256};
 
 use crate::read_hash_lines;
@@ -163,14 +163,14 @@ pub fn run(opts: &Options) -> Result<()> {
     let manifest_path = opts.out.join("manifest.json");
     if manifest_path.exists() {
         bail!(
-            "{} already exists - publish into a fresh --out directory",
+            "{} already exists - bundle into a fresh --out directory",
             manifest_path.display()
         );
     }
 
     let inputs_sha256 = fingerprint_inputs(&resolved)?;
 
-    // Build each table into a scratch subdir of the staging dir; HashStore::publish
+    // Build each table into a scratch subdir of the staging dir; HashStore::commit
     // copies them into place under their immutable versioned names.
     let build_dir = opts.out.join(".build");
     fs::create_dir_all(&build_dir).with_context(|| format!("creating {}", build_dir.display()))?;
@@ -186,7 +186,7 @@ pub fn run(opts: &Options) -> Result<()> {
             stats.arena_compressed_size,
             stats.file_len,
         );
-        items.push(PublishItem::new(spec.table, &version, path));
+        items.push(CommitItem::new(spec.table, &version, path));
     }
 
     let source = Source {
@@ -194,11 +194,11 @@ pub fn run(opts: &Options) -> Result<()> {
         commit: opts.source_commit.clone(),
         inputs_sha256: Some(inputs_sha256),
     };
-    let manifest = HashStore::at(&opts.out).publish(&items, Some(source))?;
+    let manifest = HashStore::at(&opts.out).commit(&items, Some(source))?;
     fs::remove_dir_all(&build_dir).with_context(|| format!("removing {}", build_dir.display()))?;
 
     println!(
-        "published {} tables (version {version}) -> {}",
+        "bundled {} tables (version {version}) -> {}",
         manifest.tables.len(),
         manifest_path.display()
     );
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn publishes_present_tables_with_manifest() {
+    fn bundles_present_tables_with_manifest() {
         let tmp = tempdir().unwrap();
         let opts = options(&tmp);
         // Game arrives as split parts, lcu as a single file; the rest are absent.

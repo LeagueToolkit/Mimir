@@ -138,7 +138,7 @@ custom-hash-extension APIs.
 ## Status
 
 Early development. The `.hashdb` format, reader/writer, the shared cache, release
-publishing (`mimir publish` + a scheduled CI job that ships every table as versioned
+publishing (`mimir bundle` + a scheduled CI job that ships every table as versioned
 `.lhdb` GitHub release assets, rebuilt from the canonical CommunityDragon txt lists), the
 download-driven `mimir update` flow, and the hunt engine - including WAD string mining
 (`mimir gen --wad`) - are in place.

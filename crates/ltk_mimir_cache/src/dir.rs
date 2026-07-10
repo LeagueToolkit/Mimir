@@ -15,10 +15,8 @@ const ORG_DIR: &str = "LeagueToolkit";
 /// The tables subfolder under the org dir.
 const HASHES_DIR: &str = "hashes";
 
-/// Resolve the shared cache directory without creating it.
-///
-/// `MIMIR_DIR`, when set (and non-empty), points directly at the tables directory and
-/// overrides everything; otherwise we use the platform data directory.
+/// Resolve the shared cache directory without creating it. A non-empty
+/// `MIMIR_DIR` overrides the platform default.
 pub fn resolve() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("MIMIR_DIR").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(dir));
@@ -28,8 +26,8 @@ pub fn resolve() -> Result<PathBuf> {
 
 fn platform_dir() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().ok_or(Error::NoCacheDir)?;
-    // Windows keeps hash tables machine-local (they are large, derived, and
-    // per-install), so we use LocalAppData rather than the roaming profile.
+    // Large, derived, per-install files belong in LocalAppData, not the
+    // roaming profile.
     #[cfg(windows)]
     let root = base.data_local_dir();
     #[cfg(not(windows))]

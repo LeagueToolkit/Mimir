@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
 use ltk_mimir_cache::{
-    Error, Fetch, FetchError, HashStore, Manifest, PublishItem, Source, Table, UpdateOptions,
+    CommitItem, Error, Fetch, FetchError, HashStore, Manifest, Source, Table, UpdateOptions,
     UpdateOutcome, UpdateReport,
 };
 use tempfile::tempdir;
@@ -37,16 +37,16 @@ fn build_table(dir: &Path, name: &str, entries: &[(u64, &str)]) -> PathBuf {
 }
 
 /// Stage a fake release (versioned `.lhdb` files + `manifest.json`) in `dir`,
-/// reusing the real publish path so the layout matches CI's output.
+/// reusing the real commit path so the layout matches CI's output.
 fn make_release(dir: &Path, version: &str, tables: &[(Table, &[(u64, &str)])]) {
     let build = dir.join(".release-build");
     fs::create_dir_all(&build).unwrap();
 
-    let items: Vec<PublishItem> = tables
+    let items: Vec<CommitItem> = tables
         .iter()
         .map(|(table, entries)| {
             let built = build_table(&build, &format!("{}.lhdb", table.id()), entries);
-            PublishItem::new(*table, version, built)
+            CommitItem::new(*table, version, built)
         })
         .collect();
     let source = Source {
@@ -54,7 +54,7 @@ fn make_release(dir: &Path, version: &str, tables: &[(Table, &[(u64, &str)])]) {
         commit: Some("deadbeef".into()),
         inputs_sha256: None,
     };
-    HashStore::at(dir).publish(&items, Some(source)).unwrap();
+    HashStore::at(dir).commit(&items, Some(source)).unwrap();
 
     fs::remove_dir_all(&build).unwrap();
 }
@@ -215,6 +215,90 @@ fn corrupted_download_fails_without_installing() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(litter.is_empty(), "staged downloads were cleaned up");
+}
+
+#[test]
+fn up_to_date_run_still_gcs_stray_files() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release);
+    store.update(&remote, UpdateOptions::default()).unwrap();
+
+    // An unreferenced version a previous run couldn't sweep still lingers on disk.
+    let stray = cache.join("game-old.lhdb");
+    fs::write(&stray, b"stale").unwrap();
+
+    // The second run installs nothing, but GC still runs and reclaims the stray - it is
+    // no longer gated behind an install.
+    let rerun = completed(store.update(&remote, UpdateOptions::default()).unwrap());
+    assert!(rerun.is_up_to_date());
+    assert!(
+        rerun.gc.deleted.contains(&stray),
+        "an up-to-date run still sweeps strays"
+    );
+    assert!(!stray.exists());
+}
+
+/// A release cut between the manifest fetch and the asset fetch: the asset returns the
+/// newer bytes, which don't match the manifest we verified against. `update` errors out
+/// without installing anything, and a re-run against the now-consistent release
+/// converges - the documented contract for mid-publish failures.
+#[test]
+fn release_race_errors_and_rerun_converges() {
+    let tmp = tempdir().unwrap();
+    let old = tmp.path().join("old");
+    let new = tmp.path().join("new");
+    let cache = tmp.path().join("cache");
+    // Same version label, different content - the newer release replaced the asset.
+    make_release(&old, "1", &[(Table::Game, &[(0x1, "a")])]);
+    make_release(&new, "1", &[(Table::Game, &[(0x2, "b")])]);
+
+    /// Serves the old release until the first asset request, then flips to the new one -
+    /// modelling `latest` advancing mid-run.
+    struct RacingFetch {
+        old: PathBuf,
+        new: PathBuf,
+        flipped: std::cell::Cell<bool>,
+    }
+    impl Fetch for RacingFetch {
+        fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError> {
+            if filename.ends_with(".lhdb") {
+                self.flipped.set(true);
+            }
+            let dir = if self.flipped.get() {
+                &self.new
+            } else {
+                &self.old
+            };
+            Ok(fs::read(dir.join(filename))?)
+        }
+    }
+
+    let store = HashStore::at(&cache);
+    let remote = RacingFetch {
+        old,
+        new,
+        flipped: std::cell::Cell::new(false),
+    };
+
+    let err = store.update(&remote, UpdateOptions::default()).unwrap_err();
+    assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err}");
+    assert!(store.manifest().is_err(), "nothing was installed");
+
+    // `latest` has settled on the new release; a re-run sees a consistent
+    // manifest + assets and succeeds.
+    let report = completed(store.update(&remote, UpdateOptions::default()).unwrap());
+    assert_eq!(report.installed, [Table::Game]);
+    let db = store.open(Table::Game).unwrap();
+    assert_eq!(
+        db.get(0x2).as_deref(),
+        Some("b"),
+        "the re-run installed the newer release's content"
+    );
 }
 
 #[test]

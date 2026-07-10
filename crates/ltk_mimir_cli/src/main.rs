@@ -1,8 +1,8 @@
-//! The `mimir` CLI. Verbs: build / get / update / gen / merge / publish /
+//! The `mimir` CLI. Verbs: build / get / update / gen / merge / bundle /
 //! verify / stats.
 
+mod bundle;
 mod merge;
-mod publish;
 mod update;
 
 use std::collections::HashSet;
@@ -200,7 +200,7 @@ enum Command {
     },
 
     /// Build all tables + manifest from CDragon txt inputs, staged for a GH release.
-    Publish {
+    Bundle {
         /// Directory of CDragon `hashes.*.txt` inputs (the data repo's `hashes/lol`).
         /// `hashes.game.txt` may be a single file or split into `.0`, `.1`, … parts.
         #[arg(long)]
@@ -281,7 +281,7 @@ fn main() -> Result<()> {
         ),
         Command::Verify { file } => verify(file),
         Command::Stats { file } => stats(file),
-        Command::Publish {
+        Command::Bundle {
             inputs,
             out,
             version,
@@ -290,7 +290,7 @@ fn main() -> Result<()> {
             allow_missing,
             frame_size,
             level,
-        } => publish::run(&publish::Options {
+        } => bundle::run(&bundle::Options {
             inputs,
             out,
             version,

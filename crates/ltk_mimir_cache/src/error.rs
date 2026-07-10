@@ -50,4 +50,10 @@ pub enum Error {
 
     #[error("table {id}: malformed filename {file:?} in the remote manifest")]
     BadRemoteFilename { id: String, file: String },
+
+    #[error(
+        "table {table:?}: version {version:?} is already published with different content; \
+         published versions are immutable"
+    )]
+    VersionReused { table: Table, version: String },
 }

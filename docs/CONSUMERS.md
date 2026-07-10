@@ -218,7 +218,7 @@ Semantics worth relying on:
 installing tables you built locally instead of downloading, custom retention, etc.:
 
 ```rust
-use ltk_mimir_cache::{HashStore, PublishItem, Source, Table};
+use ltk_mimir_cache::{CommitItem, HashStore, Source, Table};
 
 let store = HashStore::discover()?;
 
@@ -227,8 +227,8 @@ let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
 
 // Install atomically: files are copied durable first, the manifest pointer
 // swaps last, so a concurrent reader never sees a half-written table.
-store.publish(
-    &[PublishItem::new(Table::Game, "2026-07-10", built_game_path)],
+store.commit(
+    &[CommitItem::new(Table::Game, "2026-07-10", built_game_path)],
     Some(Source { repo: Some("CommunityDragon/Data".into()), commit, inputs_sha256 }),
 )?;
 
@@ -321,7 +321,7 @@ mimir get     0x1234abcd --table game        # one lookup from the shared cache
 mimir update  [--force]                      # install the latest release into the shared cache
 mimir gen     --known known.txt --wad Ahri.wad.client --table game --out found.txt
 mimir merge   a.txt b.txt --out merged.txt   # sorted dedup merge of txt lists
-mimir publish --inputs <dir> --out <dir>     # build all tables + manifest for a release
+mimir bundle  --inputs <dir> --out <dir>     # build all tables + manifest for a release
 mimir verify  game.hashdb                    # structure + full checksum
 mimir stats   game.hashdb                    # sizes, entry count, compression ratio
 ```

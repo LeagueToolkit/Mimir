@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-/// A sibling temp path next to `path` (same directory / volume, so a subsequent
-/// rename is a cheap in-volume move). We append `.tmp` rather than replacing the
-/// extension so `manifest.json` → `manifest.json.tmp`, not `manifest.tmp`.
+/// A sibling temp path (`<name>.tmp`) in `path`'s directory, so a subsequent
+/// rename is an in-volume move.
 pub fn tmp_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
@@ -19,10 +18,9 @@ pub fn tmp_sibling(path: &Path) -> PathBuf {
     }
 }
 
-/// Write `bytes` to `path` atomically: fill a sibling temp file, `fsync` it, then
-/// rename over the destination. `fs::rename` replaces an existing file on both POSIX
-/// and Windows (`MoveFileExW` with `REPLACE_EXISTING`), so readers see either the old
-/// or new file whole, never a partial write.
+/// Write `bytes` to `path` atomically: sibling temp file, `fsync`, rename over
+/// the destination. `fs::rename` replaces an existing file on both POSIX and
+/// Windows, so readers see the old or new file whole, never a partial write.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = tmp_sibling(path);
     {
@@ -33,8 +31,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-/// Copy `src` into `dst` atomically (temp copy in `dst`'s directory + fsync + rename),
-/// so a partially copied table is never visible under its final versioned name.
+/// Copy `src` into `dst` atomically (temp copy + fsync + rename), so a partial
+/// copy is never visible under its final versioned name.
 pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     let tmp = tmp_sibling(dst);
     fs::copy(src, &tmp)?;

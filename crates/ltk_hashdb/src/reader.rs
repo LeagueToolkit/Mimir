@@ -153,7 +153,7 @@ impl HashDb {
     /// once (same-directory hashes cluster into the same frames). Yielded in input order.
     pub fn get_batch<'a>(
         &'a self,
-        hashes: &'a [u64],
+        hashes: &[u64],
     ) -> impl Iterator<Item = (u64, Option<Cow<'a, str>>)> + 'a {
         let indices: Vec<Option<usize>> = hashes.iter().map(|&h| self.index_of(h)).collect();
         let mut order: Vec<usize> = (0..hashes.len()).collect();
@@ -168,7 +168,9 @@ impl HashDb {
                 results[p] = self.str_at_cached(i, &mut cache);
             }
         }
-        hashes.iter().copied().zip(results)
+
+        let out: Vec<(u64, Option<Cow<'a, str>>)> = hashes.iter().copied().zip(results).collect();
+        out.into_iter()
     }
 
     pub fn len(&self) -> usize {
@@ -206,6 +208,13 @@ impl HashDb {
     /// Bytes the arena occupies on disk (== decompressed size for raw arenas).
     pub fn arena_compressed_size(&self) -> u64 {
         self.header.arena_compressed_size
+    }
+
+    /// Frames decompressed over this table's lifetime. Misses never bump it, so
+    /// it doubles as a frame-coalescing probe: a clustered `get_batch` should
+    /// raise it by ~#frames, not ~#hits.
+    pub fn decompressions(&self) -> u64 {
+        self.decompressions.load(Ordering::Relaxed)
     }
 
     /// Hash a path string with **this table's** algorithm and casing rule (from

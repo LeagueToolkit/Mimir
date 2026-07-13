@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ltk_hashdb::HashDb;
+use ltk_hashdb::{HashDb, LayeredHashDb};
 
 use crate::manifest::{Manifest, Source, TableEntry};
 use crate::{
@@ -105,6 +105,33 @@ impl HashStore {
     /// checksum pass.
     pub fn open(&self, table: Table) -> Result<HashDb, OpenError> {
         Ok(HashDb::open(self.path_for(table)?)?)
+    }
+
+    /// Open several tables, pairing each with its result so callers can warn-and-skip
+    /// missing ones instead of aborting on the first error. Results are returned in
+    /// `tables` order.
+    pub fn open_many(&self, tables: &[Table]) -> Vec<(Table, Result<HashDb, OpenError>)> {
+        tables.iter().map(|&t| (t, self.open(t))).collect()
+    }
+
+    /// Open `tables`, layer the ones that opened into a [`LayeredHashDb`] (in the
+    /// given priority order - earlier tables shadow later ones), and return the
+    /// per-table open errors for the caller to log.
+    ///
+    /// A tool stays usable when a table is missing: its hashes just miss. This is
+    /// the shape most WAD consumers want - e.g.
+    /// `open_layered(&[Table::Game, Table::Lcu])`.
+    pub fn open_layered(&self, tables: &[Table]) -> (LayeredHashDb, Vec<(Table, OpenError)>) {
+        let mut layered = LayeredHashDb::new();
+        let mut errors = Vec::new();
+        for (table, res) in self.open_many(tables) {
+            match res {
+                Ok(db) => layered.push_base(db),
+                Err(e) => errors.push((table, e)),
+            }
+        }
+
+        (layered, errors)
     }
 
     /// Try to become the single updater without blocking. `Ok(None)` means another

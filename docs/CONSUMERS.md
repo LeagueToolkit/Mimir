@@ -163,6 +163,45 @@ The base file is never mutated. `ext.base()` exposes the underlying `HashDb`;
 not persisted - if you want them shared or durable, contribute them upstream to the
 CommunityDragon txt lists (the canonical source).
 
+### Layering several base tables under one overlay
+
+When a workload spans **more than one** table - WAD chunk resolution consults both
+`Game` and `Lcu` - reach for `LayeredHashDb` instead of hand-rolling a `Vec<HashDb>`
+plus fallback. It is `ExtendedHashDb` generalised to N ordered bases: lookups consult
+the overlay first, then each base in push order, first hit wins.
+
+```rust
+use ltk_mimir_cache::{HashStore, Table};
+
+let store = HashStore::discover()?;
+
+// Open the WAD path tables into one layered reader; missing tables are reported,
+// not fatal - the tool stays usable and their hashes just miss.
+let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+for (table, e) in &errors {
+    eprintln!("skipping {table:?}: {e}");
+}
+
+db.insert(precomputed_hash, "assets/mymod/custom.bin"); // overlay writes as before
+
+// Batch-resolve a WAD's chunk hashes: the overlay is checked first, then each base
+// handles only the residual misses, so every base's frames decompress at most once.
+for (hash, path) in db.get_batch(&chunk_hashes) {
+    match path {
+        Some(p) => println!("{p}"),
+        None => println!("{hash:016x} (unknown)"),
+    }
+}
+```
+
+`open_layered` is the convenience most WAD consumers want; `open_many` is the
+lower-level primitive it's built from - it pairs each requested table with its
+`Result<HashDb, OpenError>` so you can warn-and-skip instead of aborting on the first
+missing one. `db.bases()` exposes the opened tables in priority order, `overlay_len()`
+counts overlay entries, and `insert_path` hashes with the **first** base's algorithm
+(returning `None` when there are no bases). The League-domain hex fallback for a total
+miss stays in your tool - mimir returns `Option`, it never invents a hex string.
+
 ## Getting and updating tables
 
 Tables are published as GitHub release assets: each release carries every table as an

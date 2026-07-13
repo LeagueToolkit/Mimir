@@ -121,6 +121,101 @@ fn open_missing_manifest_and_table_error() {
 }
 
 #[test]
+fn open_layered_skips_missing_and_respects_order() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    // Two tables sharing a key with different values, plus a unique key each.
+    let game = &[(0xAAAA_u64, "game/shared"), (0x1111, "game/only")][..];
+    let lcu = &[(0xAAAA_u64, "lcu/shared"), (0x2222, "lcu/only")][..];
+    store
+        .commit(
+            &[
+                CommitItem::new(
+                    Table::Game,
+                    "v1",
+                    build_table(&tmp.path().join("g.lhdb"), game),
+                ),
+                CommitItem::new(
+                    Table::Lcu,
+                    "v1",
+                    build_table(&tmp.path().join("l.lhdb"), lcu),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+
+    // Both present: no errors, each table's unique key resolves, and the earlier
+    // table shadows the later one on the shared key.
+    let (db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+    assert!(errors.is_empty());
+    assert_eq!(db.get(0x1111).as_deref(), Some("game/only"));
+    assert_eq!(db.get(0x2222).as_deref(), Some("lcu/only"));
+    assert_eq!(db.get(0xAAAA).as_deref(), Some("game/shared"));
+    assert_eq!(db.bases().len(), 2);
+
+    // Reversing the request order flips which table wins the shared key.
+    let (db, _) = store.open_layered(&[Table::Lcu, Table::Game]);
+    assert_eq!(db.get(0xAAAA).as_deref(), Some("lcu/shared"));
+}
+
+#[test]
+fn open_layered_reports_missing_table_but_stays_usable() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    // Only Game is committed; Lcu is absent.
+    store
+        .commit(
+            &[CommitItem::new(
+                Table::Game,
+                "v1",
+                build_table(&tmp.path().join("g.lhdb"), ENTRIES),
+            )],
+            None,
+        )
+        .unwrap();
+
+    let (db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+
+    // The present table still resolves; the missing one is reported, not fatal.
+    assert!(db.contains(0x1111));
+    assert_eq!(db.bases().len(), 1);
+    assert_eq!(errors.len(), 1);
+    assert!(matches!(
+        errors[0],
+        (Table::Lcu, OpenError::TableNotFound(Table::Lcu))
+    ));
+}
+
+#[test]
+fn open_many_pairs_each_table_with_its_result() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    store
+        .commit(
+            &[CommitItem::new(
+                Table::Game,
+                "v1",
+                build_table(&tmp.path().join("g.lhdb"), ENTRIES),
+            )],
+            None,
+        )
+        .unwrap();
+
+    let results = store.open_many(&[Table::Game, Table::Lcu]);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, Table::Game);
+    assert!(results[0].1.is_ok());
+    assert_eq!(results[1].0, Table::Lcu);
+    assert!(matches!(
+        results[1].1,
+        Err(OpenError::TableNotFound(Table::Lcu))
+    ));
+}
+
+#[test]
 fn update_lock_is_exclusive_then_reacquirable() {
     let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());

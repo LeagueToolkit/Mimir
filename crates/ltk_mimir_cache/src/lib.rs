@@ -10,6 +10,8 @@
 
 mod dir;
 mod error;
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
+mod fetch;
 mod fsutil;
 mod lock;
 mod manifest;
@@ -17,6 +19,12 @@ mod store;
 mod update;
 
 pub use error::{CommitError, GcError, ManifestError, NoCacheDirError, OpenError, UpdateError};
+#[cfg(feature = "reqwest")]
+pub use fetch::ReqwestFetch;
+#[cfg(feature = "ureq")]
+pub use fetch::UreqFetch;
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
+pub use fetch::{HttpFetchError, ReleaseSource};
 pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};

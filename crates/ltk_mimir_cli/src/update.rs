@@ -4,13 +4,13 @@
 //! Tables are built by CI from the canonical txt lists and shipped as GitHub
 //! release assets, so updating a machine is a download, not a rebuild. The
 //! whole compare → download → verify → install loop is
-//! [`HashStore::update`] in `ltk_mimir_cache`; this module just supplies the
-//! reqwest-backed [`Fetch`] and prints what happened.
+//! [`HashStore::update`] in `ltk_mimir_cache`; this module just points its
+//! bundled [`UreqFetch`] at the right release and prints what happened.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use ltk_mimir_cache::{Fetch, HashStore, UpdateOptions, UpdateOutcome};
+use ltk_mimir_cache::{Fetch, HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch};
 
 pub struct Options {
     /// GitHub `owner/repo` whose latest release ships the tables.
@@ -28,22 +28,25 @@ pub struct Options {
 }
 
 pub fn run(opts: &Options) -> Result<()> {
-    let base = match &opts.url {
-        Some(url) => url.trim_end_matches('/').to_owned(),
-        None => format!("https://github.com/{}/releases/latest/download", opts.repo),
+    let source = match &opts.url {
+        Some(url) => ReleaseSource::base_url(url.clone()),
+        None => ReleaseSource::github(&opts.repo),
     };
     let store = match &opts.dir {
         Some(dir) => HashStore::at(dir),
         None => HashStore::discover()?,
     };
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("mimir/", env!("CARGO_PKG_VERSION")))
-        .build()?;
 
-    let outcome = store.update(
-        &HttpFetch { base, client },
-        UpdateOptions { force: opts.force },
-    )?;
+    let fetch = UreqFetch::new(source);
+    let fetch = |filename: &str| {
+        if filename.ends_with(".lhdb") {
+            println!("downloading {filename}");
+        }
+
+        fetch.fetch(filename)
+    };
+
+    let outcome = store.update(&fetch, UpdateOptions { force: opts.force })?;
     let report = match outcome {
         UpdateOutcome::Locked => {
             println!(
@@ -78,27 +81,4 @@ pub fn run(opts: &Options) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Release assets over HTTP, with a progress line per table download.
-struct HttpFetch {
-    base: String,
-    client: reqwest::blocking::Client,
-}
-
-impl Fetch for HttpFetch {
-    // reqwest's error already names the URL and HTTP status, so it flows
-    // through `UpdateError::Fetch` untouched instead of being boxed.
-    type Error = reqwest::Error;
-
-    fn fetch(&self, filename: &str) -> std::result::Result<Vec<u8>, reqwest::Error> {
-        if filename.ends_with(".lhdb") {
-            println!("downloading {filename}");
-        }
-
-        let url = format!("{}/{filename}", self.base);
-        let response = self.client.get(&url).send()?.error_for_status()?;
-
-        Ok(response.bytes()?.to_vec())
-    }
 }

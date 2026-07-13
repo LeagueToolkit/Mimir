@@ -9,10 +9,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::store::{validate_version, MANIFEST_FILE};
-use crate::{fsutil, CommitItem, Error, GcReport, HashStore, Manifest, Result, Table};
+use crate::store::{is_valid_version, MANIFEST_FILE};
+use crate::{fsutil, CommitItem, GcReport, HashStore, Manifest, ManifestError, Table, UpdateError};
 
-/// The boxed error a [`Fetch`] may return; wrapped into [`Error::Fetch`]
+/// The boxed error a [`Fetch`] may return; wrapped into [`UpdateError::Fetch`]
 /// with the filename that failed.
 pub type FetchError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -104,15 +104,15 @@ impl HashStore {
         &self,
         remote: &(impl Fetch + ?Sized),
         options: UpdateOptions,
-    ) -> Result<UpdateOutcome> {
+    ) -> Result<UpdateOutcome, UpdateError> {
         let Some(_lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
         };
 
         let local = match self.manifest() {
             Ok(manifest) => Some(manifest),
-            Err(Error::MissingManifest(_)) => None,
-            Err(e) => return Err(e),
+            Err(ManifestError::Missing(_)) => None,
+            Err(e) => return Err(e.into()),
         };
 
         // Stage a verified download for every table that differs from the local
@@ -127,7 +127,7 @@ impl HashStore {
                 continue;
             };
             let version =
-                version_of(table, &entry.file).ok_or_else(|| Error::BadRemoteFilename {
+                version_of(table, &entry.file).ok_or_else(|| UpdateError::BadRemoteFilename {
                     id: id.clone(),
                     file: entry.file.clone(),
                 })?;
@@ -142,7 +142,7 @@ impl HashStore {
             let bytes = fetch(remote, &entry.file)?;
             let sha256 = fsutil::sha256_bytes(&bytes);
             if sha256 != entry.sha256 {
-                return Err(Error::ChecksumMismatch {
+                return Err(UpdateError::ChecksumMismatch {
                     file: entry.file.clone(),
                     expected: entry.sha256.clone(),
                     actual: sha256,
@@ -174,8 +174,8 @@ impl HashStore {
 }
 
 /// Run one fetch, wrapping the fetcher's error with the filename.
-fn fetch(remote: &(impl Fetch + ?Sized), filename: &str) -> Result<Vec<u8>> {
-    remote.fetch(filename).map_err(|source| Error::Fetch {
+fn fetch(remote: &(impl Fetch + ?Sized), filename: &str) -> Result<Vec<u8>, UpdateError> {
+    remote.fetch(filename).map_err(|source| UpdateError::Fetch {
         file: filename.to_string(),
         source,
     })
@@ -183,14 +183,14 @@ fn fetch(remote: &(impl Fetch + ?Sized), filename: &str) -> Result<Vec<u8>> {
 
 /// The version label embedded in a release filename (`<id>-<version>.lhdb`).
 /// The manifest is remote input and the filename is reused locally, so anything
-/// that is not a clean path component is rejected via [`validate_version`].
+/// that is not a clean path component is rejected via [`is_valid_version`].
 fn version_of(table: Table, file: &str) -> Option<&str> {
     let version = file
         .strip_prefix(table.id())?
         .strip_prefix('-')?
         .strip_suffix(".lhdb")?;
 
-    validate_version(version).ok().map(|()| version)
+    is_valid_version(version).then_some(version)
 }
 
 #[cfg(test)]

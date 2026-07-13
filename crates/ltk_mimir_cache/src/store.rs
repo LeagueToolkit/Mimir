@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use ltk_hashdb::HashDb;
 
 use crate::manifest::{Manifest, Source, TableEntry};
-use crate::{dir, fsutil, Error, Result, Table, UpdateLock};
+use crate::{
+    dir, fsutil, CommitError, GcError, ManifestError, NoCacheDirError, OpenError, Table, UpdateLock,
+};
 
 /// The manifest filename inside the cache directory.
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
@@ -60,7 +62,7 @@ pub struct GcReport {
 impl HashStore {
     /// Resolve the cache directory from the environment / platform. Does not
     /// create it.
-    pub fn discover() -> Result<Self> {
+    pub fn discover() -> Result<Self, NoCacheDirError> {
         Ok(Self {
             dir: dir::resolve()?,
         })
@@ -81,16 +83,18 @@ impl HashStore {
         self.dir.join(MANIFEST_FILE)
     }
 
-    /// Read and parse the manifest. Errors with [`Error::MissingManifest`] if the cache
+    /// Read and parse the manifest. Errors with [`ManifestError::Missing`] if the cache
     /// has never been published to.
-    pub fn manifest(&self) -> Result<Manifest> {
+    pub fn manifest(&self) -> Result<Manifest, ManifestError> {
         Manifest::read(&self.manifest_path())
     }
 
     /// The active on-disk path for `table`, per the manifest.
-    pub fn path_for(&self, table: Table) -> Result<PathBuf> {
+    pub fn path_for(&self, table: Table) -> Result<PathBuf, OpenError> {
         let manifest = self.manifest()?;
-        let entry = manifest.entry(table).ok_or(Error::TableNotFound(table))?;
+        let entry = manifest
+            .entry(table)
+            .ok_or(OpenError::TableNotFound(table))?;
         Ok(self.dir.join(&entry.file))
     }
 
@@ -99,16 +103,16 @@ impl HashStore {
     /// Structure is validated on open; the download-time sha256 in the manifest is
     /// trusted, so this stays cheap and lazy. Use [`HashDb::verify`] for a full
     /// checksum pass.
-    pub fn open(&self, table: Table) -> Result<HashDb> {
+    pub fn open(&self, table: Table) -> Result<HashDb, OpenError> {
         Ok(HashDb::open(self.path_for(table)?)?)
     }
 
     /// Try to become the single updater without blocking. `Ok(None)` means another
     /// process is already updating. Hold the returned guard across
     /// download/build/[`commit`](HashStore::commit)/[`gc`](HashStore::gc).
-    pub fn try_lock_update(&self) -> Result<Option<UpdateLock>> {
+    pub fn try_lock_update(&self) -> std::io::Result<Option<UpdateLock>> {
         std::fs::create_dir_all(&self.dir)?;
-        Ok(UpdateLock::try_acquire(&self.dir.join(UPDATE_LOCK_FILE))?)
+        UpdateLock::try_acquire(&self.dir.join(UPDATE_LOCK_FILE))
     }
 
     /// Install one or more freshly built tables and atomically flip the manifest to
@@ -121,20 +125,26 @@ impl HashStore {
     ///
     /// Committing zero items still refreshes the timestamp and replaces `source`,
     /// so the manifest always describes the last commit.
-    pub fn commit(&self, items: &[CommitItem], source: Option<Source>) -> Result<Manifest> {
+    pub fn commit(
+        &self,
+        items: &[CommitItem],
+        source: Option<Source>,
+    ) -> Result<Manifest, CommitError> {
         std::fs::create_dir_all(&self.dir)?;
 
         // Start from the current manifest so unpublished tables keep their pointers.
         let mut manifest = match self.manifest() {
             Ok(m) => m,
-            Err(Error::MissingManifest(_)) => Manifest::empty(),
-            Err(e) => return Err(e),
+            Err(ManifestError::Missing(_)) => Manifest::empty(),
+            Err(e) => return Err(e.into()),
         };
         manifest.generated_at = crate::manifest::now_rfc3339();
         manifest.source = source;
 
         for item in items {
-            validate_version(&item.version)?;
+            if !is_valid_version(&item.version) {
+                return Err(CommitError::InvalidVersion(item.version.clone()));
+            }
             let filename = format!("{}-{}.{}", item.table.id(), item.version, TABLE_EXT);
             let dest = self.dir.join(&filename);
 
@@ -151,7 +161,7 @@ impl HashStore {
             let sha256 = if dest.exists() {
                 let existing = fsutil::sha256_file(&dest)?;
                 if existing != fsutil::sha256_file(&item.path)? {
-                    return Err(Error::VersionReused {
+                    return Err(CommitError::VersionReused {
                         table: item.table,
                         version: item.version.clone(),
                     });
@@ -181,11 +191,11 @@ impl HashStore {
     /// `.tmp` leftovers. Files the OS refuses to delete (still mmap'd on Windows) are
     /// reported in [`GcReport::retained`] and retried on a later run. A missing
     /// manifest deletes nothing.
-    pub fn gc(&self) -> Result<GcReport> {
+    pub fn gc(&self) -> Result<GcReport, GcError> {
         let manifest = match self.manifest() {
             Ok(m) => m,
-            Err(Error::MissingManifest(_)) => return Ok(GcReport::default()),
-            Err(e) => return Err(e),
+            Err(ManifestError::Missing(_)) => return Ok(GcReport::default()),
+            Err(e) => return Err(e.into()),
         };
         let referenced: std::collections::HashSet<&str> =
             manifest.tables.values().map(|t| t.file.as_str()).collect();
@@ -218,13 +228,9 @@ impl HashStore {
 
 /// A version label must be a single path component - non-empty, no separators -
 /// so `<table>-<version>.lhdb` can never escape the cache directory.
-pub(crate) fn validate_version(version: &str) -> Result<()> {
-    let bad = version.is_empty()
-        || version.contains('/')
-        || version.contains('\\')
-        || version.contains(std::path::MAIN_SEPARATOR);
-    if bad {
-        return Err(Error::InvalidVersion(version.to_string()));
-    }
-    Ok(())
+pub(crate) fn is_valid_version(version: &str) -> bool {
+    !version.is_empty()
+        && !version.contains('/')
+        && !version.contains('\\')
+        && !version.contains(std::path::MAIN_SEPARATOR)
 }

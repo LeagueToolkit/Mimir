@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::io::Cursor;
 
 use ltk_hashdb::{
-    Casing, Compression, Error, ExtendedHashDb, HashDb, HashDbWriter, HashKind, KeyWidth,
+    BuildError, Casing, Compression, ExtendedHashDb, HashDb, HashDbWriter, HashKind, KeyWidth,
+    OpenError, VerifyError,
 };
 
 fn build_with(
@@ -162,7 +163,7 @@ fn conflicting_duplicate_key_errors() {
     w.insert(7, "a.bin");
     w.insert(7, "b.bin");
     let err = w.build(Cursor::new(Vec::new())).unwrap_err();
-    assert!(matches!(err, Error::DuplicateKey { key: 7 }));
+    assert!(matches!(err, BuildError::DuplicateKey { key: 7 }));
 }
 
 #[test]
@@ -170,7 +171,7 @@ fn u32_table_rejects_wide_keys() {
     let mut w = HashDbWriter::new(KeyWidth::U32, Compression::None);
     w.insert(0x1_0000_0000, "too/wide.bin");
     let err = w.build(Cursor::new(Vec::new())).unwrap_err();
-    assert!(matches!(err, Error::KeyOutOfRange { .. }));
+    assert!(matches!(err, BuildError::KeyOutOfRange { .. }));
 }
 
 #[test]
@@ -312,7 +313,7 @@ fn corruption_is_detected_by_verify() {
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff; // flip a bit in the arena
     let db = HashDb::open_bytes(bytes).expect("open still succeeds (lazy)");
-    assert!(matches!(db.verify(), Err(Error::ChecksumMismatch)));
+    assert!(matches!(db.verify(), Err(VerifyError::ChecksumMismatch)));
 }
 
 #[test]
@@ -327,7 +328,10 @@ fn truncated_file_rejected_on_open() {
 fn bad_magic_rejected() {
     let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     bytes[0] = b'X';
-    assert!(matches!(HashDb::open_bytes(bytes), Err(Error::BadMagic)));
+    assert!(matches!(
+        HashDb::open_bytes(bytes),
+        Err(OpenError::BadMagic)
+    ));
 }
 
 #[test]
@@ -383,7 +387,7 @@ fn path_longer_than_u16_rejected() {
     let long = "x".repeat(u16::MAX as usize + 1);
     w.insert(7, &long);
     let err = w.build(&mut Cursor::new(Vec::new())).unwrap_err();
-    assert!(matches!(err, Error::PathTooLong { key: 7, len } if len == u16::MAX as usize + 1));
+    assert!(matches!(err, BuildError::PathTooLong { key: 7, len } if len == u16::MAX as usize + 1));
 }
 
 #[test]

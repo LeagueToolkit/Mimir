@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use crate::{Error, Result};
+use crate::NoCacheDirError;
 
 /// The vendor/organization folder under the platform data dir.
 const ORG_DIR: &str = "LeagueToolkit";
@@ -17,15 +17,15 @@ const HASHES_DIR: &str = "hashes";
 
 /// Resolve the shared cache directory without creating it. A non-empty
 /// `MIMIR_DIR` overrides the platform default.
-pub fn resolve() -> Result<PathBuf> {
+pub fn resolve() -> Result<PathBuf, NoCacheDirError> {
     if let Some(dir) = std::env::var_os("MIMIR_DIR").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
     platform_dir()
 }
 
-fn platform_dir() -> Result<PathBuf> {
-    let base = directories::BaseDirs::new().ok_or(Error::NoCacheDir)?;
+fn platform_dir() -> Result<PathBuf, NoCacheDirError> {
+    let base = directories::BaseDirs::new().ok_or(NoCacheDirError)?;
     // Large, derived, per-install files belong in LocalAppData, not the
     // roaming profile.
     #[cfg(windows)]

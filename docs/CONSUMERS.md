@@ -42,7 +42,7 @@ if let Some(path) = db.get(0x1234_5678_9abc_def0) {
   decompressed and no checksum is computed (the manifest's sha256 was checked at download
   time). Pages fault in as lookups touch them.
 - If the cache has never been populated, `manifest()`/`open` fail with
-  `Error::MissingManifest` - see [Getting and updating tables](#getting-and-updating-tables).
+  `ManifestError::Missing` - see [Getting and updating tables](#getting-and-updating-tables).
 
 The logical tables are `Table::{Game, Lcu, BinEntries, BinTypes, BinFields, BinHashes,
 Rst, RstXxh3}`; `Table::ALL` iterates them and `Table::id()`/`from_id()` map to the stable
@@ -269,7 +269,7 @@ println!("{} entries, {} bytes", stats.entries, stats.file_len);
 ```
 
 - `build` sorts by key and dedups identical pairs; the same key mapped to two
-  *different* strings is an `Error::DuplicateKey`.
+  *different* strings is a `BuildError::DuplicateKey`.
 - `Compression::None` trades disk size for borrowed (`Cow::Borrowed`) zero-copy reads -
   right for small tables or latency-critical embedding. `Compression::Zeekstd` is what
   published tables use; see `docs/BENCHMARKS.md` for the frame-size/level trade-offs.

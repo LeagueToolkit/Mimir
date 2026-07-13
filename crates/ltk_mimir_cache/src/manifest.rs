@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::{fsutil, Error, Result, Table};
+use crate::{fsutil, ManifestError, Table};
 
 /// The manifest schema version this build reads and writes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -71,27 +71,27 @@ impl Manifest {
     }
 
     /// Parse a manifest from bytes, rejecting an unknown schema version.
-    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, ManifestError> {
         let manifest: Manifest = serde_json::from_slice(bytes)?;
         if manifest.schema != SCHEMA_VERSION {
-            return Err(Error::UnsupportedSchema(manifest.schema));
+            return Err(ManifestError::UnsupportedSchema(manifest.schema));
         }
         Ok(manifest)
     }
 
     /// Read and parse the manifest at `path`.
-    pub fn read(path: &Path) -> Result<Self> {
+    pub fn read(path: &Path) -> Result<Self, ManifestError> {
         match std::fs::read(path) {
             Ok(bytes) => Self::from_slice(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::MissingManifest(path.to_path_buf()))
+                Err(ManifestError::Missing(path.to_path_buf()))
             }
             Err(e) => Err(e.into()),
         }
     }
 
     /// Serialize (pretty, trailing newline) and atomically swap the manifest at `path`.
-    pub fn write_atomic(&self, path: &Path) -> Result<()> {
+    pub fn write_atomic(&self, path: &Path) -> Result<(), ManifestError> {
         let mut json = serde_json::to_vec_pretty(self)?;
         json.push(b'\n');
         fsutil::atomic_write(path, &json)?;

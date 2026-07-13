@@ -23,7 +23,7 @@
 //! The lengths section (`entry_count` × u16) has no header field: it sits
 //! immediately after the offsets, at `offsets_offset + entry_count × offset_width`.
 
-use crate::{Casing, Error, HashKind, KeyWidth, Result};
+use crate::{Casing, HashKind, KeyWidth, OpenError};
 
 pub const MAGIC: [u8; 8] = *b"HASHDB\0\0";
 pub const FORMAT_VERSION: u16 = 1;
@@ -101,34 +101,34 @@ impl Header {
 
     /// Decode and validate the header's own fields; the reader checks section
     /// bounds against the file length.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, OpenError> {
         let buf: &[u8; HEADER_SIZE] = bytes
             .get(..HEADER_SIZE)
             .and_then(|s| s.try_into().ok())
-            .ok_or(Error::MalformedHeader("file shorter than header"))?;
+            .ok_or(OpenError::MalformedHeader("file shorter than header"))?;
 
         if buf[0..8] != MAGIC {
-            return Err(Error::BadMagic);
+            return Err(OpenError::BadMagic);
         }
         let version = u16::from_le_bytes(buf[8..10].try_into().unwrap());
         if version != FORMAT_VERSION {
-            return Err(Error::UnsupportedVersion(version));
+            return Err(OpenError::UnsupportedVersion(version));
         }
         let hash_kind =
-            HashKind::from_u8(buf[10]).ok_or(Error::MalformedHeader("unknown hash_kind"))?;
+            HashKind::from_u8(buf[10]).ok_or(OpenError::MalformedHeader("unknown hash_kind"))?;
         let flags = buf[11];
         if flags & !KNOWN_FLAGS != 0 {
-            return Err(Error::MalformedHeader("unknown flag bits set"));
+            return Err(OpenError::MalformedHeader("unknown flag bits set"));
         }
         let key_width = match buf[12] {
             4 => KeyWidth::U32,
             8 => KeyWidth::U64,
-            _ => return Err(Error::MalformedHeader("key_width must be 4 or 8")),
+            _ => return Err(OpenError::MalformedHeader("key_width must be 4 or 8")),
         };
         let offset_width = match buf[13] {
             4 => OffsetWidth::U32,
             8 => OffsetWidth::U64,
-            _ => return Err(Error::MalformedHeader("offset_width must be 4 or 8")),
+            _ => return Err(OpenError::MalformedHeader("offset_width must be 4 or 8")),
         };
 
         let u64_at = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());

@@ -7,7 +7,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::header::{
     Header, OffsetWidth, FLAG_ARENA_COMPRESSED, FLAG_CASE_INSENSITIVE, HEADER_SIZE,
 };
-use crate::{Casing, Compression, Error, HashKind, KeyWidth, Result};
+use crate::{BuildError, Casing, Compression, HashKind, KeyWidth};
 
 /// Collects `(key, path)` pairs, then [`HashDbWriter::build`] sorts by key, dedups,
 /// assigns arena offsets, and writes the file.
@@ -65,16 +65,16 @@ impl HashDbWriter {
     /// Sort by key, dedup, assign offsets, and write
     /// header + keys + offsets + lengths + arena.
     ///
-    /// A key mapped to two different paths is an [`Error::DuplicateKey`].
-    pub fn build<W: Write + Seek>(mut self, mut out: W) -> Result<BuildStats> {
+    /// A key mapped to two different paths is a [`BuildError::DuplicateKey`].
+    pub fn build<W: Write + Seek>(mut self, mut out: W) -> Result<BuildStats, BuildError> {
         self.entries.sort_unstable();
         self.entries.dedup();
         if let Some(w) = self.entries.windows(2).find(|w| w[0].0 == w[1].0) {
-            return Err(Error::DuplicateKey { key: w[0].0 });
+            return Err(BuildError::DuplicateKey { key: w[0].0 });
         }
         if self.key_width == KeyWidth::U32 {
             if let Some(&(key, _)) = self.entries.iter().find(|(k, _)| *k > u32::MAX as u64) {
-                return Err(Error::KeyOutOfRange { key });
+                return Err(BuildError::KeyOutOfRange { key });
             }
         }
 
@@ -93,7 +93,7 @@ impl HashDbWriter {
         for &i in &by_path {
             let (key, path) = &self.entries[i];
             if path.len() > u16::MAX as usize {
-                return Err(Error::PathTooLong {
+                return Err(BuildError::PathTooLong {
                     key: *key,
                     len: path.len(),
                 });
@@ -138,7 +138,7 @@ impl HashDbWriter {
             Compression::None => (arena, 0),
             Compression::Zeekstd { frame_size, level } => {
                 if frame_size == 0 {
-                    return Err(Error::Malformed("zeekstd frame_size must be nonzero"));
+                    return Err(BuildError::ZeroFrameSize);
                 }
                 let mut compressed = Vec::new();
                 let mut encoder = zeekstd::EncodeOptions::new()

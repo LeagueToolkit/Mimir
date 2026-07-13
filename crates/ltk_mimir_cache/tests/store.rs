@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ltk_hashdb::{Compression, HashDbWriter, KeyWidth};
-use ltk_mimir_cache::{CommitItem, Error, HashStore, Source, Table};
+use ltk_mimir_cache::{
+    CommitError, CommitItem, HashStore, ManifestError, OpenError, Source, Table,
+};
 use tempfile::tempdir;
 
 /// Build a raw `.lhdb` at `path` from `entries`, returning the path.
@@ -104,7 +106,7 @@ fn open_missing_manifest_and_table_error() {
     // No manifest yet.
     assert!(matches!(
         store.open(Table::Game),
-        Err(ltk_mimir_cache::Error::MissingManifest(_))
+        Err(OpenError::Manifest(ManifestError::Missing(_)))
     ));
 
     // Manifest exists but lacks the requested table.
@@ -114,7 +116,7 @@ fn open_missing_manifest_and_table_error() {
         .unwrap();
     assert!(matches!(
         store.open(Table::Lcu),
-        Err(ltk_mimir_cache::Error::TableNotFound(Table::Lcu))
+        Err(OpenError::TableNotFound(Table::Lcu))
     ));
 }
 
@@ -148,7 +150,7 @@ fn invalid_version_is_rejected() {
     for bad in ["", "a/b", "a\\b"] {
         assert!(matches!(
             store.commit(&[CommitItem::new(Table::Game, bad, &src)], None),
-            Err(ltk_mimir_cache::Error::InvalidVersion(_))
+            Err(CommitError::InvalidVersion(_))
         ));
     }
     // No manifest should have been written for a rejected commit.
@@ -174,7 +176,7 @@ fn reused_version_with_different_content_is_rejected() {
     assert!(
         matches!(
             err,
-            Error::VersionReused {
+            CommitError::VersionReused {
                 table: Table::Game,
                 ..
             }

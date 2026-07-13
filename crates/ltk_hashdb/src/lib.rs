@@ -15,7 +15,7 @@ mod header;
 mod reader;
 mod writer;
 
-pub use error::{Error, Result};
+pub use error::{BuildError, OpenError, VerifyError};
 pub use extended::ExtendedHashDb;
 pub use hash::{Casing, HashKind};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
 use ltk_mimir_cache::{
-    CommitItem, Error, Fetch, FetchError, HashStore, Manifest, Source, Table, UpdateOptions,
+    CommitItem, Fetch, FetchError, HashStore, Manifest, Source, Table, UpdateError, UpdateOptions,
     UpdateOutcome, UpdateReport,
 };
 use tempfile::tempdir;
@@ -202,7 +202,7 @@ fn corrupted_download_fails_without_installing() {
         .unwrap_err();
 
     assert!(
-        matches!(err, Error::ChecksumMismatch { ref file, .. } if file == "game-1.lhdb"),
+        matches!(err, UpdateError::ChecksumMismatch { ref file, .. } if file == "game-1.lhdb"),
         "{err}"
     );
     assert!(
@@ -286,7 +286,7 @@ fn release_race_errors_and_rerun_converges() {
     };
 
     let err = store.update(&remote, UpdateOptions::default()).unwrap_err();
-    assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err}");
+    assert!(matches!(err, UpdateError::ChecksumMismatch { .. }), "{err}");
     assert!(store.manifest().is_err(), "nothing was installed");
 
     // `latest` has settled on the new release; a re-run sees a consistent
@@ -373,6 +373,9 @@ fn malformed_remote_filename_is_rejected() {
         .update(&DirFetch(release), UpdateOptions::default())
         .unwrap_err();
 
-    assert!(matches!(err, Error::BadRemoteFilename { .. }), "{err}");
+    assert!(
+        matches!(err, UpdateError::BadRemoteFilename { .. }),
+        "{err}"
+    );
     assert!(store.manifest().is_err(), "nothing was installed");
 }

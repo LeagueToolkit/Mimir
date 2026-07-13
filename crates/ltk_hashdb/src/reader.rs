@@ -11,7 +11,7 @@ use xxhash_rust::xxh3::Xxh3;
 use zeekstd::SeekTable;
 
 use crate::header::Header;
-use crate::{Casing, Error, HashKind, KeyWidth, Result};
+use crate::{Casing, HashKind, KeyWidth, OpenError, VerifyError};
 
 /// A read-only `.hashdb` hash table.
 ///
@@ -53,25 +53,25 @@ type FrameCache = Option<(Range<u64>, Vec<u8>)>;
 
 impl HashDb {
     /// mmap `path` read-only and validate it.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
         let file = File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Self::from_backing(Backing::Mmap(mmap))
     }
 
     /// Open an in-memory image (embedded tables, tests).
-    pub fn open_bytes(bytes: impl Into<Cow<'static, [u8]>>) -> Result<Self> {
+    pub fn open_bytes(bytes: impl Into<Cow<'static, [u8]>>) -> Result<Self, OpenError> {
         Self::from_backing(Backing::Bytes(bytes.into()))
     }
 
-    fn from_backing(backing: Backing) -> Result<Self> {
+    fn from_backing(backing: Backing) -> Result<Self, OpenError> {
         let data = backing.bytes();
         let header = Header::decode(data)?;
 
         if !header.arena_compressed()
             && header.arena_compressed_size != header.arena_decompressed_size
         {
-            return Err(Error::MalformedHeader(
+            return Err(OpenError::MalformedHeader(
                 "raw arena sizes disagree (compressed != decompressed)",
             ));
         }
@@ -79,15 +79,15 @@ impl HashDb {
         let keys_len = header
             .entry_count
             .checked_mul(header.key_width.bytes() as u64)
-            .ok_or(Error::MalformedHeader("entry_count overflows"))?;
+            .ok_or(OpenError::MalformedHeader("entry_count overflows"))?;
         let offsets_len = header
             .entry_count
             .checked_mul(header.offset_width.bytes() as u64)
-            .ok_or(Error::MalformedHeader("entry_count overflows"))?;
+            .ok_or(OpenError::MalformedHeader("entry_count overflows"))?;
         let lengths_offset = header
             .offsets_offset
             .checked_add(offsets_len)
-            .ok_or(Error::MalformedHeader("section extent overflows"))?;
+            .ok_or(OpenError::MalformedHeader("section extent overflows"))?;
         let lengths_len = header.entry_count * 2;
 
         let keys = section(data.len(), header.keys_offset, keys_len)?;
@@ -109,12 +109,14 @@ impl HashDb {
                 n => st.frame_end_decomp(n - 1)?,
             };
             if total != header.arena_decompressed_size {
-                return Err(Error::Malformed(
+                return Err(OpenError::Malformed(
                     "seek table decompressed size disagrees with header",
                 ));
             }
             if st.max_frame_size_decomp() as usize > zeekstd::SEEKABLE_MAX_FRAME_SIZE {
-                return Err(Error::Malformed("frame exceeds seekable-format maximum"));
+                return Err(OpenError::Malformed(
+                    "frame exceeds seekable-format maximum",
+                ));
             }
             Some(st)
         } else {
@@ -236,7 +238,7 @@ impl HashDb {
     /// - xxh3 checksum over the stored sections
     /// - keys strictly ascending
     /// - every entry in bounds and valid UTF-8 in the arena
-    pub fn verify(&self) -> Result<()> {
+    pub fn verify(&self) -> Result<(), VerifyError> {
         let data = self.backing.bytes();
         let mut hasher = Xxh3::new();
         hasher.update(&data[self.keys.clone()]);
@@ -244,13 +246,13 @@ impl HashDb {
         hasher.update(&data[self.lengths.clone()]);
         hasher.update(&data[self.arena.clone()]);
         if hasher.digest() != self.header.checksum {
-            return Err(Error::ChecksumMismatch);
+            return Err(VerifyError::ChecksumMismatch);
         }
 
         let n = self.len();
         for i in 1..n {
             if self.key_at(i - 1) >= self.key_at(i) {
-                return Err(Error::Malformed("keys not strictly ascending"));
+                return Err(VerifyError::Malformed("keys not strictly ascending"));
             }
         }
 
@@ -260,9 +262,9 @@ impl HashDb {
                 let slice = self
                     .extent_of(i)
                     .and_then(|(start, end)| arena.get(start as usize..end as usize))
-                    .ok_or(Error::Malformed("entry extends past the arena"))?;
+                    .ok_or(VerifyError::Malformed("entry extends past the arena"))?;
                 if std::str::from_utf8(slice).is_err() {
-                    return Err(Error::Malformed("entry is not valid UTF-8"));
+                    return Err(VerifyError::Malformed("entry is not valid UTF-8"));
                 }
             }
             return Ok(());
@@ -274,13 +276,13 @@ impl HashDb {
         for i in self.arena_order() {
             let (start, end) = self
                 .extent_of(i)
-                .ok_or(Error::Malformed("entry extends past the arena"))?;
+                .ok_or(VerifyError::Malformed("entry extends past the arena"))?;
             if start == end {
                 continue;
             }
             let slice = self.frame_bytes(start, end, &mut cache)?;
             if std::str::from_utf8(slice).is_err() {
-                return Err(Error::Malformed("entry is not valid UTF-8"));
+                return Err(VerifyError::Malformed("entry is not valid UTF-8"));
             }
         }
         Ok(())
@@ -350,7 +352,15 @@ impl HashDb {
 
     /// Decompressed bytes for extent `start..end`, filling `cache` with the
     /// containing frame(s) on a miss. Caller must handle the empty (`start == end`) case.
-    fn frame_bytes<'c>(&self, start: u64, end: u64, cache: &'c mut FrameCache) -> Result<&'c [u8]> {
+    ///
+    /// Errors mean a corrupt file ([`VerifyError`]); the lookup path swallows
+    /// them into a miss, only `verify` surfaces them.
+    fn frame_bytes<'c>(
+        &self,
+        start: u64,
+        end: u64,
+        cache: &'c mut FrameCache,
+    ) -> Result<&'c [u8], VerifyError> {
         let covered = cache
             .as_ref()
             .is_some_and(|(range, _)| range.start <= start && end <= range.end);
@@ -368,7 +378,7 @@ impl HashDb {
     /// Decompress frames `lo..=hi`, returning the run's decompressed-space start
     /// offset plus the bytes. Frame content is untrusted, so every extent and
     /// output size is checked.
-    fn read_frames(&self, lo: u32, hi: u32) -> Result<(u64, Vec<u8>)> {
+    fn read_frames(&self, lo: u32, hi: u32) -> Result<(u64, Vec<u8>), VerifyError> {
         let st = self.seek_table.as_ref().expect("compressed arena");
         let arena = &self.backing.bytes()[self.arena.clone()];
         let d_start = st.frame_start_decomp(lo)?;
@@ -386,13 +396,15 @@ impl HashDb {
             let d_size = st.frame_size_decomp(f)? as usize;
             let frame = arena
                 .get(c_start..c_end)
-                .ok_or(Error::Malformed("frame extent out of arena bounds"))?;
+                .ok_or(VerifyError::Malformed("frame extent out of arena bounds"))?;
             self.decompressions.fetch_add(1, Ordering::Relaxed);
             out.get_mut().reserve(d_size);
             let pos = out.position();
             let n = dctx.decompress_to_buffer(frame, &mut out)?;
             if n != d_size {
-                return Err(Error::Malformed("frame decompressed to unexpected size"));
+                return Err(VerifyError::Malformed(
+                    "frame decompressed to unexpected size",
+                ));
             }
             out.set_position(pos + n as u64);
         }
@@ -408,12 +420,14 @@ fn read_uint(data: &[u8], at: usize, width: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-fn section(file_len: usize, offset: u64, len: u64) -> Result<Range<usize>> {
+fn section(file_len: usize, offset: u64, len: u64) -> Result<Range<usize>, OpenError> {
     let end = offset
         .checked_add(len)
-        .ok_or(Error::MalformedHeader("section extent overflows"))?;
+        .ok_or(OpenError::MalformedHeader("section extent overflows"))?;
     if end > file_len as u64 {
-        return Err(Error::MalformedHeader("section extends past end of file"));
+        return Err(OpenError::MalformedHeader(
+            "section extends past end of file",
+        ));
     }
     Ok(offset as usize..end as usize)
 }

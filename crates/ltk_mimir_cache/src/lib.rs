@@ -15,7 +15,7 @@ mod manifest;
 mod store;
 mod update;
 
-pub use error::{Error, Result};
+pub use error::{CommitError, GcError, ManifestError, NoCacheDirError, OpenError, UpdateError};
 pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};

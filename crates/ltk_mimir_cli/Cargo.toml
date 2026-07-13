@@ -15,11 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 ltk_hashdb.workspace = true
-ltk_mimir_cache.workspace = true
+ltk_mimir_cache = { workspace = true, features = ["ureq"] }
 ltk_mimir_gen.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-reqwest.workspace = true
 zstd.workspace = true
 indicatif.workspace = true
 sha2.workspace = true

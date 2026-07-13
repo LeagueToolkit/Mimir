@@ -32,6 +32,7 @@ directories = "5"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+ureq = "2"
 
 # CLI
 anyhow = "1"
@@ -51,6 +52,7 @@ ltk_meta = "0.6"
 # dev
 tempfile = "3"
 pollster = "0.4"
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 
 [workspace.dependencies.plotters]
 version = "0.3"

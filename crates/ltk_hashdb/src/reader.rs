@@ -210,10 +210,9 @@ impl HashDb {
         self.header.arena_compressed_size
     }
 
-    /// Frames decompressed over this table's lifetime. Misses never bump it, so
-    /// it doubles as a frame-coalescing probe: a clustered `get_batch` should
-    /// raise it by ~#frames, not ~#hits.
-    pub fn decompressions(&self) -> u64 {
+    /// Number of zstd frames this table has decompressed over its lifetime.
+    #[cfg(test)]
+    pub(crate) fn decompressions(&self) -> u64 {
         self.decompressions.load(Ordering::Relaxed)
     }
 

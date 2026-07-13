@@ -92,6 +92,7 @@ as an error.
 | `HashStore::try_lock_update` → `UpdateLock` | Non-blocking cross-process single-updater lock |
 | `HashStore::commit` | Install versioned files + atomically swap the manifest |
 | `HashStore::gc` → `GcReport` | Reclaim unreferenced, unmapped versions |
+| `HashStore::update` / `update_async` | The download-driven update loop (blocking or async) over a caller-supplied `Fetch` / `AsyncFetch` |
 | `Table` | The eight logical tables (`id` / `from_id` / `ALL`) |
 | `Manifest` / `Source` / `TableEntry` | The `manifest.json` schema (serde) |
 

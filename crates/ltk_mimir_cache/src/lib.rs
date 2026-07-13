@@ -5,7 +5,8 @@
 //! - Reads the manifest and opens the active table file read-only
 //! - Commits new versions atomically under a single-updater lock with lazy GC
 //! - Updates the cache in-process from a published release, through a
-//!   caller-supplied fetcher ([`HashStore::update`])
+//!   caller-supplied fetcher ([`HashStore::update`] /
+//!   [`HashStore::update_async`])
 
 mod dir;
 mod error;
@@ -19,7 +20,7 @@ pub use error::{CommitError, GcError, ManifestError, NoCacheDirError, OpenError,
 pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
-pub use update::{Fetch, FetchError, UpdateOptions, UpdateOutcome, UpdateReport};
+pub use update::{AsyncFetch, Fetch, FetchError, UpdateOptions, UpdateOutcome, UpdateReport};
 
 /// The logical hash tables, each stored as its own `.lhdb` file.
 ///

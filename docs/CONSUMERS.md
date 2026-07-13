@@ -10,7 +10,7 @@ The CLI is covered [at the end](#the-cli).
 | You want to… | Depend on |
 |---|---|
 | Resolve hashes against the machine-shared League tables (the common case) | `ltk_mimir_cache` (+ `ltk_hashdb` for the `HashDb` type it hands back) |
-| Keep that shared cache up to date from your app (no CLI) | `ltk_mimir_cache` - `HashStore::update` + your HTTP client |
+| Keep that shared cache up to date from your app (no CLI) | `ltk_mimir_cache` - `HashStore::update` / `update_async` + your HTTP client |
 | Open a specific `.hashdb`/`.lhdb` file, or bytes you embedded/downloaded yourself | `ltk_hashdb` |
 | Build your own tables (the format is general-purpose: any `u64 → str` map) | `ltk_hashdb` (writer) |
 | Brute-force unknown hashes back into paths | `ltk_mimir_gen` |
@@ -200,7 +200,34 @@ match store.update(&fetch, UpdateOptions::default())? {
 > `mimir update` is exactly this call plus a reqwest-backed `Fetch` - still the right
 > tool for cron jobs and setup scripts. **Readers need none of this** - they just `open`.
 
-Semantics worth relying on:
+Async apps (tokio + async reqwest, a GUI runtime) use `HashStore::update_async` with an
+`AsyncFetch` instead - same loop, same guarantees, awaiting each download. The future
+cannot borrow the filename, so build owned state before the `async move` block:
+
+```rust
+let fetch = |filename: &str| {
+    let url = format!(
+        "https://github.com/LeagueToolkit/mimir/releases/latest/download/{filename}"
+    );
+    async move {
+        let response = client.get(&url).send().await?.error_for_status()?;
+        Ok(response.bytes().await?.to_vec())
+    }
+};
+
+match store.update_async(&fetch, UpdateOptions::default()).await? {
+    UpdateOutcome::Locked => {}
+    UpdateOutcome::Completed(report) => { /* as above */ }
+}
+```
+
+The future is `Send` (given a `Sync` fetcher) and cancel-safe: dropping it releases the
+update lock and removes staged downloads, leaving the cache exactly as it was. Local
+work between downloads (checksum verification, the final install) runs inline on the
+calling task - up to a few hundred milliseconds per table; if that stalls your executor,
+run the blocking `update` on a dedicated thread instead.
+
+Semantics worth relying on (both variants):
 
 - **Immutability.** A published `.lhdb` is never modified; updates are new files under
   new names. Concurrent readers keep their mapping until they reopen.

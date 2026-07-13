@@ -50,6 +50,7 @@ ltk_meta = "0.6"
 
 # dev
 tempfile = "3"
+pollster = "0.4"
 
 [workspace.dependencies.plotters]
 version = "0.3"

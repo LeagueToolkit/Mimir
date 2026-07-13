@@ -6,14 +6,15 @@
 //! test binary named `update*.exe` without elevation (os error 740).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
 use ltk_mimir_cache::{
-    CommitItem, Fetch, FetchError, HashStore, Manifest, Source, Table, UpdateError, UpdateOptions,
-    UpdateOutcome, UpdateReport,
+    Fetch, FetchError, HashStore, Manifest, Table, UpdateError, UpdateOptions, UpdateOutcome,
 };
 use tempfile::tempdir;
+
+mod common;
+use common::{completed, make_release};
 
 /// Serve "release assets" straight from a directory.
 struct DirFetch(PathBuf);
@@ -21,49 +22,6 @@ struct DirFetch(PathBuf);
 impl Fetch for DirFetch {
     fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError> {
         Ok(fs::read(self.0.join(filename))?)
-    }
-}
-
-/// Build a tiny raw `.lhdb` and return its path.
-fn build_table(dir: &Path, name: &str, entries: &[(u64, &str)]) -> PathBuf {
-    let mut writer = HashDbWriter::new(KeyWidth::U64, Compression::None).hash_kind(HashKind::Xxh64);
-    for (hash, path) in entries {
-        writer.insert(*hash, path);
-    }
-
-    let path = dir.join(name);
-    writer.build(fs::File::create(&path).unwrap()).unwrap();
-    path
-}
-
-/// Stage a fake release (versioned `.lhdb` files + `manifest.json`) in `dir`,
-/// reusing the real commit path so the layout matches CI's output.
-fn make_release(dir: &Path, version: &str, tables: &[(Table, &[(u64, &str)])]) {
-    let build = dir.join(".release-build");
-    fs::create_dir_all(&build).unwrap();
-
-    let items: Vec<CommitItem> = tables
-        .iter()
-        .map(|(table, entries)| {
-            let built = build_table(&build, &format!("{}.lhdb", table.id()), entries);
-            CommitItem::new(*table, version, built)
-        })
-        .collect();
-    let source = Source {
-        repo: Some("test/data".into()),
-        commit: Some("deadbeef".into()),
-        inputs_sha256: None,
-    };
-    HashStore::at(dir).commit(&items, Some(source)).unwrap();
-
-    fs::remove_dir_all(&build).unwrap();
-}
-
-/// Unwrap a completed run's report.
-fn completed(outcome: UpdateOutcome) -> UpdateReport {
-    match outcome {
-        UpdateOutcome::Completed(report) => report,
-        UpdateOutcome::Locked => panic!("expected a completed run, got Locked"),
     }
 }
 

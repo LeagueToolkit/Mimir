@@ -175,17 +175,19 @@ matches, download and checksum-verify the rest, install atomically, GC supersede
 versions, all under the single-updater lock - is `HashStore::update`. The one thing
 you bring is the transport: the cache crate deliberately ships no HTTP client, so you
 hand it a `Fetch` (any closure from asset filename to bytes) backed by whatever client
-your app already has:
+your app already has. The fetcher's error is an associated type (`Fetch::Error`), and
+`update` returns `UpdateError<F::Error>` - a failed download surfaces your client's
+concrete error (e.g. `reqwest::Error`), not a boxed `dyn Error`:
 
 ```rust
-use ltk_mimir_cache::{FetchError, HashStore, UpdateOptions, UpdateOutcome};
+use ltk_mimir_cache::{HashStore, UpdateOptions, UpdateOutcome};
 
 let store = HashStore::discover()?;
-let fetch = |filename: &str| -> Result<Vec<u8>, FetchError> {
+let fetch = |filename: &str| -> Result<Vec<u8>, MyClientError> {
     let url = format!(
         "https://github.com/LeagueToolkit/mimir/releases/latest/download/{filename}"
     );
-    Ok(my_http_get(&url)?)   // reqwest, ureq, curl - your choice
+    my_http_get(&url)   // reqwest, ureq, curl - your choice; your error type
 };
 
 match store.update(&fetch, UpdateOptions::default())? {
@@ -211,7 +213,7 @@ let fetch = |filename: &str| {
     );
     async move {
         let response = client.get(&url).send().await?.error_for_status()?;
-        Ok(response.bytes().await?.to_vec())
+        Ok::<_, reqwest::Error>(response.bytes().await?.to_vec())
     }
 };
 

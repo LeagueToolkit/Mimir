@@ -17,25 +17,31 @@ use crate::{
     UpdateError,
 };
 
-/// The boxed error a [`Fetch`] may return; wrapped into [`UpdateError::Fetch`]
-/// with the filename that failed.
-pub type FetchError = Box<dyn std::error::Error + Send + Sync>;
-
 /// Fetch one release asset by filename (`manifest.json`,
 /// `game-<version>.lhdb`, ...).
 ///
-/// For a GitHub release the asset URL is
+/// The error is an associated type, so [`HashStore::update`] fails with
+/// [`UpdateError<Self::Error>`](UpdateError) and callers see the transport's
+/// concrete error instead of a boxed one. For a GitHub release the asset URL is
 /// `https://github.com/<owner>/<repo>/releases/latest/download/<filename>`.
-/// Any `Fn(&str) -> Result<Vec<u8>, FetchError>` closure is a `Fetch`.
+/// Any `Fn(&str) -> Result<Vec<u8>, E>` closure whose error type meets the
+/// bounds is a `Fetch`.
 pub trait Fetch {
-    fn fetch(&self, filename: &str) -> std::result::Result<Vec<u8>, FetchError>;
+    /// The error this fetcher fails with, surfaced in
+    /// [`UpdateError::Fetch`] alongside the filename that failed.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn fetch(&self, filename: &str) -> Result<Vec<u8>, Self::Error>;
 }
 
-impl<F> Fetch for F
+impl<F, E> Fetch for F
 where
-    F: Fn(&str) -> std::result::Result<Vec<u8>, FetchError>,
+    F: Fn(&str) -> Result<Vec<u8>, E>,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    fn fetch(&self, filename: &str) -> std::result::Result<Vec<u8>, FetchError> {
+    type Error = E;
+
+    fn fetch(&self, filename: &str) -> Result<Vec<u8>, E> {
         self(filename)
     }
 }
@@ -51,25 +57,29 @@ where
 /// ```ignore
 /// let fetch = |filename: &str| {
 ///     let url = format!("{base}/{filename}");
-///     async move { Ok(client.get(&url).send().await?.bytes().await?.to_vec()) }
+///     async move {
+///         let response = client.get(&url).send().await?.error_for_status()?;
+///         Ok::<_, reqwest::Error>(response.bytes().await?.to_vec())
+///     }
 /// };
 /// ```
 pub trait AsyncFetch {
-    fn fetch(
-        &self,
-        filename: &str,
-    ) -> impl Future<Output = std::result::Result<Vec<u8>, FetchError>> + Send;
+    /// The error this fetcher fails with, surfaced in
+    /// [`UpdateError::Fetch`] alongside the filename that failed.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn fetch(&self, filename: &str) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
 }
 
-impl<F, Fut> AsyncFetch for F
+impl<F, Fut, E> AsyncFetch for F
 where
     F: Fn(&str) -> Fut,
-    Fut: Future<Output = std::result::Result<Vec<u8>, FetchError>> + Send,
+    Fut: Future<Output = Result<Vec<u8>, E>> + Send,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    fn fetch(
-        &self,
-        filename: &str,
-    ) -> impl Future<Output = std::result::Result<Vec<u8>, FetchError>> + Send {
+    type Error = E;
+
+    fn fetch(&self, filename: &str) -> impl Future<Output = Result<Vec<u8>, E>> + Send {
         self(filename)
     }
 }
@@ -148,11 +158,11 @@ impl HashStore {
     /// updating. Any failure errors out before anything is installed. A release
     /// published mid-run can fail a fetch or a checksum; that state is transient
     /// and re-running converges on the new release.
-    pub fn update(
+    pub fn update<F: Fetch + ?Sized>(
         &self,
-        remote: &(impl Fetch + ?Sized),
+        remote: &F,
         options: UpdateOptions,
-    ) -> Result<UpdateOutcome, UpdateError> {
+    ) -> Result<UpdateOutcome, UpdateError<F::Error>> {
         let Some(_lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
         };
@@ -187,11 +197,11 @@ impl HashStore {
     /// lock and removes staged `.tmp` downloads, and the manifest only flips
     /// after every file is durable, so a cancelled run leaves the cache
     /// exactly as it was.
-    pub async fn update_async(
+    pub async fn update_async<F: AsyncFetch + ?Sized>(
         &self,
-        remote: &(impl AsyncFetch + ?Sized),
+        remote: &F,
         options: UpdateOptions,
-    ) -> Result<UpdateOutcome, UpdateError> {
+    ) -> Result<UpdateOutcome, UpdateError<F::Error>> {
         let Some(_lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
         };
@@ -213,12 +223,12 @@ impl HashStore {
     /// the local manifest or whose file went missing (all of them under
     /// [`force`](UpdateOptions::force)). Unknown remote ids are recorded in
     /// `report` and skipped; a malformed remote filename is fatal.
-    fn plan<'a>(
+    fn plan<'a, E>(
         &self,
         remote: &'a Manifest,
         options: UpdateOptions,
         report: &mut UpdateReport,
-    ) -> Result<Vec<PlannedDownload<'a>>, UpdateError> {
+    ) -> Result<Vec<PlannedDownload<'a>>, UpdateError<E>> {
         let local = match self.manifest() {
             Ok(manifest) => Some(manifest),
             Err(ManifestError::Missing(_)) => None,
@@ -256,12 +266,12 @@ impl HashStore {
 
     /// Verify downloaded bytes against the planned entry's sha256 and stage
     /// them as a `.download.tmp` next to their final name.
-    fn verify_and_stage(
+    fn verify_and_stage<E>(
         &self,
         download: &PlannedDownload<'_>,
         bytes: &[u8],
         staged: &mut Staged,
-    ) -> Result<CommitItem, UpdateError> {
+    ) -> Result<CommitItem, UpdateError<E>> {
         let sha256 = fsutil::sha256_bytes(bytes);
         if sha256 != download.entry.sha256 {
             return Err(UpdateError::ChecksumMismatch {
@@ -284,13 +294,13 @@ impl HashStore {
     /// Install the staged items and sweep superseded versions - the shared
     /// tail of [`update`](HashStore::update) and
     /// [`update_async`](HashStore::update_async).
-    fn finish(
+    fn finish<E>(
         &self,
         items: Vec<CommitItem>,
         staged: Staged,
         source: Option<Source>,
         mut report: UpdateReport,
-    ) -> Result<UpdateOutcome, UpdateError> {
+    ) -> Result<UpdateOutcome, UpdateError<E>> {
         // Install atomically - table files first, manifest pointer last.
         if !items.is_empty() {
             self.commit(&items, source)?;
@@ -308,7 +318,7 @@ impl HashStore {
 }
 
 /// Run one fetch, wrapping the fetcher's error with the filename.
-fn fetch(remote: &(impl Fetch + ?Sized), filename: &str) -> Result<Vec<u8>, UpdateError> {
+fn fetch<F: Fetch + ?Sized>(remote: &F, filename: &str) -> Result<Vec<u8>, UpdateError<F::Error>> {
     remote.fetch(filename).map_err(|source| UpdateError::Fetch {
         file: filename.to_string(),
         source,
@@ -316,10 +326,10 @@ fn fetch(remote: &(impl Fetch + ?Sized), filename: &str) -> Result<Vec<u8>, Upda
 }
 
 /// Run one async fetch, wrapping the fetcher's error with the filename.
-async fn fetch_async(
-    remote: &(impl AsyncFetch + ?Sized),
+async fn fetch_async<F: AsyncFetch + ?Sized>(
+    remote: &F,
     filename: &str,
-) -> Result<Vec<u8>, UpdateError> {
+) -> Result<Vec<u8>, UpdateError<F::Error>> {
     remote
         .fetch(filename)
         .await

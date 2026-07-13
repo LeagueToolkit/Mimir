@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use ltk_mimir_cache::{Fetch, FetchError, HashStore, UpdateOptions, UpdateOutcome};
+use ltk_mimir_cache::{Fetch, HashStore, UpdateOptions, UpdateOutcome};
 
 pub struct Options {
     /// GitHub `owner/repo` whose latest release ships the tables.
@@ -87,24 +87,18 @@ struct HttpFetch {
 }
 
 impl Fetch for HttpFetch {
-    fn fetch(&self, filename: &str) -> std::result::Result<Vec<u8>, FetchError> {
+    // reqwest's error already names the URL and HTTP status, so it flows
+    // through `UpdateError::Fetch` untouched instead of being boxed.
+    type Error = reqwest::Error;
+
+    fn fetch(&self, filename: &str) -> std::result::Result<Vec<u8>, reqwest::Error> {
         if filename.ends_with(".lhdb") {
             println!("downloading {filename}");
         }
 
         let url = format!("{}/{filename}", self.base);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !response.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", response.status()).into());
-        }
+        let response = self.client.get(&url).send()?.error_for_status()?;
 
-        Ok(response
-            .bytes()
-            .map_err(|e| format!("reading {url}: {e}"))?
-            .to_vec())
+        Ok(response.bytes()?.to_vec())
     }
 }

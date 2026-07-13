@@ -76,8 +76,12 @@ pub enum GcError {
 }
 
 /// Errors from an update run ([`HashStore::update`](crate::HashStore::update)).
+///
+/// Generic over the fetcher's error type ([`Fetch::Error`](crate::Fetch::Error) /
+/// [`AsyncFetch::Error`](crate::AsyncFetch::Error)), so a failed download
+/// surfaces the transport's concrete error instead of a boxed one.
 #[derive(Debug, Error)]
-pub enum UpdateError {
+pub enum UpdateError<E> {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -88,7 +92,7 @@ pub enum UpdateError {
     Fetch {
         file: String,
         #[source]
-        source: crate::FetchError,
+        source: E,
     },
 
     #[error("{file}: sha256 mismatch (manifest {expected}, downloaded {actual})")]

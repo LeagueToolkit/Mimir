@@ -13,9 +13,7 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
-use ltk_mimir_cache::{
-    AsyncFetch, FetchError, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome,
-};
+use ltk_mimir_cache::{AsyncFetch, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome};
 use pollster::block_on;
 use tempfile::tempdir;
 
@@ -26,8 +24,10 @@ use common::{completed, make_release};
 struct DirFetch(PathBuf);
 
 impl AsyncFetch for DirFetch {
-    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError> {
-        Ok(fs::read(self.0.join(filename))?)
+    type Error = std::io::Error;
+
+    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
+        fs::read(self.0.join(filename))
     }
 }
 
@@ -54,10 +54,11 @@ fn fresh_install_downloads_everything() {
     );
 
     // A closure is an `AsyncFetch` too - it builds owned state before the
-    // `async move` block since the future cannot borrow the filename.
+    // `async move` block since the future cannot borrow the filename. Its
+    // error type stays concrete and comes back as `UpdateError<io::Error>`.
     let fetch = |filename: &str| {
         let path = release.join(filename);
-        async move { Ok::<_, FetchError>(fs::read(path)?) }
+        async move { fs::read(path) }
     };
     let store = HashStore::at(&cache);
     let report = completed(block_on(store.update_async(&fetch, UpdateOptions::default())).unwrap());
@@ -142,11 +143,13 @@ fn locked_cache_is_skipped() {
 struct StallOnLcu(PathBuf);
 
 impl AsyncFetch for StallOnLcu {
-    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError> {
+    type Error = std::io::Error;
+
+    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
         if filename.starts_with("lcu-") {
             std::future::pending::<()>().await;
         }
-        Ok(fs::read(self.0.join(filename))?)
+        fs::read(self.0.join(filename))
     }
 }
 

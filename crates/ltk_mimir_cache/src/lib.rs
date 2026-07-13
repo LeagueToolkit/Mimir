@@ -20,7 +20,7 @@ pub use error::{CommitError, GcError, ManifestError, NoCacheDirError, OpenError,
 pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
-pub use update::{AsyncFetch, Fetch, FetchError, UpdateOptions, UpdateOutcome, UpdateReport};
+pub use update::{AsyncFetch, Fetch, UpdateOptions, UpdateOutcome, UpdateReport};
 
 /// The logical hash tables, each stored as its own `.lhdb` file.
 ///

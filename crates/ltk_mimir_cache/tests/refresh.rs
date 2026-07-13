@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use ltk_mimir_cache::{
-    Fetch, FetchError, HashStore, Manifest, Table, UpdateError, UpdateOptions, UpdateOutcome,
+    Fetch, HashStore, Manifest, Table, UpdateError, UpdateOptions, UpdateOutcome,
 };
 use tempfile::tempdir;
 
@@ -20,8 +20,10 @@ use common::{completed, make_release};
 struct DirFetch(PathBuf);
 
 impl Fetch for DirFetch {
-    fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError> {
-        Ok(fs::read(self.0.join(filename))?)
+    type Error = std::io::Error;
+
+    fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
+        fs::read(self.0.join(filename))
     }
 }
 
@@ -40,8 +42,9 @@ fn fresh_install_downloads_everything() {
     );
 
     // A closure is a `Fetch` too - this is the shape most consumers will use.
+    // Its error type stays concrete and comes back as `UpdateError<io::Error>`.
     let fetch =
-        |filename: &str| -> Result<Vec<u8>, FetchError> { Ok(fs::read(release.join(filename))?) };
+        |filename: &str| -> Result<Vec<u8>, std::io::Error> { fs::read(release.join(filename)) };
     let store = HashStore::at(&cache);
     let report = completed(store.update(&fetch, UpdateOptions::default()).unwrap());
 
@@ -223,7 +226,9 @@ fn release_race_errors_and_rerun_converges() {
         flipped: std::cell::Cell<bool>,
     }
     impl Fetch for RacingFetch {
-        fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError> {
+        type Error = std::io::Error;
+
+        fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
             if filename.ends_with(".lhdb") {
                 self.flipped.set(true);
             }
@@ -232,7 +237,7 @@ fn release_race_errors_and_rerun_converges() {
             } else {
                 &self.old
             };
-            Ok(fs::read(dir.join(filename))?)
+            fs::read(dir.join(filename))
         }
     }
 

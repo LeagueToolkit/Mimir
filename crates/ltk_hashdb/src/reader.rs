@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use xxhash_rust::xxh3::Xxh3;
@@ -124,6 +124,10 @@ struct Inner {
 
     /// Frames decompressed so far; misses must never bump it (see unit tests).
     decompressions: AtomicU64,
+
+    /// Cleared for good the first time a lookup swallows a decompression failure,
+    /// so "this build knows nothing" can be told apart from "this file is broken".
+    healthy: AtomicBool,
 }
 
 enum Backing {
@@ -318,6 +322,7 @@ impl HashDb {
                 seek_table,
                 cache,
                 decompressions: AtomicU64::new(0),
+                healthy: AtomicBool::new(true),
             }),
         })
     }
@@ -327,7 +332,58 @@ impl HashDb {
     /// (corrupt file - see [`HashDb::verify`]).
     pub fn get(&self, hash: u64) -> Option<PathRef<'_>> {
         let i = self.inner.index_of(hash)?;
-        self.inner.bytes_at(i).ok().flatten().map(PathRef::from)
+        self.inner.lookup(i).map(PathRef::from)
+    }
+
+    /// Look up a hash, surfacing a corrupt arena instead of reporting it as a miss.
+    ///
+    /// [`get`](HashDb::get) follows the format's rule that an entry which will not
+    /// decompress reads as a miss. That is right for resolving names and wrong for
+    /// telling a user why every name in an install came back unknown, so this returns
+    /// the failure at the call site instead. `Ok(None)` is a genuine miss.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`VerifyError`] when the entry's frame will not decompress or its
+    /// extent runs outside the arena - always a corrupt file.
+    pub fn try_get(&self, hash: u64) -> Result<Option<PathRef<'_>>, VerifyError> {
+        let Some(i) = self.inner.index_of(hash) else {
+            return Ok(None);
+        };
+
+        Ok(self.inner.bytes_at(i)?.map(PathRef::from))
+    }
+
+    /// Copy a path into `buf`, replacing what was there. `false` for a miss.
+    ///
+    /// The counterpart to [`get`](HashDb::get) for a caller looping over a reusable
+    /// buffer: it copies the bytes out and holds no frame afterwards, where a retained
+    /// [`PathRef`] keeps its frame resident.
+    pub fn get_into(&self, hash: u64, buf: &mut String) -> bool {
+        let Some(i) = self.inner.index_of(hash) else {
+            return false;
+        };
+        let Some(bytes) = self.inner.lookup(i) else {
+            return false;
+        };
+
+        buf.clear();
+        match std::str::from_utf8(bytes.as_slice()) {
+            Ok(path) => buf.push_str(path),
+            Err(_) => buf.push_str(&String::from_utf8_lossy(bytes.as_slice())),
+        }
+
+        true
+    }
+
+    /// Whether every lookup so far has read cleanly.
+    ///
+    /// Turns false for good the first time a lookup hits an entry that will not
+    /// decompress - bit rot, a truncated write - and stays false. Nothing re-verifies
+    /// an installed table after its download checksum, so this is the cheap signal that
+    /// a table needs [`verify`](HashDb::verify) rather than a redownload of the world.
+    pub fn is_healthy(&self) -> bool {
+        self.inner.healthy.load(Ordering::Relaxed)
     }
 
     /// Membership test; never touches the arena.
@@ -350,12 +406,35 @@ impl HashDb {
         results.resize_with(hashes.len(), || None);
         for p in order {
             if let Some(i) = indices[p] {
-                results[p] = self.inner.bytes_at(i).ok().flatten().map(PathRef::from);
+                results[p] = self.inner.lookup(i).map(PathRef::from);
             }
         }
 
         let out: Vec<(u64, Option<PathRef<'a>>)> = hashes.iter().copied().zip(results).collect();
         out.into_iter()
+    }
+
+    /// Resolve a batch without collecting it, calling `f` per hash as it resolves.
+    ///
+    /// The allocation-free batch: where [`get_batch`](HashDb::get_batch) materialises
+    /// every result before yielding the first, this hands each one straight to `f`.
+    /// Calls arrive in **arena order**, not input order - that is what lets each frame
+    /// decompress once - so the first argument is the hash's position in `hashes`.
+    pub fn for_each_batch(&self, hashes: &[u64], mut f: impl FnMut(usize, u64, Option<&str>)) {
+        let indices: Vec<Option<usize>> = hashes.iter().map(|&h| self.inner.index_of(h)).collect();
+        let mut order: Vec<usize> = (0..hashes.len()).collect();
+        order.sort_unstable_by_key(|&p| indices[p].map_or(u64::MAX, |i| self.inner.offset_at(i)));
+
+        for p in order {
+            let path = indices[p].and_then(|i| self.inner.lookup(i));
+            match path {
+                Some(bytes) => {
+                    let path = PathRef::from(bytes);
+                    f(p, hashes[p], Some(&path));
+                }
+                None => f(p, hashes[p], None),
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -416,7 +495,7 @@ impl HashDb {
     /// decompresses once. Entries that fail to decompress are skipped; `verify()` reports them.
     pub fn iter(&self) -> impl Iterator<Item = (u64, PathRef<'_>)> {
         self.inner.arena_order().into_iter().filter_map(move |i| {
-            let bytes = self.inner.bytes_at(i).ok().flatten()?;
+            let bytes = self.inner.lookup(i)?;
             Some((self.inner.key_at(i), PathRef::from(bytes)))
         })
     }
@@ -602,6 +681,18 @@ impl Inner {
         Ok(Some(Bytes::Spliced(spliced)))
     }
 
+    /// Entry `i`'s bytes for a lookup: a failure to decompress reads as a miss, and
+    /// trips the health flag on its way past.
+    fn lookup(&self, i: usize) -> Option<Bytes<'_>> {
+        match self.bytes_at(i) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.healthy.store(false, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     /// Check one entry the way `verify` needs it checked: in bounds and valid UTF-8.
     fn verify_entry(&self, i: usize) -> Result<(), VerifyError> {
         let bytes = self
@@ -691,6 +782,14 @@ mod tests {
     }
 
     fn compressed_db_with(frame_size: u32, cache_bytes: usize) -> HashDb {
+        HashDb::options()
+            .frame_cache_bytes(cache_bytes)
+            .open_bytes(compressed_bytes(frame_size))
+            .expect("open")
+    }
+
+    /// 100 clustered paths, keyed `i * 3`, spanning several frames.
+    fn compressed_bytes(frame_size: u32) -> Vec<u8> {
         let mut w = HashDbWriter::new(
             KeyWidth::U64,
             Compression::Zeekstd {
@@ -706,10 +805,7 @@ mod tests {
         }
         let mut out = Cursor::new(Vec::new());
         w.build(&mut out).expect("build");
-        HashDb::options()
-            .frame_cache_bytes(cache_bytes)
-            .open_bytes(out.into_inner())
-            .expect("open")
+        out.into_inner()
     }
 
     /// A miss is decided by the key array alone - never a frame decompression.
@@ -754,6 +850,64 @@ mod tests {
         let clone = db.clone();
         assert!(clone.get(0).is_some());
         assert_eq!(clone.decompressions(), after_first);
+    }
+
+    /// A table whose arena no longer decompresses must degrade to misses, say so via
+    /// `is_healthy`, and surface the reason through `try_get` - never panic.
+    #[test]
+    fn a_corrupt_frame_reports_unhealthy() {
+        let mut bytes = compressed_bytes(128);
+        // The seek table lives at the end of the arena, so scribbling over the start
+        // leaves the file openable and breaks only the frames it lands on.
+        let arena_offset = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+        for byte in &mut bytes[arena_offset..arena_offset + 64] {
+            *byte = 0xff;
+        }
+
+        let db = HashDb::open_bytes(bytes).expect("open");
+        assert!(db.is_healthy(), "nothing has been read yet");
+
+        let keys: Vec<u64> = (0..100u64).map(|i| i * 3).collect();
+        let swallowed = keys.iter().filter(|&&k| db.get(k).is_none()).count();
+        assert!(swallowed > 0, "the corrupt frame should swallow lookups");
+        assert!(!db.is_healthy(), "and say so afterwards");
+
+        // The same lookups report the corruption when asked to.
+        let surfaced = keys.iter().filter(|&&k| db.try_get(k).is_err()).count();
+        assert_eq!(surfaced, swallowed);
+
+        // Entries in the untouched frames still resolve.
+        assert!(keys.iter().any(|&k| db.get(k).is_some()));
+    }
+
+    #[test]
+    fn for_each_batch_matches_get_batch() {
+        let db = compressed_db(128);
+        let probes = [0u64, 3, 297, 1, 99, 0];
+
+        let mut streamed: Vec<(u64, Option<String>)> = vec![(0, None); probes.len()];
+        db.for_each_batch(&probes, |i, hash, path| {
+            streamed[i] = (hash, path.map(str::to_owned));
+        });
+
+        let collected: Vec<(u64, Option<String>)> = db
+            .get_batch(&probes)
+            .map(|(hash, path)| (hash, path.map(|p| p.into_owned())))
+            .collect();
+        assert_eq!(streamed, collected);
+    }
+
+    #[test]
+    fn get_into_reuses_the_callers_buffer() {
+        let db = compressed_db(128);
+        let mut buf = String::from("stale contents");
+
+        assert!(db.get_into(0, &mut buf));
+        assert_eq!(buf, "assets/characters/champ0/skins/skin0.bin");
+
+        // A miss leaves the buffer alone rather than clearing it.
+        assert!(!db.get_into(1, &mut buf));
+        assert_eq!(buf, "assets/characters/champ0/skins/skin0.bin");
     }
 
     /// With caching off, every lookup pays for its own frame - the old behaviour,

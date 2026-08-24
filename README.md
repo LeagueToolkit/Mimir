@@ -136,9 +136,10 @@ use ltk_mimir_cache::{HashStore, Table};
 let store = HashStore::discover()?;
 
 // Missing tables are reported, not fatal - the tool stays usable and their hashes miss.
-let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+// The call itself only fails if you ask for tables from different hash universes.
+let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu])?;
 for (table, e) in &errors {
-    eprintln!("skipping {table:?}: {e}");
+    eprintln!("skipping {table}: {e}");
 }
 
 // Register a path your mod introduced; it is hashed with the first base's algorithm.
@@ -148,8 +149,10 @@ assert_eq!(db.get(hash).as_deref(), Some("assets/mymod/custom.dds"));
 
 > [!NOTE]
 > Every base must agree on key width, hash algorithm, and casing, because lookups take a
-> hash the caller already computed and no base re-hashes it. `game` and `lcu` do; the four
-> 32-bit `bin*` tables are separate hash universes and must not be layered together.
+> hash the caller already computed and no base re-hashes it - `push_base` returns a
+> `KeyConfigMismatch` rather than layering one that doesn't. `game` and `lcu` agree; the
+> four 32-bit `bin*` tables agree too, and still must not be layered, because they are
+> separate hash *universes* - so `open_layered` refuses that set outright.
 
 ### Enumerating a table
 
@@ -193,7 +196,7 @@ use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
 
 let mut writer = HashDbWriter::new(KeyWidth::U64, Compression::default())
     .hash_kind(HashKind::Xxh64)     // recorded, so readers can hash new paths
-    .casing(Casing::Insensitive);   // League tables hash the lowercased path
+    .casing(Casing::AsciiInsensitive);   // League tables hash the ASCII-lowercased path
 
 writer.insert(hash, "assets/characters/ahri/ahri.bin");
 writer.extend(pairs);
@@ -244,15 +247,24 @@ frame cache. `Send + Sync`.
 | `discover` · `at` | resolve the platform cache dir, or point at your own |
 | `open_shared` | open the active version, reusing a handle this store already has |
 | `open` · `open_many` | open a fresh mapping, one table or several |
-| `open_layered` | open several into one `LayeredHashDb`, reporting per-table errors |
+| `open_layered` | open several of one universe into a `LayeredHashDb`, reporting per-table errors |
 | `manifest` · `path_for` | what is installed, and where |
 | `update` · `update_async` | compare → download → verify → install → GC |
 | `commit` · `gc` · `try_lock_update` | publish versions, sweep old ones, take the lock |
 
+**`Table`** - which logical table, and how it hashes.
+
+| Method | |
+|---|---|
+| `ALL` · `id` · `Display` · `FromStr` · serde | the stable spellings (`game`, `binentries`, `rst-xxh3`) |
+| `key_config` · `key_width` · `hash_kind` · `casing` | how this table's keys were produced |
+| `universe` | which hashes it can answer - only same-universe tables may be layered |
+
 **`PathRef`** - a resolved path. `Deref<Target = str>`, plus `as_str`, `is_owned`
 (whether the bytes were copied rather than borrowed), and `into_owned`.
 
-**`HashDbWriter`** - `new` → `hash_kind` / `casing` → `insert` / `extend` → `build`.
+**`HashDbWriter`** - `new` → `hash_kind` / `casing` → `insert` / `extend` → `build`, or
+`with_key_config` when a `Table` already states all three.
 
 ## CLI
 

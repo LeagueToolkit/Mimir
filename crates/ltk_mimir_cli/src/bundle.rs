@@ -13,7 +13,7 @@ use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Compression, HashDbWriter};
 use ltk_mimir_cache::{CommitItem, HashStore, Source, Table};
 use sha2::{Digest, Sha256};
 
@@ -46,25 +46,18 @@ pub struct Options {
 /// Which CDragon txt file feeds each table. `split` also gathers numbered
 /// `<input>.<n>` parts - the data repo splits `hashes.game.txt` purely to dodge
 /// GitHub's file-size limit, so parts and the unsplit file are the same list.
+///
+/// Only the input layout lives here; a table's key width, hash algorithm, and
+/// casing come from [`Table::key_config`].
 struct TableSpec {
     table: Table,
-    key_width: KeyWidth,
-    hash_kind: HashKind,
     input: &'static str,
     split: bool,
 }
 
-const fn spec(
-    table: Table,
-    key_width: KeyWidth,
-    hash_kind: HashKind,
-    input: &'static str,
-    split: bool,
-) -> TableSpec {
+const fn spec(table: Table, input: &'static str, split: bool) -> TableSpec {
     TableSpec {
         table,
-        key_width,
-        hash_kind,
         input,
         split,
     }
@@ -74,62 +67,14 @@ const fn spec(
 /// not consumed: tables store full-width hashes only; the
 /// full-width `.xxh64` / `.xxh3` lists cover RST.
 const SPECS: [TableSpec; 8] = [
-    spec(
-        Table::Game,
-        KeyWidth::U64,
-        HashKind::Xxh64,
-        "hashes.game.txt",
-        true,
-    ),
-    spec(
-        Table::Lcu,
-        KeyWidth::U64,
-        HashKind::Xxh64,
-        "hashes.lcu.txt",
-        false,
-    ),
-    spec(
-        Table::BinEntries,
-        KeyWidth::U32,
-        HashKind::Fnv1a32,
-        "hashes.binentries.txt",
-        false,
-    ),
-    spec(
-        Table::BinTypes,
-        KeyWidth::U32,
-        HashKind::Fnv1a32,
-        "hashes.bintypes.txt",
-        false,
-    ),
-    spec(
-        Table::BinFields,
-        KeyWidth::U32,
-        HashKind::Fnv1a32,
-        "hashes.binfields.txt",
-        false,
-    ),
-    spec(
-        Table::BinHashes,
-        KeyWidth::U32,
-        HashKind::Fnv1a32,
-        "hashes.binhashes.txt",
-        false,
-    ),
-    spec(
-        Table::Rst,
-        KeyWidth::U64,
-        HashKind::Xxh64,
-        "hashes.rst.xxh64.txt",
-        false,
-    ),
-    spec(
-        Table::RstXxh3,
-        KeyWidth::U64,
-        HashKind::Xxh3,
-        "hashes.rst.xxh3.txt",
-        false,
-    ),
+    spec(Table::Game, "hashes.game.txt", true),
+    spec(Table::Lcu, "hashes.lcu.txt", false),
+    spec(Table::BinEntries, "hashes.binentries.txt", false),
+    spec(Table::BinTypes, "hashes.bintypes.txt", false),
+    spec(Table::BinFields, "hashes.binfields.txt", false),
+    spec(Table::BinHashes, "hashes.binhashes.txt", false),
+    spec(Table::Rst, "hashes.rst.xxh64.txt", false),
+    spec(Table::RstXxh3, "hashes.rst.xxh3.txt", false),
 ];
 
 pub fn run(opts: &Options) -> Result<()> {
@@ -262,10 +207,7 @@ fn build_table(
     out: &Path,
     compression: Compression,
 ) -> Result<ltk_hashdb::BuildStats> {
-    // Every League table hashes the lowercased path.
-    let mut writer = HashDbWriter::new(spec.key_width, compression)
-        .hash_kind(spec.hash_kind)
-        .casing(Casing::Insensitive);
+    let mut writer = HashDbWriter::with_key_config(spec.table.key_config(), compression);
     for file in files {
         read_hash_lines(file, |hash, _, path| {
             writer.insert(hash, path);

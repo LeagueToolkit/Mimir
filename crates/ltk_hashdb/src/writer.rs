@@ -7,7 +7,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::header::{
     Header, OffsetWidth, FLAG_ARENA_COMPRESSED, FLAG_CASE_INSENSITIVE, HEADER_SIZE,
 };
-use crate::{BuildError, Casing, Compression, HashKind, KeyWidth};
+use crate::{BuildError, Casing, Compression, HashKind, KeyConfig, KeyWidth};
 
 /// Collects `(key, path)` pairs, then [`HashDbWriter::build`] sorts by key, dedups,
 /// assigns arena offsets, and writes the file.
@@ -29,6 +29,9 @@ pub struct BuildStats {
 }
 
 impl HashDbWriter {
+    /// A writer for `key_width` keys, with the algorithm unrecorded and the paths
+    /// hashed as given; [`hash_kind`](Self::hash_kind) and [`casing`](Self::casing)
+    /// fill those in.
     pub fn new(key_width: KeyWidth, compression: Compression) -> Self {
         Self {
             key_width,
@@ -39,6 +42,16 @@ impl HashDbWriter {
         }
     }
 
+    /// A writer for a table whose key configuration is already known - a League
+    /// table, say, whose [`Table::key_config`] states all three at once.
+    ///
+    /// [`Table::key_config`]: https://docs.rs/ltk_mimir_cache/latest/ltk_mimir_cache/enum.Table.html#method.key_config
+    pub fn with_key_config(config: KeyConfig, compression: Compression) -> Self {
+        Self::new(config.key_width(), compression)
+            .hash_kind(config.hash_kind())
+            .casing(config.casing())
+    }
+
     /// Record the algorithm the keys were hashed with, so readers can hash new
     /// paths via `HashDb::hash_path`.
     pub fn hash_kind(mut self, kind: HashKind) -> Self {
@@ -46,7 +59,7 @@ impl HashDbWriter {
         self
     }
 
-    /// Record whether the keys hash the lowercased path ([`Casing::Insensitive`],
+    /// Record whether the keys hash the ASCII-lowercased path ([`Casing::AsciiInsensitive`],
     /// all League tables) or the path as given. Defaults to [`Casing::Sensitive`].
     pub fn casing(mut self, casing: Casing) -> Self {
         self.casing = casing;
@@ -150,7 +163,7 @@ impl HashDbWriter {
                 (compressed, FLAG_ARENA_COMPRESSED)
             }
         };
-        if self.casing == Casing::Insensitive {
+        if self.casing == Casing::AsciiInsensitive {
             flags |= FLAG_CASE_INSENSITIVE;
         }
 

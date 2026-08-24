@@ -17,8 +17,8 @@ mod path;
 mod reader;
 mod writer;
 
-pub use error::{BuildError, OpenError, VerifyError};
-pub use hash::{Casing, HashKind};
+pub use error::{BuildError, KeyConfigMismatch, OpenError, VerifyError};
+pub use hash::{Casing, HashKind, KeyConfig};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use layered::LayeredHashDb;
 pub use path::PathRef;
@@ -26,7 +26,7 @@ pub use reader::{HashDb, HashDbOptions, WeakHashDb, DEFAULT_FRAME_CACHE_BYTES};
 pub use writer::{BuildStats, HashDbWriter};
 
 /// Width of the integer keys in a table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyWidth {
     /// 32-bit keys (bin tables: FNV-1a).
     U32,
@@ -42,6 +42,15 @@ impl KeyWidth {
             Self::U32 => 4,
             Self::U64 => 8,
         }
+    }
+}
+
+impl std::fmt::Display for KeyWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+        })
     }
 }
 

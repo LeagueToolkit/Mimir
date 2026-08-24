@@ -11,9 +11,10 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use ltk_hashdb::{Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
-use ltk_mimir_cache::{HashStore, Table as CacheTable};
+use clap::builder::TypedValueParser as _;
+use clap::{Parser, Subcommand};
+use ltk_hashdb::{Compression, HashDb, HashDbWriter};
+use ltk_mimir_cache::{HashStore, Table};
 use ltk_mimir_gen::guessers::{
     CharacterSkin, CrossReference, ExtensionSwap, NumericRange, PrefixVariants, RegionLocale,
     SeedStrings, WordAdd, WordSubstitution,
@@ -27,53 +28,14 @@ struct Cli {
     command: Command,
 }
 
-/// The logical CDragon tables; picks key width and hash algorithm.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Table {
-    Game,
-    Lcu,
-    BinEntries,
-    BinTypes,
-    BinFields,
-    BinHashes,
-    Rst,
-    RstXxh3,
-}
-
-impl Table {
-    fn key_width(self) -> KeyWidth {
-        match self {
-            Self::Game | Self::Lcu | Self::Rst | Self::RstXxh3 => KeyWidth::U64,
-            _ => KeyWidth::U32,
-        }
-    }
-
-    fn hash_kind(self) -> HashKind {
-        match self {
-            Self::Game | Self::Lcu | Self::Rst => HashKind::Xxh64,
-            Self::RstXxh3 => HashKind::Xxh3,
-            _ => HashKind::Fnv1a32,
-        }
-    }
-
-    /// Every League table hashes the lowercased path.
-    fn casing(self) -> Casing {
-        Casing::Insensitive
-    }
-
-    /// The corresponding shared-cache table.
-    fn cache(self) -> CacheTable {
-        match self {
-            Self::Game => CacheTable::Game,
-            Self::Lcu => CacheTable::Lcu,
-            Self::BinEntries => CacheTable::BinEntries,
-            Self::BinTypes => CacheTable::BinTypes,
-            Self::BinFields => CacheTable::BinFields,
-            Self::BinHashes => CacheTable::BinHashes,
-            Self::Rst => CacheTable::Rst,
-            Self::RstXxh3 => CacheTable::RstXxh3,
-        }
-    }
+/// Accept the library table ids (`game`, `binentries`, `rst-xxh3`, ...) as
+/// `--table` values, with completions and an error listing them.
+///
+/// `Table` is a foreign type, so it cannot derive clap's `ValueEnum`; restricting
+/// the raw value to `Table::ALL` and parsing it back is the same thing by hand.
+fn table_parser() -> impl clap::builder::TypedValueParser<Value = Table> {
+    clap::builder::PossibleValuesParser::new(Table::ALL.iter().map(|t| t.id()))
+        .map(|id| Table::from_id(&id).expect("clap accepted only known ids"))
 }
 
 #[derive(Subcommand)]
@@ -85,7 +47,7 @@ enum Command {
         input: PathBuf,
 
         /// Which logical table this is (sets key width + hash algorithm).
-        #[arg(long)]
+        #[arg(long, value_parser = table_parser())]
         table: Table,
 
         /// Output .hashdb file.
@@ -118,7 +80,12 @@ enum Command {
 
         /// Resolve from the shared cache's active version of this table instead
         /// (cache dir: MIMIR_DIR override, else the platform data dir).
-        #[arg(long, conflicts_with = "file", required_unless_present = "file")]
+        #[arg(
+            long,
+            conflicts_with = "file",
+            required_unless_present = "file",
+            value_parser = table_parser()
+        )]
         table: Option<Table>,
     },
 
@@ -162,7 +129,7 @@ enum Command {
         wad: Vec<PathBuf>,
 
         /// Which logical table (sets key width, hash algorithm, guesser preset).
-        #[arg(long)]
+        #[arg(long, value_parser = table_parser())]
         table: Table,
 
         /// Extra candidate strings (one per line) checked verbatim, e.g.
@@ -347,9 +314,7 @@ fn read_hash_lines(input: &Path, mut on_entry: impl FnMut(u64, &str, &str)) -> R
 }
 
 fn build(input: PathBuf, table: Table, out: PathBuf, compression: Compression) -> Result<()> {
-    let mut writer = HashDbWriter::new(table.key_width(), compression)
-        .hash_kind(table.hash_kind())
-        .casing(table.casing());
+    let mut writer = HashDbWriter::with_key_config(table.key_config(), compression);
     read_hash_lines(&input, |hash, _, path| {
         writer.insert(hash, path);
     })?;
@@ -380,7 +345,7 @@ fn gen_hashes(
     max_skin: u32,
     out: PathBuf,
 ) -> Result<()> {
-    let mut ctx = GuessContext::new(table.hash_kind(), table.casing(), table.key_width());
+    let mut ctx = GuessContext::new(table.key_config());
     let mut known_hashes = HashSet::new();
     for input in &known {
         let mut paths = Vec::new();
@@ -499,7 +464,7 @@ fn gen_hashes(
 
     let mut out_file =
         BufWriter::new(File::create(&out).with_context(|| format!("creating {}", out.display()))?);
-    let hex_width = 2 * table.key_width().bytes();
+    let hex_width = 2 * table.key_config().key_width().bytes();
     // The game-class CDragon lists store paths lowercased (the bin lists keep
     // original casing); match, so merging finds into a list never produces
     // case-only duplicates of the same hash.
@@ -536,9 +501,9 @@ fn get(hash: &str, file: Option<PathBuf>, table: Option<Table>) -> Result<()> {
         (None, Some(table)) => {
             let store = HashStore::discover()?;
             let db = store
-                .open(table.cache())
-                .with_context(|| format!("opening {table:?} from the shared cache"))?;
-            (db, format!("the shared cache ({table:?})"))
+                .open(table)
+                .with_context(|| format!("opening {table} from the shared cache"))?;
+            (db, format!("the shared cache ({table})"))
         }
         (None, None) => unreachable!("clap requires --file or --table"),
     };

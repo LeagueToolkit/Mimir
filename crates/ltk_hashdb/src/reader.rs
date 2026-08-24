@@ -15,7 +15,7 @@ use zeekstd::SeekTable;
 
 use crate::cache::{Frame, FrameCache};
 use crate::header::Header;
-use crate::{Casing, HashKind, KeyWidth, OpenError, PathRef, VerifyError};
+use crate::{Casing, HashKind, KeyConfig, KeyWidth, OpenError, PathRef, VerifyError};
 
 /// Decompressed frame bytes a table caches by default: 4 MiB, i.e. 256 frames at the
 /// published 16 KiB frame size.
@@ -477,10 +477,17 @@ impl HashDb {
         self.inner.header.hash_kind
     }
 
-    /// Whether the keys hash the lowercased path (from the `case_insensitive`
-    /// header flag).
+    /// Whether the keys hash the ASCII-lowercased path (from the
+    /// `case_insensitive` header flag).
     pub fn casing(&self) -> Casing {
         self.inner.header.casing()
+    }
+
+    /// Width, algorithm, and casing as one value - what a probe must be hashed
+    /// under to be answerable here, and what every base of a
+    /// [`LayeredHashDb`](crate::LayeredHashDb) must agree on.
+    pub fn key_config(&self) -> KeyConfig {
+        KeyConfig::new(self.key_width(), self.hash_kind(), self.casing())
     }
 
     /// Whether the arena is zeekstd-compressed on disk.
@@ -508,11 +515,7 @@ impl HashDb {
     /// the `hash_kind` header field - falling back on key width when
     /// unspecified - and the `case_insensitive` flag).
     pub fn hash_path(&self, path: &str) -> u64 {
-        self.inner.header.hash_kind.hash(
-            path,
-            self.inner.header.casing(),
-            self.inner.header.key_width,
-        )
+        self.key_config().hash(path)
     }
 
     /// Iterate entries in arena order (path order, **not** key order) so each frame

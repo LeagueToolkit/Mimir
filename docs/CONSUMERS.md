@@ -147,7 +147,7 @@ tables, so you don't hand-roll a second map plus fallback:
 ```rust
 use ltk_hashdb::LayeredHashDb;
 
-let mut db = LayeredHashDb::from_bases(vec![store.open(Table::Game)?]);
+let mut db = LayeredHashDb::from_bases(vec![store.open(Table::Game)?])?;
 
 // Hashes with the first base's algorithm and returns the hash:
 let h = db.insert_path("assets/mymod/custom.dds").expect("has a base");
@@ -176,9 +176,9 @@ let store = HashStore::discover()?;
 
 // Open the WAD path tables into one layered reader; missing tables are reported,
 // not fatal - the tool stays usable and their hashes just miss.
-let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu])?;
 for (table, e) in &errors {
-    eprintln!("skipping {table:?}: {e}");
+    eprintln!("skipping {table}: {e}");
 }
 
 db.insert(precomputed_hash, "assets/mymod/custom.bin"); // overlay writes as before
@@ -192,6 +192,13 @@ for (hash, path) in db.get_batch(&chunk_hashes) {
     }
 }
 ```
+
+`open_layered` only fails outright on a set spanning more than one hash universe -
+`&[Table::BinEntries, Table::BinFields]`, say, where one table would answer the other's
+hashes with an unrelated path. That is checked before anything is opened. Everything
+else (a missing table, an unreadable file, a file that isn't the table it's filed under)
+comes back in the per-table error list, so a partial cache still gives you a usable
+reader.
 
 `open_layered` is the convenience most WAD consumers want; `open_many` is the
 lower-level primitive it's built from - it pairs each requested table with its
@@ -324,7 +331,7 @@ use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
 
 let mut w = HashDbWriter::new(KeyWidth::U64, Compression::default()) // 16 KiB frames, level 19
     .hash_kind(HashKind::Xxh64)         // recorded so readers can `hash_path`
-    .casing(Casing::Insensitive);       // keys hash the lowercased path (League rule);
+    .casing(Casing::AsciiInsensitive);       // keys hash the ASCII-lowercased path (League rule);
                                         // defaults to Sensitive (hash bytes as given)
 
 w.insert(hash, "assets/characters/aatrox/aatrox.bin");
@@ -353,11 +360,11 @@ for path-shaped tokens), and the chunk table *is* the unknown set:
 ```rust
 use ltk_mimir_gen::guessers::SeedStrings;
 use ltk_mimir_gen::{mine_wad, GuessContext, Hunt};
-use ltk_hashdb::{Casing, HashKind, KeyWidth};
+use ltk_mimir_cache::Table;
 
 let mined = mine_wad("Ahri.wad.client".as_ref())?;      // seed strings + chunk hashes
 
-let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::Insensitive, KeyWidth::U64);
+let mut ctx = GuessContext::new(Table::Game.key_config());
 ctx.add_known(db.iter().map(|(_, p)| p.into_owned()));  // corpus to mutate from
 ctx.add_unknown(mined.chunk_hashes.into_iter().filter(|&h| !db.contains(h)));
 

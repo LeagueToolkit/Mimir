@@ -16,7 +16,7 @@ fn build_with(
     // The fixtures are League-shaped, so record the League casing rule.
     let mut w = HashDbWriter::new(key_width, compression)
         .hash_kind(hash_kind)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     w.extend(entries.iter().copied());
     let mut out = Cursor::new(Vec::new());
     let stats = w.build(&mut out).expect("build");
@@ -296,7 +296,7 @@ fn zero_frame_size_rejected() {
 fn hash_path_uses_table_algorithm() {
     let bytes = build(KeyWidth::U32, HashKind::Fnv1a32, &[]);
     let db = HashDb::open_bytes(bytes).expect("open");
-    assert_eq!(db.casing(), Casing::Insensitive);
+    assert_eq!(db.casing(), Casing::AsciiInsensitive);
     assert_eq!(db.hash_path("TEST"), 0xafd071e5);
 }
 
@@ -344,7 +344,7 @@ fn bad_magic_rejected() {
 fn overlay_shadows_a_real_base_table() {
     let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
-    let mut layered = LayeredHashDb::from_bases(vec![db]);
+    let mut layered = LayeredHashDb::from_bases(vec![db]).expect("one base");
 
     // Base entries still resolve.
     assert_eq!(

@@ -75,24 +75,25 @@ RST hashes are stored **full-width** (no truncation/masking).
 
 ### `case_insensitive` (flags bit1)
 
-Whether the keys hash the **lowercased** path (bit set) or the path bytes as
-given (bit clear). All League tables set it - the game hashes lowercased
+Whether the keys hash the **ASCII-lowercased** path (bit set) or the path bytes
+as given (bit clear). All League tables set it - the game hashes lowercased
 paths - so a consumer hashing a new path must lowercase it first to match.
 
-Paths are UTF-8 and the lowercasing is Unicode-aware, so non-League tables get
-full UTF-8 case-insensitivity: the path is mapped through the Unicode **full**
-lowercase mapping - Rust's `str::to_lowercase`, which is per-character *plus*
-the context-sensitive final-sigma rule (`Σ` → `ς` at the end of a word, `σ`
-elsewhere) - then UTF-8 encoded and hashed. Implementations in other languages
-must match that mapping exactly, not a per-character-only one. League paths are
-ASCII, where this reduces to plain `A-Z` → `a-z` and coincides with `ltk_hash`'s
-`WadHash`/`BinHash` on all real data.
+The mapping is exactly `A-Z` → `a-z`, byte by byte. Every other byte is hashed
+untouched, including every byte of a multi-byte UTF-8 sequence, so `É` and `é`
+are different keys. This is a deliberate narrowing: a byte substitution has no
+locale, no Unicode tables and no toolchain drift behind it, so a key computed
+from a given path is the same key forever, and an implementation in any language
+is a three-line loop. On League data - all ASCII - it coincides with `ltk_hash`'s
+`WadHash`/`BinHash`.
 
-Stability note: Unicode case mappings can gain entries in new Unicode versions,
-so only the ASCII part of the mapping (`A-Z` → `a-z`) is guaranteed bit-stable
-across toolchains. Hashes of non-ASCII paths could in principle drift when the
-producer's Unicode tables update; publishers of non-ASCII tables who need
-long-term stability should pre-lowercase their paths and hash case-sensitively.
+A publisher whose paths are not ASCII should case-fold them however its domain
+requires and then hash **case-sensitively**, which keeps the folding rule (and
+its version) on the publisher's side of the file rather than the reader's. Should
+a Unicode-aware rule ever be specified, it takes a value in the reserved byte at
+offset 14 (0 = defer to bit1) rather than a second flag bit: unknown flag bits
+are rejected on open, unknown reserved bytes are ignored, so the addition would
+be readable by builds that predate it.
 
 ## Sections
 

@@ -60,8 +60,14 @@ pub enum ManifestError {
     #[error("no manifest at {0}")]
     Missing(PathBuf),
 
-    #[error("unsupported manifest schema version {0}")]
+    #[error("manifest schema {0} predates the first published one")]
     UnsupportedSchema(u32),
+
+    #[error(
+        "this manifest requires a reader that understands schema {required}, and this build \
+         understands {supported}"
+    )]
+    ReaderTooOld { required: u32, supported: u32 },
 }
 
 /// Errors from opening a cached table ([`HashStore::open`](crate::HashStore::open) /

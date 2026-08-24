@@ -298,6 +298,8 @@ impl HashStore {
                     sha256,
                     entries,
                     key_width,
+                    // We just opened it, and `open` is what enforces the version.
+                    format_version: ltk_hashdb::FORMAT_VERSION,
                 },
             );
         }

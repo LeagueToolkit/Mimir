@@ -101,6 +101,16 @@ pub enum UpdateOutcome {
     Completed(UpdateReport),
 }
 
+/// A remote table this build cannot read, and the format version it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedTable {
+    /// The table the release published.
+    pub table: Table,
+
+    /// The `.hashdb` format version it was published in.
+    pub format_version: u16,
+}
+
 /// What a completed update run installed and cleaned up.
 #[derive(Debug, Default)]
 pub struct UpdateReport {
@@ -110,6 +120,11 @@ pub struct UpdateReport {
     /// Remote manifest ids this build has no [`Table`] for (a newer release).
     /// Skipped, never fatal.
     pub unknown_tables: Vec<String>,
+
+    /// Tables published in a `.hashdb` format version this build cannot open.
+    /// Skipped, never fatal - whatever version the cache already holds keeps
+    /// being served.
+    pub unsupported_tables: Vec<UnsupportedTable>,
 
     /// What GC swept. GC runs even on up-to-date runs, so files a prior run
     /// had to retain (e.g. still mmap'd on Windows) get another chance.
@@ -167,7 +182,7 @@ impl HashStore {
             return Ok(UpdateOutcome::Locked);
         };
 
-        let remote_manifest = Manifest::from_slice(&fetch(remote, MANIFEST_FILE)?)?;
+        let remote_manifest = fetch_manifest(remote)?;
         let mut report = UpdateReport::default();
         let planned = self.plan(&remote_manifest, options, &mut report)?;
 
@@ -206,7 +221,7 @@ impl HashStore {
             return Ok(UpdateOutcome::Locked);
         };
 
-        let remote_manifest = Manifest::from_slice(&fetch_async(remote, MANIFEST_FILE).await?)?;
+        let remote_manifest = fetch_manifest_async(remote).await?;
         let mut report = UpdateReport::default();
 
         let mut items = Vec::new();
@@ -221,8 +236,9 @@ impl HashStore {
 
     /// Decide what to download: every remote table whose sha256 differs from
     /// the local manifest or whose file went missing (all of them under
-    /// [`force`](UpdateOptions::force)). Unknown remote ids are recorded in
-    /// `report` and skipped; a malformed remote filename is fatal.
+    /// [`force`](UpdateOptions::force)). Remote ids this build does not know,
+    /// and tables in a format it cannot open, are recorded in `report` and
+    /// skipped; a malformed remote filename is fatal.
     fn plan<'a, E>(
         &self,
         remote: &'a Manifest,
@@ -241,6 +257,16 @@ impl HashStore {
                 report.unknown_tables.push(id.clone());
                 continue;
             };
+            // Downloading a table this build cannot open would replace a working
+            // pointer with an unreadable one, so leave the local version alone.
+            if !entry.is_supported() {
+                report.unsupported_tables.push(UnsupportedTable {
+                    table,
+                    format_version: entry.format_version,
+                });
+                continue;
+            }
+
             let version =
                 version_of(table, &entry.file).ok_or_else(|| UpdateError::BadRemoteFilename {
                     id: id.clone(),
@@ -314,6 +340,45 @@ impl HashStore {
         report.gc = self.gc().unwrap_or_default();
 
         Ok(UpdateOutcome::Completed(report))
+    }
+}
+
+/// Fetch the remote manifest from this build's format channel, falling back to
+/// the unversioned asset.
+///
+/// The channel is what keeps an old build updating across a format bump: it asks
+/// for the manifest describing the format it can read, and a release that still
+/// builds that format still publishes one. The fallback covers releases made
+/// before channels existed, so a failure there says nothing the channel error
+/// did not already say - the caller sees the first one.
+fn fetch_manifest<F: Fetch + ?Sized>(remote: &F) -> Result<Manifest, UpdateError<F::Error>> {
+    let channel = Manifest::asset_for_format(ltk_hashdb::FORMAT_VERSION);
+    match remote.fetch(&channel) {
+        Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
+        Err(source) => match remote.fetch(MANIFEST_FILE) {
+            Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
+            Err(_) => Err(UpdateError::Fetch {
+                file: channel,
+                source,
+            }),
+        },
+    }
+}
+
+/// Async twin of [`fetch_manifest`].
+async fn fetch_manifest_async<F: AsyncFetch + ?Sized>(
+    remote: &F,
+) -> Result<Manifest, UpdateError<F::Error>> {
+    let channel = Manifest::asset_for_format(ltk_hashdb::FORMAT_VERSION);
+    match remote.fetch(&channel).await {
+        Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
+        Err(source) => match remote.fetch(MANIFEST_FILE).await {
+            Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
+            Err(_) => Err(UpdateError::Fetch {
+                file: channel,
+                source,
+            }),
+        },
     }
 }
 

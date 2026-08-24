@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use ltk_hashdb::FORMAT_VERSION;
 use ltk_mimir_cache::{Fetch, HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch};
 
 pub struct Options {
@@ -60,6 +61,12 @@ pub fn run(opts: &Options) -> Result<()> {
 
     for id in &report.unknown_tables {
         eprintln!("{id}: unknown table - skipped (newer mimir release?)");
+    }
+    for skipped in &report.unsupported_tables {
+        eprintln!(
+            "{}: published in .hashdb format {} - skipped (this build reads {})",
+            skipped.table, skipped.format_version, FORMAT_VERSION
+        );
     }
     if report.is_up_to_date() {
         println!("up to date");

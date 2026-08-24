@@ -13,8 +13,8 @@ use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ltk_hashdb::{Compression, HashDbWriter};
-use ltk_mimir_cache::{CommitItem, HashStore, Source, Table};
+use ltk_hashdb::{Compression, HashDbWriter, FORMAT_VERSION};
+use ltk_mimir_cache::{CommitItem, HashStore, Manifest, Source, Table};
 use sha2::{Digest, Sha256};
 
 use crate::read_hash_lines;
@@ -142,10 +142,17 @@ pub fn run(opts: &Options) -> Result<()> {
     let manifest = HashStore::at(&opts.out).commit(&items, Some(source))?;
     fs::remove_dir_all(&build_dir).with_context(|| format!("removing {}", build_dir.display()))?;
 
+    // The same document under a format-specific name. A build asks for its own
+    // channel, so once a later format ships, releases that still carry this one
+    // keep updating the builds that can only read it.
+    let channel = opts.out.join(Manifest::asset_for_format(FORMAT_VERSION));
+    fs::copy(&manifest_path, &channel).with_context(|| format!("writing {}", channel.display()))?;
+
     println!(
-        "bundled {} tables (version {version}) -> {}",
+        "bundled {} tables (version {version}) -> {} + {}",
         manifest.tables.len(),
-        manifest_path.display()
+        manifest_path.display(),
+        channel.display()
     );
     Ok(())
 }
@@ -293,6 +300,16 @@ mod tests {
         assert_eq!(source.repo.as_deref(), Some("CommunityDragon/Data"));
         assert_eq!(source.commit.as_deref(), Some("abc123"));
         assert!(source.inputs_sha256.is_some());
+
+        // The format channel ships next to it, byte for byte, so a build that
+        // asks for its own format gets the same document.
+        let channel = opts.out.join(Manifest::asset_for_format(FORMAT_VERSION));
+        assert_eq!(
+            fs::read(&channel).unwrap(),
+            fs::read(opts.out.join("manifest.json")).unwrap(),
+            "{} is the same manifest under its channel name",
+            channel.display()
+        );
 
         // Both split parts landed in the game table, under the versioned name.
         let game = HashDb::open(opts.out.join("game-2026-07-09.lhdb")).unwrap();

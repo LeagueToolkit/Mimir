@@ -18,7 +18,7 @@ use pollster::block_on;
 use tempfile::tempdir;
 
 mod common;
-use common::{completed, make_release};
+use common::{channel_asset, completed, edit_release_manifest, make_release};
 
 /// Serve "release assets" straight from a directory.
 struct DirFetch(PathBuf);
@@ -67,6 +67,61 @@ fn fresh_install_downloads_everything() {
     assert!(report.unknown_tables.is_empty());
     let db = store.open(Table::Game).unwrap();
     assert_eq!(db.get(0x11aa).as_deref(), Some("assets/foo.bin"));
+}
+
+/// The async driver resolves the remote manifest the same way the blocking one
+/// does: this format's channel first, then the unversioned asset.
+#[test]
+fn the_manifest_comes_from_the_format_channel() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    fs::write(release.join("manifest.json"), b"not json at all").unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        block_on(store.update_async(&DirFetch(release), UpdateOptions::default())).unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+}
+
+#[test]
+fn a_channel_less_release_still_updates() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    fs::remove_file(release.join(channel_asset())).unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        block_on(store.update_async(&DirFetch(release), UpdateOptions::default())).unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+}
+
+/// A table in a format this build cannot open is skipped here too - the async
+/// driver shares `plan`, so this guards the wiring, not the decision.
+#[test]
+fn an_unreadable_format_is_skipped() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.get_mut("game").unwrap().format_version = 99;
+    });
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        block_on(store.update_async(&DirFetch(release), UpdateOptions::default())).unwrap(),
+    );
+
+    assert!(report.installed.is_empty());
+    assert_eq!(report.unsupported_tables.len(), 1);
 }
 
 #[test]

@@ -33,4 +33,4 @@ pub use lock::UpdateLock;
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
 pub use table::{HashUniverse, Table};
-pub use update::{AsyncFetch, Fetch, UpdateOptions, UpdateOutcome, UpdateReport};
+pub use update::{AsyncFetch, Fetch, UnsupportedTable, UpdateOptions, UpdateOutcome, UpdateReport};

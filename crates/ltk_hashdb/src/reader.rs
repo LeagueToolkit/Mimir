@@ -1,24 +1,115 @@
 //! Read-only, mmap-backed `.hashdb` hash table.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use xxhash_rust::xxh3::Xxh3;
 use zeekstd::SeekTable;
 
+use crate::cache::{Frame, FrameCache};
 use crate::header::Header;
-use crate::{Casing, HashKind, KeyWidth, OpenError, VerifyError};
+use crate::{Casing, HashKind, KeyWidth, OpenError, PathRef, VerifyError};
+
+/// Decompressed frame bytes a table caches by default: 4 MiB, i.e. 256 frames at the
+/// published 16 KiB frame size.
+///
+/// Enough that a consumer walking a WAD's chunks in path order keeps hitting the frames
+/// it just decompressed, small enough to be an unremarkable cost per open table.
+pub const DEFAULT_FRAME_CACHE_BYTES: usize = 4 << 20;
+
+/// Open-time knobs for a [`HashDb`].
+///
+/// ```no_run
+/// # use ltk_hashdb::HashDb;
+/// // A table used for one bulk pass needs no cache; one behind a UI wants a bigger one.
+/// let scratch = HashDb::options().frame_cache_bytes(0).open("game.lhdb")?;
+/// let resident = HashDb::options().frame_cache_bytes(32 << 20).open("game.lhdb")?;
+/// # Ok::<(), ltk_hashdb::OpenError>(())
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct HashDbOptions {
+    frame_cache_bytes: usize,
+}
+
+impl Default for HashDbOptions {
+    fn default() -> Self {
+        Self {
+            frame_cache_bytes: DEFAULT_FRAME_CACHE_BYTES,
+        }
+    }
+}
+
+impl HashDbOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cap the decompressed frames this table keeps cached; `0` disables caching.
+    ///
+    /// Only compressed arenas cache anything - a raw arena is read straight out of the
+    /// mmap, so the budget is ignored.
+    pub fn frame_cache_bytes(mut self, bytes: usize) -> Self {
+        self.frame_cache_bytes = bytes;
+        self
+    }
+
+    /// mmap `path` read-only and validate it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be opened or mapped, or if the header or section
+    /// bounds do not validate - see [`OpenError`].
+    ///
+    /// # Safety of the mapping
+    ///
+    /// See [`HashDb::open`] for the obligation a caller takes on by mapping a file.
+    pub fn open(self, path: impl AsRef<Path>) -> Result<HashDb, OpenError> {
+        let file = File::open(path)?;
+        // SAFETY: `Mmap::map` is unsound if the mapped bytes change underneath us, so
+        // every writer of a `.hashdb` this crate ships must leave published files
+        // immutable. `ltk_mimir_cache` upholds that: `commit` writes a new versioned
+        // filename and renames it into place rather than over an existing one, and `gc`
+        // only unlinks (an unlinked file keeps its pages alive for anyone still mapping
+        // it). A caller mapping a file some other process may truncate or rewrite in
+        // place gets undefined behaviour, not an error - `HashDb::open` documents this.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        HashDb::from_backing(Backing::Mmap(mmap), self)
+    }
+
+    /// Open an in-memory image (embedded tables, tests).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the header or section bounds do not validate - see [`OpenError`].
+    pub fn open_bytes(self, bytes: impl Into<Cow<'static, [u8]>>) -> Result<HashDb, OpenError> {
+        HashDb::from_backing(Backing::Bytes(bytes.into()), self)
+    }
+}
 
 /// A read-only `.hashdb` hash table.
 ///
 /// `open` validates the (untrusted) header and section bounds. Lookups binary-search
 /// the mmap'd key array, so a miss never touches the arena; a hit on a compressed
-/// arena decompresses only the containing frame(s).
+/// arena decompresses only the containing frame, and keeps it cached for the lookups
+/// after it.
+///
+/// Cloning is cheap - every clone shares one mapping, one seek table, and one frame
+/// cache - so a `HashDb` is passed around rather than reopened.
+#[derive(Clone)]
 pub struct HashDb {
+    inner: Arc<Inner>,
+}
+
+/// Everything a table's clones share: the bytes, where the sections are, and the
+/// frames decompressed out of them so far.
+struct Inner {
     backing: Backing,
     header: Header,
     keys: Range<usize>,
@@ -28,6 +119,8 @@ pub struct HashDb {
 
     /// Present iff the arena is a zeekstd seekable stream.
     seek_table: Option<SeekTable>,
+
+    cache: FrameCache,
 
     /// Frames decompressed so far; misses must never bump it (see unit tests).
     decompressions: AtomicU64,
@@ -47,24 +140,102 @@ impl Backing {
     }
 }
 
-/// A decompressed run of frames (raw-arena range it covers + the bytes), so
-/// in-order consumers decompress each frame once rather than once per entry.
-type FrameCache = Option<(Range<u64>, Vec<u8>)>;
+/// Entry bytes as they were found: lent by the mmap, lent by a cached frame, or
+/// spliced together because the entry crossed a frame boundary.
+enum Bytes<'a> {
+    Borrowed(&'a [u8]),
+    Frame {
+        frame: Arc<Frame>,
+        start: usize,
+        len: usize,
+    },
+    Spliced(Vec<u8>),
+}
+
+impl Bytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Frame { frame, start, len } => &frame.bytes()[*start..*start + *len],
+            Self::Spliced(bytes) => bytes,
+        }
+    }
+}
+
+impl<'a> From<Bytes<'a>> for PathRef<'a> {
+    fn from(bytes: Bytes<'a>) -> Self {
+        match bytes {
+            Bytes::Borrowed(bytes) => match String::from_utf8_lossy(bytes) {
+                Cow::Borrowed(path) => PathRef::borrowed(path),
+                Cow::Owned(path) => PathRef::owned(path),
+            },
+            Bytes::Frame { frame, start, len } => PathRef::from_frame(frame, start, len),
+            Bytes::Spliced(bytes) => match String::from_utf8(bytes) {
+                Ok(path) => PathRef::owned(path),
+                Err(e) => PathRef::owned(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            },
+        }
+    }
+}
+
+thread_local! {
+    /// One decompression context per thread: creating one per frame would cost more
+    /// than the decompression, and sharing one across threads would serialize them.
+    static DCTX: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` against this thread's decompression context, creating it on first use.
+fn with_dctx<R>(
+    f: impl FnOnce(&mut zstd::bulk::Decompressor<'static>) -> Result<R, VerifyError>,
+) -> Result<R, VerifyError> {
+    DCTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let dctx = match &mut *slot {
+            Some(dctx) => dctx,
+            slot => slot.insert(zstd::bulk::Decompressor::new()?),
+        };
+
+        f(dctx)
+    })
+}
 
 impl HashDb {
     /// mmap `path` read-only and validate it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be opened or mapped, or if the header or section
+    /// bounds do not validate - see [`OpenError`].
+    ///
+    /// # Safety of the mapping
+    ///
+    /// The mapping is only sound while the file's bytes do not change. Published
+    /// `.hashdb` files are immutable by contract - a new version ships as a new
+    /// filename, and old versions are only ever unlinked - which is what discharges
+    /// the `unsafe` here. If you manage your own tables, uphold the same rule: never
+    /// truncate or rewrite a file in place while a `HashDb` maps it. Doing so is
+    /// undefined behaviour rather than an error you can catch. Build to a temporary
+    /// name and rename, or use [`open_bytes`](HashDb::open_bytes) for images you
+    /// mutate.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
-        let file = File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Self::from_backing(Backing::Mmap(mmap))
+        HashDbOptions::default().open(path)
     }
 
     /// Open an in-memory image (embedded tables, tests).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the header or section bounds do not validate - see [`OpenError`].
     pub fn open_bytes(bytes: impl Into<Cow<'static, [u8]>>) -> Result<Self, OpenError> {
-        Self::from_backing(Backing::Bytes(bytes.into()))
+        HashDbOptions::default().open_bytes(bytes)
     }
 
-    fn from_backing(backing: Backing) -> Result<Self, OpenError> {
+    /// Open-time knobs - the frame cache budget, today.
+    pub fn options() -> HashDbOptions {
+        HashDbOptions::default()
+    }
+
+    fn from_backing(backing: Backing, options: HashDbOptions) -> Result<Self, OpenError> {
         let data = backing.bytes();
         let header = Header::decode(data)?;
 
@@ -123,30 +294,45 @@ impl HashDb {
             None
         };
 
+        // Size the cache to this table: never more slots than it has frames, and
+        // nothing at all for a raw arena, which is read straight out of the mmap.
+        let cache = match &seek_table {
+            Some(st) => FrameCache::new(
+                options.frame_cache_bytes,
+                st.max_frame_size_decomp() as usize,
+                st.num_frames() as usize,
+            ),
+            None => FrameCache::new(0, 0, 0),
+        };
+
         // Per-entry extents aren't validated here (keeps `open` O(1)); each read
         // bounds-checks its own, reading out-of-bounds as a miss. `verify()` reports them.
         Ok(Self {
-            backing,
-            header,
-            keys,
-            offsets,
-            lengths,
-            arena,
-            seek_table,
-            decompressions: AtomicU64::new(0),
+            inner: Arc::new(Inner {
+                backing,
+                header,
+                keys,
+                offsets,
+                lengths,
+                arena,
+                seek_table,
+                cache,
+                decompressions: AtomicU64::new(0),
+            }),
         })
     }
 
-    /// Look up a hash. Raw arenas borrow the path from the mmap; compressed arenas
-    /// decompress its frame(s). Returns `None` for a miss or an entry that won't
-    /// decompress (corrupt file - see [`HashDb::verify`]).
-    pub fn get(&self, hash: u64) -> Option<Cow<'_, str>> {
-        self.index_of(hash).and_then(|i| self.str_at(i))
+    /// Look up a hash. The path is lent by the mmap or by a cached frame, so a hit
+    /// allocates nothing. Returns `None` for a miss or an entry that won't decompress
+    /// (corrupt file - see [`HashDb::verify`]).
+    pub fn get(&self, hash: u64) -> Option<PathRef<'_>> {
+        let i = self.inner.index_of(hash)?;
+        self.inner.bytes_at(i).ok().flatten().map(PathRef::from)
     }
 
     /// Membership test; never touches the arena.
     pub fn contains(&self, hash: u64) -> bool {
-        self.index_of(hash).is_some()
+        self.inner.index_of(hash).is_some()
     }
 
     /// Bulk lookup. Hits resolve in arena order so each frame decompresses at most
@@ -154,146 +340,165 @@ impl HashDb {
     pub fn get_batch<'a>(
         &'a self,
         hashes: &[u64],
-    ) -> impl Iterator<Item = (u64, Option<Cow<'a, str>>)> + 'a {
-        let indices: Vec<Option<usize>> = hashes.iter().map(|&h| self.index_of(h)).collect();
+    ) -> impl Iterator<Item = (u64, Option<PathRef<'a>>)> + 'a {
+        let indices: Vec<Option<usize>> = hashes.iter().map(|&h| self.inner.index_of(h)).collect();
         let mut order: Vec<usize> = (0..hashes.len()).collect();
         // Resolve hits in arena order (misses sort last) so each frame decompresses once.
-        order.sort_unstable_by_key(|&p| indices[p].map_or(u64::MAX, |i| self.offset_at(i)));
+        order.sort_unstable_by_key(|&p| indices[p].map_or(u64::MAX, |i| self.inner.offset_at(i)));
 
-        let mut results: Vec<Option<Cow<'a, str>>> = Vec::new();
+        let mut results: Vec<Option<PathRef<'a>>> = Vec::new();
         results.resize_with(hashes.len(), || None);
-        let mut cache: FrameCache = None;
         for p in order {
             if let Some(i) = indices[p] {
-                results[p] = self.str_at_cached(i, &mut cache);
+                results[p] = self.inner.bytes_at(i).ok().flatten().map(PathRef::from);
             }
         }
 
-        let out: Vec<(u64, Option<Cow<'a, str>>)> = hashes.iter().copied().zip(results).collect();
+        let out: Vec<(u64, Option<PathRef<'a>>)> = hashes.iter().copied().zip(results).collect();
         out.into_iter()
     }
 
     pub fn len(&self) -> usize {
-        self.header.entry_count as usize
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.header.entry_count == 0
+        self.inner.header.entry_count == 0
     }
 
     pub fn key_width(&self) -> KeyWidth {
-        self.header.key_width
+        self.inner.header.key_width
     }
 
     pub fn hash_kind(&self) -> HashKind {
-        self.header.hash_kind
+        self.inner.header.hash_kind
     }
 
     /// Whether the keys hash the lowercased path (from the `case_insensitive`
     /// header flag).
     pub fn casing(&self) -> Casing {
-        self.header.casing()
+        self.inner.header.casing()
     }
 
     /// Whether the arena is zeekstd-compressed on disk.
     pub fn is_compressed(&self) -> bool {
-        self.header.arena_compressed()
+        self.inner.header.arena_compressed()
     }
 
     /// Total length of all path strings (the raw arena), in bytes.
     pub fn arena_decompressed_size(&self) -> u64 {
-        self.header.arena_decompressed_size
+        self.inner.header.arena_decompressed_size
     }
 
     /// Bytes the arena occupies on disk (== decompressed size for raw arenas).
     pub fn arena_compressed_size(&self) -> u64 {
-        self.header.arena_compressed_size
+        self.inner.header.arena_compressed_size
     }
 
     /// Number of zstd frames this table has decompressed over its lifetime.
     #[cfg(test)]
     pub(crate) fn decompressions(&self) -> u64 {
-        self.decompressions.load(Ordering::Relaxed)
+        self.inner.decompressions.load(Ordering::Relaxed)
     }
 
     /// Hash a path string with **this table's** algorithm and casing rule (from
     /// the `hash_kind` header field - falling back on key width when
     /// unspecified - and the `case_insensitive` flag).
     pub fn hash_path(&self, path: &str) -> u64 {
-        self.header
-            .hash_kind
-            .hash(path, self.header.casing(), self.header.key_width)
+        self.inner.header.hash_kind.hash(
+            path,
+            self.inner.header.casing(),
+            self.inner.header.key_width,
+        )
     }
 
     /// Iterate entries in arena order (path order, **not** key order) so each frame
     /// decompresses once. Entries that fail to decompress are skipped; `verify()` reports them.
-    pub fn iter(&self) -> impl Iterator<Item = (u64, Cow<'_, str>)> {
-        let mut cache: FrameCache = None;
-        self.arena_order().into_iter().filter_map(move |i| {
-            let path = self.str_at_cached(i, &mut cache)?;
-            Some((self.key_at(i), path))
+    pub fn iter(&self) -> impl Iterator<Item = (u64, PathRef<'_>)> {
+        self.inner.arena_order().into_iter().filter_map(move |i| {
+            let bytes = self.inner.bytes_at(i).ok().flatten()?;
+            Some((self.inner.key_at(i), PathRef::from(bytes)))
         })
     }
 
     /// Opt-in fully-resident mode: decode everything into an owned map.
     pub fn load_all(&self) -> HashMap<u64, Box<str>> {
-        self.iter()
-            .map(|(k, s)| (k, s.into_owned().into_boxed_str()))
-            .collect()
+        self.iter().map(|(k, path)| (k, path.into())).collect()
     }
 
     /// Full integrity check, skipped by `open`:
     /// - xxh3 checksum over the stored sections
     /// - keys strictly ascending
     /// - every entry in bounds and valid UTF-8 in the arena
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`VerifyError`] on the first problem it finds: a checksum mismatch,
+    /// out-of-order keys, an entry that runs past the arena, one that is not valid
+    /// UTF-8, or a frame that will not decompress.
     pub fn verify(&self) -> Result<(), VerifyError> {
-        let data = self.backing.bytes();
+        let inner = &*self.inner;
+        let data = inner.backing.bytes();
         let mut hasher = Xxh3::new();
-        hasher.update(&data[self.keys.clone()]);
-        hasher.update(&data[self.offsets.clone()]);
-        hasher.update(&data[self.lengths.clone()]);
-        hasher.update(&data[self.arena.clone()]);
-        if hasher.digest() != self.header.checksum {
+        hasher.update(&data[inner.keys.clone()]);
+        hasher.update(&data[inner.offsets.clone()]);
+        hasher.update(&data[inner.lengths.clone()]);
+        hasher.update(&data[inner.arena.clone()]);
+        if hasher.digest() != inner.header.checksum {
             return Err(VerifyError::ChecksumMismatch);
         }
 
-        let n = self.len();
+        let n = inner.len();
         for i in 1..n {
-            if self.key_at(i - 1) >= self.key_at(i) {
+            if inner.key_at(i - 1) >= inner.key_at(i) {
                 return Err(VerifyError::Malformed("keys not strictly ascending"));
             }
         }
 
-        if self.seek_table.is_none() {
-            let arena = &data[self.arena.clone()];
+        // Compressed arenas are walked in arena order so each frame decompresses once
+        // and only the current run is resident - never the whole arena at once. A raw
+        // arena is already resident, so key order is as good and needs no permutation.
+        if inner.seek_table.is_none() {
             for i in 0..n {
-                let slice = self
-                    .extent_of(i)
-                    .and_then(|(start, end)| arena.get(start as usize..end as usize))
-                    .ok_or(VerifyError::Malformed("entry extends past the arena"))?;
-                if std::str::from_utf8(slice).is_err() {
-                    return Err(VerifyError::Malformed("entry is not valid UTF-8"));
-                }
+                inner.verify_entry(i)?;
             }
-            return Ok(());
+        } else {
+            for i in inner.arena_order() {
+                inner.verify_entry(i)?;
+            }
         }
 
-        // Compressed: walk entries in arena order so each frame decompresses once
-        // and only the current run is resident - never the whole arena at once.
-        let mut cache: FrameCache = None;
-        for i in self.arena_order() {
-            let (start, end) = self
-                .extent_of(i)
-                .ok_or(VerifyError::Malformed("entry extends past the arena"))?;
-            if start == end {
-                continue;
-            }
-            let slice = self.frame_bytes(start, end, &mut cache)?;
-            if std::str::from_utf8(slice).is_err() {
-                return Err(VerifyError::Malformed("entry is not valid UTF-8"));
-            }
-        }
         Ok(())
+    }
+}
+
+impl fmt::Debug for HashDb {
+    /// Shape only - counts, widths, and flags. Never entries.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = &*self.inner;
+        f.debug_struct("HashDb")
+            .field("entries", &inner.header.entry_count)
+            .field("key_width", &inner.header.key_width)
+            .field("hash_kind", &inner.header.hash_kind)
+            .field("casing", &inner.header.casing())
+            .field("compressed", &inner.header.arena_compressed())
+            .field(
+                "arena_decompressed_size",
+                &inner.header.arena_decompressed_size,
+            )
+            .field("arena_compressed_size", &inner.header.arena_compressed_size)
+            .field(
+                "frames",
+                &inner.seek_table.as_ref().map_or(0, SeekTable::num_frames),
+            )
+            .field("cached_frames", &inner.cache.capacity())
+            .finish()
+    }
+}
+
+impl Inner {
+    fn len(&self) -> usize {
+        self.header.entry_count as usize
     }
 
     /// Entry indices sorted by arena offset (path order); walking them this way
@@ -339,84 +544,117 @@ impl HashDb {
         (end <= self.header.arena_decompressed_size).then_some((start, end))
     }
 
-    /// The path for entry `i`, or `None` if out of bounds. Invalid UTF-8 is replaced
-    /// lossily rather than panicking; `verify()` reports both.
-    fn str_at(&self, i: usize) -> Option<Cow<'_, str>> {
-        self.str_at_cached(i, &mut None)
-    }
-
-    fn str_at_cached(&self, i: usize, cache: &mut FrameCache) -> Option<Cow<'_, str>> {
-        let (start, end) = self.extent_of(i)?;
-        if self.seek_table.is_none() {
-            let range = self.arena.start + start as usize..self.arena.start + end as usize;
-            return Some(String::from_utf8_lossy(&self.backing.bytes()[range]));
-        }
-        if start == end {
-            return Some(Cow::Borrowed(""));
-        }
-        let bytes = self.frame_bytes(start, end, cache).ok()?;
-        Some(Cow::Owned(String::from_utf8_lossy(bytes).into_owned()))
-    }
-
-    /// Decompressed bytes for extent `start..end`, filling `cache` with the
-    /// containing frame(s) on a miss. Caller must handle the empty (`start == end`) case.
+    /// Entry `i`'s bytes, or `None` if its extent runs past the arena.
     ///
-    /// Errors mean a corrupt file ([`VerifyError`]); the lookup path swallows
-    /// them into a miss, only `verify` surfaces them.
-    fn frame_bytes<'c>(
-        &self,
-        start: u64,
-        end: u64,
-        cache: &'c mut FrameCache,
-    ) -> Result<&'c [u8], VerifyError> {
-        let covered = cache
-            .as_ref()
-            .is_some_and(|(range, _)| range.start <= start && end <= range.end);
-        if !covered {
-            let st = self.seek_table.as_ref().unwrap();
-            let lo = st.frame_index_decomp(start);
-            let hi = st.frame_index_decomp(end - 1);
-            let (cov_start, bytes) = self.read_frames(lo, hi)?;
-            *cache = Some((cov_start..cov_start + bytes.len() as u64, bytes));
+    /// Errors mean a corrupt file ([`VerifyError`]); the lookup path swallows them
+    /// into a miss, only `verify` surfaces them.
+    fn bytes_at(&self, i: usize) -> Result<Option<Bytes<'_>>, VerifyError> {
+        let Some((start, end)) = self.extent_of(i) else {
+            return Ok(None);
+        };
+
+        let Some(seek_table) = self.seek_table.as_ref() else {
+            let range = self.arena.start + start as usize..self.arena.start + end as usize;
+            return Ok(Some(Bytes::Borrowed(&self.backing.bytes()[range])));
+        };
+        if start == end {
+            return Ok(Some(Bytes::Borrowed(&[])));
         }
-        let (range, bytes) = cache.as_ref().unwrap();
-        Ok(&bytes[(start - range.start) as usize..(end - range.start) as usize])
+
+        let first = seek_table.frame_index_decomp(start);
+        let last = seek_table.frame_index_decomp(end - 1);
+        let frame = self.frame(first)?;
+        let frame_start = seek_table.frame_start_decomp(first)?;
+        let offset = (start - frame_start) as usize;
+
+        if first == last {
+            let len = (end - start) as usize;
+            if offset + len > frame.bytes().len() {
+                return Err(VerifyError::Malformed("entry extends past its frame"));
+            }
+
+            return Ok(Some(Bytes::Frame {
+                frame,
+                start: offset,
+                len,
+            }));
+        }
+
+        // The entry straddles a frame boundary - roughly one entry per frame. Splice
+        // the pieces into a buffer of its own rather than lending out either frame.
+        let mut spliced = Vec::with_capacity((end - start) as usize);
+        let head = frame
+            .bytes()
+            .get(offset..)
+            .ok_or(VerifyError::Malformed("entry starts past its frame"))?;
+        spliced.extend_from_slice(head);
+
+        for index in first + 1..=last {
+            let frame = self.frame(index)?;
+            let frame_start = seek_table.frame_start_decomp(index)?;
+            let take = (end - frame_start).min(frame.bytes().len() as u64) as usize;
+            let tail = frame.bytes().get(..take).ok_or(VerifyError::Malformed(
+                "frame shorter than the seek table says",
+            ))?;
+            spliced.extend_from_slice(tail);
+        }
+
+        Ok(Some(Bytes::Spliced(spliced)))
     }
 
-    /// Decompress frames `lo..=hi`, returning the run's decompressed-space start
-    /// offset plus the bytes. Frame content is untrusted, so every extent and
-    /// output size is checked.
-    fn read_frames(&self, lo: u32, hi: u32) -> Result<(u64, Vec<u8>), VerifyError> {
-        let st = self.seek_table.as_ref().expect("compressed arena");
-        let arena = &self.backing.bytes()[self.arena.clone()];
-        let d_start = st.frame_start_decomp(lo)?;
-        let total = st.frame_end_decomp(hi)? - d_start;
-        // Cap the capacity hint at the (header-pinned) arena size so a corrupt seek
-        // table can't force a huge allocation; a full read still allocates once.
-        let cap = total.min(self.header.arena_decompressed_size) as usize;
-        // Decompress each frame straight into `out` via a cursor - one reusable
-        // context, no per-frame buffer, no second copy.
-        let mut out = std::io::Cursor::new(Vec::with_capacity(cap));
-        let mut dctx = zstd::bulk::Decompressor::new()?;
-        for f in lo..=hi {
-            let c_start = st.frame_start_comp(f)? as usize;
-            let c_end = st.frame_end_comp(f)? as usize;
-            let d_size = st.frame_size_decomp(f)? as usize;
-            let frame = arena
-                .get(c_start..c_end)
-                .ok_or(VerifyError::Malformed("frame extent out of arena bounds"))?;
-            self.decompressions.fetch_add(1, Ordering::Relaxed);
-            out.get_mut().reserve(d_size);
-            let pos = out.position();
-            let n = dctx.decompress_to_buffer(frame, &mut out)?;
-            if n != d_size {
-                return Err(VerifyError::Malformed(
-                    "frame decompressed to unexpected size",
-                ));
-            }
-            out.set_position(pos + n as u64);
+    /// Check one entry the way `verify` needs it checked: in bounds and valid UTF-8.
+    fn verify_entry(&self, i: usize) -> Result<(), VerifyError> {
+        let bytes = self
+            .bytes_at(i)?
+            .ok_or(VerifyError::Malformed("entry extends past the arena"))?;
+        if std::str::from_utf8(bytes.as_slice()).is_err() {
+            return Err(VerifyError::Malformed("entry is not valid UTF-8"));
         }
-        Ok((d_start, out.into_inner()))
+
+        Ok(())
+    }
+
+    /// Frame `index`, decompressing it only if it is not already cached.
+    fn frame(&self, index: u32) -> Result<Arc<Frame>, VerifyError> {
+        if let Some(frame) = self.cache.get(index) {
+            return Ok(frame);
+        }
+
+        // Decompressed outside any cache lock, so concurrent readers never wait on each
+        // other. Two threads racing on one frame both decompress it; the loser's copy is
+        // simply dropped, which is cheaper than serializing every miss.
+        let frame = Arc::new(Frame::from(self.decompress(index)?));
+        self.cache.insert(index, &frame);
+
+        Ok(frame)
+    }
+
+    /// Decompress one frame. Frame content is untrusted, so the extent and the
+    /// resulting size are both checked.
+    fn decompress(&self, index: u32) -> Result<Vec<u8>, VerifyError> {
+        let seek_table = self.seek_table.as_ref().expect("compressed arena");
+        let arena = &self.backing.bytes()[self.arena.clone()];
+        let start = seek_table.frame_start_comp(index)? as usize;
+        let end = seek_table.frame_end_comp(index)? as usize;
+        let size = seek_table.frame_size_decomp(index)? as usize;
+        let compressed = arena
+            .get(start..end)
+            .ok_or(VerifyError::Malformed("frame extent out of arena bounds"))?;
+
+        // Cap the capacity hint at the (header-pinned) arena size so a corrupt seek
+        // table can't force a huge allocation.
+        let capacity = size.min(self.header.arena_decompressed_size as usize);
+        let mut buffer = self.cache.take_buffer(capacity);
+
+        self.decompressions.fetch_add(1, Ordering::Relaxed);
+        let written = with_dctx(|dctx| Ok(dctx.decompress_to_buffer(compressed, &mut buffer)?))?;
+        if written != size {
+            return Err(VerifyError::Malformed(
+                "frame decompressed to unexpected size",
+            ));
+        }
+
+        Ok(buffer)
     }
 }
 
@@ -449,6 +687,10 @@ mod tests {
     use crate::{Compression, HashDbWriter, KeyWidth};
 
     fn compressed_db(frame_size: u32) -> HashDb {
+        compressed_db_with(frame_size, super::DEFAULT_FRAME_CACHE_BYTES)
+    }
+
+    fn compressed_db_with(frame_size: u32, cache_bytes: usize) -> HashDb {
         let mut w = HashDbWriter::new(
             KeyWidth::U64,
             Compression::Zeekstd {
@@ -464,7 +706,10 @@ mod tests {
         }
         let mut out = Cursor::new(Vec::new());
         w.build(&mut out).expect("build");
-        HashDb::open_bytes(out.into_inner()).expect("open")
+        HashDb::options()
+            .frame_cache_bytes(cache_bytes)
+            .open_bytes(out.into_inner())
+            .expect("open")
     }
 
     /// A miss is decided by the key array alone - never a frame decompression.
@@ -475,10 +720,10 @@ mod tests {
             assert_eq!(db.get(probe), None);
         }
         assert!(!db.contains(999));
-        assert_eq!(db.decompressions.load(Ordering::Relaxed), 0);
+        assert_eq!(db.inner.decompressions.load(Ordering::Relaxed), 0);
 
         assert!(db.get(0).is_some());
-        assert!(db.decompressions.load(Ordering::Relaxed) > 0);
+        assert!(db.inner.decompressions.load(Ordering::Relaxed) > 0);
     }
 
     /// In-order iteration decompresses each frame once, not once per entry.
@@ -486,9 +731,40 @@ mod tests {
     fn iter_decompresses_each_frame_once() {
         let db = compressed_db(128);
         assert_eq!(db.iter().count(), 100);
-        let frames = db.seek_table.as_ref().unwrap().num_frames() as u64;
+        let frames = db.inner.seek_table.as_ref().unwrap().num_frames() as u64;
         assert!(frames > 1, "fixture should span multiple frames");
         // Boundary-straddling entries decompress both frames, so allow one re-read each.
-        assert!(db.decompressions.load(Ordering::Relaxed) <= 2 * frames);
+        assert!(db.inner.decompressions.load(Ordering::Relaxed) <= 2 * frames);
+    }
+
+    /// The point of the cache: repeating a lookup must not decompress again, and
+    /// neighbouring keys share the frame their neighbour just paid for.
+    #[test]
+    fn cached_frames_are_not_decompressed_twice() {
+        let db = compressed_db(128);
+        assert!(db.get(0).is_some());
+        let after_first = db.decompressions();
+
+        for _ in 0..10 {
+            assert!(db.get(0).is_some());
+        }
+        assert_eq!(db.decompressions(), after_first, "repeat lookups were free");
+
+        // A clone shares the cache rather than starting its own.
+        let clone = db.clone();
+        assert!(clone.get(0).is_some());
+        assert_eq!(clone.decompressions(), after_first);
+    }
+
+    /// With caching off, every lookup pays for its own frame - the old behaviour,
+    /// still available for one-shot passes.
+    #[test]
+    fn a_disabled_cache_decompresses_every_time() {
+        let db = compressed_db_with(128, 0);
+        assert!(db.get(0).is_some());
+        let after_first = db.decompressions();
+
+        assert!(db.get(0).is_some());
+        assert!(db.decompressions() > after_first);
     }
 }

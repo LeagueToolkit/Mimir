@@ -1,6 +1,5 @@
 //! Round-trip and behavioral tests: txt-shaped data → `HashDbWriter` → `HashDb`.
 
-use std::borrow::Cow;
 use std::io::Cursor;
 
 use ltk_hashdb::{
@@ -104,11 +103,12 @@ fn empty_table() {
     db.verify().expect("verify");
 }
 
+/// A raw arena lends its bytes straight out of the mapping - no copy per lookup.
 #[test]
-fn get_returns_borrowed_for_raw_arena() {
+fn get_borrows_from_a_raw_arena() {
     let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
-    assert!(matches!(db.get(1), Some(Cow::Borrowed(_))));
+    assert!(!db.get(1).expect("hit").is_owned());
 }
 
 #[test]
@@ -193,7 +193,12 @@ fn compressed_roundtrip() {
         assert!(db.is_compressed());
         for &(k, p) in GAME_ENTRIES {
             assert_eq!(db.get(k).as_deref(), Some(p), "frame_size {frame_size}");
-            assert!(matches!(db.get(k), Some(Cow::Owned(_))));
+            // A frame larger than the whole arena holds every entry whole, so the
+            // hit lends its bytes out of the cached frame rather than copying them.
+            // The tiny frame sizes above are the straddling case, which must splice.
+            if frame_size == 1 << 20 {
+                assert!(!db.get(k).expect("hit").is_owned());
+            }
         }
         assert_eq!(db.get(2), None);
         db.verify().expect("verify");

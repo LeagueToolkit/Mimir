@@ -1,9 +1,8 @@
 //! An in-memory overlay layered over an ordered list of read-only base tables.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::{Casing, HashDb, HashKind, KeyWidth};
+use crate::{Casing, HashDb, HashKind, KeyWidth, PathRef};
 
 /// The key configuration a base hashes under. Every base in a [`LayeredHashDb`]
 /// must agree on this triple; a base that diverges can never be hit by a caller's
@@ -105,9 +104,9 @@ impl LayeredHashDb {
     }
 
     /// Overlay first, then each base in push order; the first hit wins.
-    pub fn get(&self, hash: u64) -> Option<Cow<'_, str>> {
+    pub fn get(&self, hash: u64) -> Option<PathRef<'_>> {
         if let Some(path) = self.overlay.get(&hash) {
-            return Some(Cow::Borrowed(&**path));
+            return Some(PathRef::borrowed(path));
         }
         self.bases.iter().find_map(|base| base.get(hash))
     }
@@ -124,8 +123,8 @@ impl LayeredHashDb {
     pub fn get_batch<'a>(
         &'a self,
         hashes: &'a [u64],
-    ) -> impl Iterator<Item = (u64, Option<Cow<'a, str>>)> + 'a {
-        let mut results: Vec<Option<Cow<'a, str>>> = Vec::new();
+    ) -> impl Iterator<Item = (u64, Option<PathRef<'a>>)> + 'a {
+        let mut results: Vec<Option<PathRef<'a>>> = Vec::new();
         results.resize_with(hashes.len(), || None);
 
         // Layer 0: overlay, O(1) per hash. Positions still missing stay in
@@ -133,7 +132,7 @@ impl LayeredHashDb {
         let mut residual: Vec<usize> = Vec::new();
         for (i, &h) in hashes.iter().enumerate() {
             match self.overlay.get(&h) {
-                Some(path) => results[i] = Some(Cow::Borrowed(&**path)),
+                Some(path) => results[i] = Some(PathRef::borrowed(path)),
                 None => residual.push(i),
             }
         }

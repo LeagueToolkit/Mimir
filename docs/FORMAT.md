@@ -42,10 +42,11 @@ stored once).
 | 0 | `magic` | `[u8;8]` | `b"HASHDB\0\0"` |
 | 8 | `version` | `u16` | currently `1` |
 | 10 | `hash_kind` | `u8` | algorithm that produced the keys, see below |
-| 11 | `flags` | `u8` | bit0: `arena_compressed`; bit1: `case_insensitive` (see below); other bits must be 0 |
+| 11 | `flags` | `u8` | **required** flags: bit0 `arena_compressed`, bit1 `case_insensitive` (see below); any other bit set **must** reject the file |
 | 12 | `key_width` | `u8` | 4 = u32 table, 8 = u64 table |
 | 13 | `offset_width` | `u8` | 4 or 8; the writer picks 4 while `arena_decompressed_size` fits in a u32, else 8; the reader honors whatever is declared |
-| 14 | reserved | `[u8;2]` | written as zero, ignored on read |
+| 14 | `opt_flags` | `u8` | **optional** flags: none defined yet; an unrecognized bit **must** be ignored |
+| 15 | reserved | `u8` | written as zero, ignored on read |
 | 16 | `entry_count` | `u64` | |
 | 24 | `keys_offset` | `u64` | file offset of the keys section; writers must 8-align it (the reference writer emits 80), readers bounds-check and honor the declared value |
 | 32 | `offsets_offset` | `u64` | file offset of the offsets section; writers must `offset_width`-align it |
@@ -57,6 +58,22 @@ stored once).
 
 The lengths section has no header field: it sits immediately after the offsets, at
 `offsets_offset + entry_count × offset_width` (u16 entries are always 2-aligned there).
+
+### The two flag bytes
+
+`version` is an equality gate - a reader rejects anything that is not `1` - so a
+capability added later can only reach readers that already shipped if they are
+told to ignore what they do not recognize. That is the whole difference between
+the two flag bytes:
+
+| | unknown bit means | use it for |
+|---|---|---|
+| `flags` (11) | reject the file | anything that changes how the bytes must be interpreted |
+| `opt_flags` (14) | read the file as if the bit were clear | anything a reader may exploit but need not |
+
+So an index that speeds up a scan is an `opt_flags` bit; a different arena
+encoding is a `flags` bit. When in doubt, ask what a reader that ignores the bit
+would produce: a correct answer more slowly, or a wrong one.
 
 ### `hash_kind`
 
@@ -90,10 +107,10 @@ is a three-line loop. On League data - all ASCII - it coincides with `ltk_hash`'
 A publisher whose paths are not ASCII should case-fold them however its domain
 requires and then hash **case-sensitively**, which keeps the folding rule (and
 its version) on the publisher's side of the file rather than the reader's. Should
-a Unicode-aware rule ever be specified, it takes a value in the reserved byte at
-offset 14 (0 = defer to bit1) rather than a second flag bit: unknown flag bits
-are rejected on open, unknown reserved bytes are ignored, so the addition would
-be readable by builds that predate it.
+a Unicode-aware rule ever be specified, it takes an `opt_flags` bit rather than a
+second `flags` bit, so that builds predating it keep reading the table: they
+resolve every ASCII path exactly as before and miss the rest, which beats
+refusing the file outright.
 
 ## Sections
 
@@ -142,7 +159,8 @@ get(hash):
 On open, before trusting any offset:
 
 - magic, `version == 1`, `key_width ∈ {4,8}`, `offset_width ∈ {4,8}`,
-  known `flags` bits only, known `hash_kind`;
+  known `flags` bits only (`opt_flags` is *not* checked - see above),
+  known `hash_kind`;
 - for raw arenas, `arena_compressed_size == arena_decompressed_size`;
 - for compressed arenas: the trailing seek table parses, its total decompressed size
   equals `arena_decompressed_size`, and no frame's decompressed size exceeds the

@@ -330,6 +330,31 @@ fn truncated_file_rejected_on_open() {
     }
 }
 
+/// The point of splitting the flag byte: a build that predates an optional flag
+/// still reads the file, and reads it as if the bit were clear.
+#[test]
+fn unknown_optional_flags_are_ignored() {
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
+    bytes[14] = 0xff; // `opt_flags`: every bit this build has never heard of.
+
+    let db = HashDb::open_bytes(bytes).expect("an unknown optional flag is not an error");
+    let (key, path) = GAME_ENTRIES[0];
+    assert_eq!(db.get(key).as_deref(), Some(path));
+}
+
+/// The other half: a required flag changes how the file must be read, so an
+/// unknown one is still fatal.
+#[test]
+fn unknown_required_flags_rejected() {
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
+    bytes[11] |= 1 << 7;
+
+    assert!(matches!(
+        HashDb::open_bytes(bytes),
+        Err(OpenError::MalformedHeader(_))
+    ));
+}
+
 #[test]
 fn bad_magic_rejected() {
     let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);

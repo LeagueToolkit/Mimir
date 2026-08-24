@@ -140,6 +140,23 @@ pub enum GcError {
     Manifest(#[from] ManifestError),
 }
 
+/// Errors from a lock-free comparison ([`HashStore::check`](crate::HashStore::check)).
+///
+/// Deliberately smaller than [`UpdateError`]: `check` installs nothing, so there
+/// is no download to mis-checksum and no commit to fail.
+#[derive(Debug, Error)]
+pub enum CheckError<E> {
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+
+    #[error("fetching {file}")]
+    Fetch {
+        file: String,
+        #[source]
+        source: E,
+    },
+}
+
 /// Errors from an update run ([`HashStore::update`](crate::HashStore::update)).
 ///
 /// Generic over the fetcher's error type ([`Fetch::Error`](crate::Fetch::Error) /

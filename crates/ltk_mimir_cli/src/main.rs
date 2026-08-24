@@ -1,7 +1,8 @@
-//! The `mimir` CLI. Verbs: build / get / update / gen / merge / bundle /
+//! The `mimir` CLI. Verbs: build / get / check / update / gen / merge / bundle /
 //! verify / stats.
 
 mod bundle;
+mod check;
 mod merge;
 mod update;
 
@@ -90,6 +91,22 @@ enum Command {
     },
 
     /// Download the latest published tables into the shared cache.
+    /// Say what an update would do, without downloading or locking anything.
+    Check {
+        /// GitHub repository whose latest release ships the tables.
+        #[arg(long, default_value = "LeagueToolkit/mimir")]
+        repo: String,
+
+        /// Base URL serving `manifest.json` and the `.lhdb` assets (a mirror);
+        /// overrides --repo.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Compare against this directory instead of the shared cache.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
     Update {
         /// GitHub repository whose latest release ships the tables.
         #[arg(long, default_value = "LeagueToolkit/mimir")]
@@ -266,6 +283,7 @@ fn main() -> Result<()> {
             allow_missing,
             compression: Compression::Zeekstd { frame_size, level },
         }),
+        Command::Check { repo, url, dir } => check::run(&check::Options { repo, url, dir }),
         Command::Update {
             repo,
             url,

@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use crate::manifest::version_of;
 use crate::store::MANIFEST_FILE;
 use crate::{
-    fsutil, CommitItem, GcReport, HashStore, Manifest, ManifestError, Source, Table, TableEntry,
-    UpdateError,
+    fsutil, CheckError, CommitItem, GcReport, HashStore, Manifest, ManifestError, Source, Table,
+    TableEntry, UpdateError,
 };
 
 /// Fetch one release asset by filename (`manifest.json`,
@@ -100,6 +100,91 @@ pub enum UpdateOutcome {
 
     /// The run completed; the report says what changed.
     Completed(UpdateReport),
+}
+
+/// What an update would do to one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableStatus {
+    /// The cache already holds exactly this file.
+    Current,
+
+    /// The cache has no version of this table.
+    Absent,
+
+    /// The cache holds a different version.
+    Stale,
+
+    /// The manifest points at this table, but the file is gone from the cache
+    /// directory - an interrupted GC, or someone tidying up by hand.
+    FileMissing,
+
+    /// Published in a `.hashdb` format version this build cannot open, so an
+    /// update would skip it and leave whatever the cache holds in place.
+    Unsupported,
+}
+
+impl TableStatus {
+    /// Whether an update would download this table (without
+    /// [`force`](UpdateOptions::force), which downloads everything).
+    pub fn needs_update(self) -> bool {
+        matches!(self, Self::Absent | Self::Stale | Self::FileMissing)
+    }
+}
+
+impl std::fmt::Display for TableStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Current => "up to date",
+            Self::Absent => "not installed",
+            Self::Stale => "outdated",
+            Self::FileMissing => "file missing",
+            Self::Unsupported => "unsupported format",
+        })
+    }
+}
+
+/// One table as the release publishes it, next to what the cache holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDiff {
+    /// The table this describes.
+    pub table: Table,
+
+    /// What an update would do to it.
+    pub status: TableStatus,
+
+    /// The entry the release publishes.
+    pub remote: TableEntry,
+
+    /// The entry the cache holds, absent when it holds none.
+    pub local: Option<TableEntry>,
+}
+
+/// What a lock-free [`check`](HashStore::check) found.
+///
+/// Shaped like [`UpdateReport`] on purpose - the same run, described before it
+/// happens rather than after.
+#[derive(Debug, Clone, Default)]
+pub struct CheckReport {
+    /// One diff per remote table this build knows, in manifest order.
+    pub tables: Vec<TableDiff>,
+
+    /// Remote manifest ids this build has no [`Table`] for (a newer release).
+    pub unknown_tables: Vec<String>,
+}
+
+impl CheckReport {
+    /// How many tables an update would download - the "3 tables behind" number.
+    pub fn behind(&self) -> usize {
+        self.tables
+            .iter()
+            .filter(|diff| diff.status.needs_update())
+            .count()
+    }
+
+    /// True when an update would install nothing.
+    pub fn is_up_to_date(&self) -> bool {
+        self.behind() == 0
+    }
 }
 
 /// A remote table this build cannot read, and the format version it is in.
@@ -235,6 +320,92 @@ impl HashStore {
         self.finish(items, staged, remote_manifest.last_run.clone(), report)
     }
 
+    /// Compare the cache against a published release without changing either.
+    ///
+    /// Fetches the remote manifest, diffs it against the local one, and returns
+    /// a status for every table both know about. Nothing is downloaded, nothing
+    /// is installed, and the update lock is never taken - so a UI can poll this
+    /// on a timer, and a startup check can run while `mimir update` is midway
+    /// through a download.
+    ///
+    /// The answer is a snapshot: a release published a moment later makes it
+    /// stale, exactly as with any other status read.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckError::Fetch`] if the manifest cannot be retrieved, and
+    /// [`CheckError::Manifest`] if either manifest is unreadable. A cache that
+    /// has never been populated is not an error: every table comes back
+    /// [`TableStatus::Absent`].
+    pub fn check<F: Fetch + ?Sized>(
+        &self,
+        remote: &F,
+    ) -> Result<CheckReport, CheckError<F::Error>> {
+        let remote = fetch_manifest(remote)?;
+        self.diff(&remote)
+    }
+
+    /// Async twin of [`check`](HashStore::check).
+    pub async fn check_async<F: AsyncFetch + ?Sized>(
+        &self,
+        remote: &F,
+    ) -> Result<CheckReport, CheckError<F::Error>> {
+        let remote = fetch_manifest_async(remote).await?;
+        self.diff(&remote)
+    }
+
+    /// Diff a fetched remote manifest against the local one.
+    fn diff<E>(&self, remote: &Manifest) -> Result<CheckReport, CheckError<E>> {
+        let local = self.local_manifest()?;
+
+        let mut report = CheckReport::default();
+        for (id, entry) in &remote.tables {
+            let Some(table) = Table::from_id(id) else {
+                report.unknown_tables.push(id.clone());
+                continue;
+            };
+            let local = local.as_ref().and_then(|m| m.entry(table));
+
+            report.tables.push(TableDiff {
+                table,
+                status: self.status_of(local, entry),
+                remote: entry.clone(),
+                local: local.cloned(),
+            });
+        }
+
+        Ok(report)
+    }
+
+    /// What an update would do to one table. The file-presence check is what
+    /// makes a manually deleted `.lhdb` reinstall rather than read as current.
+    fn status_of(&self, local: Option<&TableEntry>, remote: &TableEntry) -> TableStatus {
+        if !remote.is_supported() {
+            return TableStatus::Unsupported;
+        }
+        let Some(local) = local else {
+            return TableStatus::Absent;
+        };
+
+        if local.sha256 != remote.sha256 {
+            TableStatus::Stale
+        } else if !self.dir().join(&local.file).is_file() {
+            TableStatus::FileMissing
+        } else {
+            TableStatus::Current
+        }
+    }
+
+    /// The local manifest, with "never published to" read as `None` rather than
+    /// as a failure.
+    fn local_manifest(&self) -> Result<Option<Manifest>, ManifestError> {
+        match self.manifest() {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(ManifestError::Missing(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Decide what to download: every remote table whose sha256 differs from
     /// the local manifest or whose file went missing (all of them under
     /// [`force`](UpdateOptions::force)). Remote ids this build does not know,
@@ -246,11 +417,7 @@ impl HashStore {
         options: UpdateOptions,
         report: &mut UpdateReport,
     ) -> Result<Vec<PlannedDownload<'a>>, UpdateError<E>> {
-        let local = match self.manifest() {
-            Ok(manifest) => Some(manifest),
-            Err(ManifestError::Missing(_)) => None,
-            Err(e) => return Err(e.into()),
-        };
+        let local = self.local_manifest()?;
 
         let mut planned = Vec::new();
         for (id, entry) in &remote.tables {
@@ -258,13 +425,18 @@ impl HashStore {
                 report.unknown_tables.push(id.clone());
                 continue;
             };
+
+            let status = self.status_of(local.as_ref().and_then(|m| m.entry(table)), entry);
             // Downloading a table this build cannot open would replace a working
             // pointer with an unreadable one, so leave the local version alone.
-            if !entry.is_supported() {
+            if status == TableStatus::Unsupported {
                 report.unsupported_tables.push(UnsupportedTable {
                     table,
                     format_version: entry.format_version,
                 });
+                continue;
+            }
+            if !status.needs_update() && !options.force {
                 continue;
             }
 
@@ -273,13 +445,6 @@ impl HashStore {
                     id: id.clone(),
                     file: entry.file.clone(),
                 })?;
-
-            let current = local.as_ref().and_then(|m| m.entry(table));
-            let fresh = current
-                .is_some_and(|c| c.sha256 == entry.sha256 && self.dir().join(&c.file).is_file());
-            if fresh && !options.force {
-                continue;
-            }
 
             planned.push(PlannedDownload {
                 table,
@@ -347,6 +512,37 @@ impl HashStore {
     }
 }
 
+/// Failure to obtain the remote manifest, before either caller has wrapped it in
+/// its own error type.
+pub(crate) enum ManifestFetch<E> {
+    Fetch { file: String, source: E },
+    Parse(ManifestError),
+}
+
+impl<E> From<ManifestError> for ManifestFetch<E> {
+    fn from(e: ManifestError) -> Self {
+        Self::Parse(e)
+    }
+}
+
+impl<E> From<ManifestFetch<E>> for UpdateError<E> {
+    fn from(e: ManifestFetch<E>) -> Self {
+        match e {
+            ManifestFetch::Fetch { file, source } => Self::Fetch { file, source },
+            ManifestFetch::Parse(e) => Self::Manifest(e),
+        }
+    }
+}
+
+impl<E> From<ManifestFetch<E>> for CheckError<E> {
+    fn from(e: ManifestFetch<E>) -> Self {
+        match e {
+            ManifestFetch::Fetch { file, source } => Self::Fetch { file, source },
+            ManifestFetch::Parse(e) => Self::Manifest(e),
+        }
+    }
+}
+
 /// Fetch the remote manifest from this build's format channel, falling back to
 /// the unversioned asset.
 ///
@@ -355,13 +551,13 @@ impl HashStore {
 /// builds that format still publishes one. The fallback covers releases made
 /// before channels existed, so a failure there says nothing the channel error
 /// did not already say - the caller sees the first one.
-fn fetch_manifest<F: Fetch + ?Sized>(remote: &F) -> Result<Manifest, UpdateError<F::Error>> {
+fn fetch_manifest<F: Fetch + ?Sized>(remote: &F) -> Result<Manifest, ManifestFetch<F::Error>> {
     let channel = Manifest::asset_for_format(ltk_hashdb::FORMAT_VERSION);
     match remote.fetch(&channel) {
         Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
         Err(source) => match remote.fetch(MANIFEST_FILE) {
             Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
-            Err(_) => Err(UpdateError::Fetch {
+            Err(_) => Err(ManifestFetch::Fetch {
                 file: channel,
                 source,
             }),
@@ -372,13 +568,13 @@ fn fetch_manifest<F: Fetch + ?Sized>(remote: &F) -> Result<Manifest, UpdateError
 /// Async twin of [`fetch_manifest`].
 async fn fetch_manifest_async<F: AsyncFetch + ?Sized>(
     remote: &F,
-) -> Result<Manifest, UpdateError<F::Error>> {
+) -> Result<Manifest, ManifestFetch<F::Error>> {
     let channel = Manifest::asset_for_format(ltk_hashdb::FORMAT_VERSION);
     match remote.fetch(&channel).await {
         Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
         Err(source) => match remote.fetch(MANIFEST_FILE).await {
             Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
-            Err(_) => Err(UpdateError::Fetch {
+            Err(_) => Err(ManifestFetch::Fetch {
                 file: channel,
                 source,
             }),

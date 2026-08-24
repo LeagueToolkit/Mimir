@@ -124,6 +124,27 @@ fn an_unreadable_format_is_skipped() {
     assert_eq!(report.unsupported_tables.len(), 1);
 }
 
+/// `check_async` answers the same question `check` does, without the lock.
+#[test]
+fn check_async_diffs_without_installing() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release);
+
+    let report = block_on(store.check_async(&remote)).unwrap();
+    assert_eq!(report.behind(), 1);
+    assert!(!cache.join("manifest.json").exists());
+
+    completed(block_on(store.update_async(&remote, UpdateOptions::default())).unwrap());
+    assert!(block_on(store.check_async(&remote))
+        .unwrap()
+        .is_up_to_date());
+}
+
 #[test]
 fn second_run_is_up_to_date() {
     let tmp = tempdir().unwrap();

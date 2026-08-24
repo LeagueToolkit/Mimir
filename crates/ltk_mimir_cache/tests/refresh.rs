@@ -8,7 +8,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use ltk_mimir_cache::{Fetch, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome};
+use ltk_mimir_cache::{
+    Fetch, HashStore, Table, TableStatus, UpdateError, UpdateOptions, UpdateOutcome,
+};
 use tempfile::tempdir;
 
 mod common;
@@ -527,4 +529,110 @@ fn an_unreadable_new_format_leaves_the_installed_table_alone() {
         Some("old"),
         "the version the cache can read is still the one it serves"
     );
+}
+
+/// The status a table has before and after an update, and the count a UI puts
+/// in front of a user.
+#[test]
+fn check_diffs_the_cache_against_the_release() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(
+        &release,
+        "2026-07-10",
+        &[(Table::Game, &[(0x1, "a")]), (Table::Lcu, &[(0x2, "b")])],
+    );
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release.clone());
+
+    let report = store.check(&remote).unwrap();
+    assert_eq!(report.behind(), 2, "an empty cache is behind on everything");
+    assert!(report
+        .tables
+        .iter()
+        .all(|diff| diff.status == TableStatus::Absent));
+    assert!(
+        !cache.join("manifest.json").exists(),
+        "check installs nothing"
+    );
+
+    completed(store.update(&remote, UpdateOptions::default()).unwrap());
+    let report = store.check(&remote).unwrap();
+    assert!(report.is_up_to_date());
+    assert_eq!(report.behind(), 0);
+
+    // The release moves on for one table only.
+    make_release(&release, "2026-07-17", &[(Table::Game, &[(0x1, "a2")])]);
+    let report = store.check(&DirFetch(release)).unwrap();
+    assert_eq!(report.behind(), 1);
+
+    let game = report
+        .tables
+        .iter()
+        .find(|diff| diff.table == Table::Game)
+        .unwrap();
+    assert_eq!(game.status, TableStatus::Stale);
+    assert_eq!(game.remote.version, "2026-07-17");
+    assert_eq!(
+        game.local.as_ref().unwrap().version,
+        "2026-07-10",
+        "both sides are named, so a UI can say what it would replace"
+    );
+}
+
+/// The point of the lock-free path: a status read works while someone else is
+/// midway through an update.
+#[test]
+fn check_does_not_take_the_update_lock() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let _held = store
+        .try_lock_update()
+        .unwrap()
+        .expect("nobody else holds it");
+
+    let report = store.check(&DirFetch(release)).unwrap();
+    assert_eq!(report.behind(), 1);
+}
+
+/// A file that vanished under the manifest reads as reinstallable, not as
+/// current - the same test `update` makes before skipping a table.
+#[test]
+fn check_notices_a_missing_file() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release);
+    completed(store.update(&remote, UpdateOptions::default()).unwrap());
+    fs::remove_file(cache.join("game-1.lhdb")).unwrap();
+
+    let report = store.check(&remote).unwrap();
+    assert_eq!(report.tables[0].status, TableStatus::FileMissing);
+    assert_eq!(report.behind(), 1);
+}
+
+/// A table this build cannot open is reported, but it is not something an
+/// update could fix - so it does not count as being behind.
+#[test]
+fn check_reports_an_unreadable_format_without_counting_it() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.get_mut("game").unwrap().format_version = 99;
+    });
+
+    let report = HashStore::at(&cache).check(&DirFetch(release)).unwrap();
+    assert_eq!(report.tables[0].status, TableStatus::Unsupported);
+    assert!(report.is_up_to_date(), "no update would change this");
 }

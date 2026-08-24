@@ -294,6 +294,39 @@ Semantics worth relying on (both variants):
   to `manifest.json`, so a release that keeps building an older format keeps feeding
   the builds pinned to it.
 
+### Asking without doing: `check`
+
+`update` takes the exclusive lock before it fetches anything, so it is the wrong
+call for "are we behind?". `check` fetches the published manifest, diffs it against
+the cache, and returns - no download, no install, no lock. Safe on a timer, and safe
+while another process is midway through an update.
+
+```rust
+use ltk_mimir_cache::{HashStore, ReleaseSource, UreqFetch};
+
+let store = HashStore::discover()?;
+let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir"));
+
+let report = store.check(&remote)?;
+if !report.is_up_to_date() {
+    println!("{} table(s) behind", report.behind());
+    for diff in &report.tables {
+        // `game: 2026-07-03 -> 2026-07-10 (outdated)`
+        let have = diff.local.as_ref().map_or("-", |local| &local.version);
+        println!("{}: {have} -> {} ({})", diff.table, diff.remote.version, diff.status);
+    }
+}
+```
+
+`TableStatus` distinguishes `Current`, `Absent`, `Stale`, `FileMissing` (the manifest
+points at a file that is gone), and `Unsupported` (a `.hashdb` format this build
+cannot open - reported, but not something an update could fix, so it does not count
+toward `behind()`).
+
+Two version labels can differ while the bytes do not: a release relabels every table
+it rebuilds, and `check` compares sha256s, so a table can read `Current` at an older
+label. That is the same test `update` makes before skipping a download.
+
 ### Custom pipelines: the primitives
 
 `update` is built from public pieces you can drive yourself when your flow differs -

@@ -100,4 +100,4 @@ See [`docs/CONSUMERS.md`](../../docs/CONSUMERS.md) for the consumer-facing integ
 
 ## License
 
-Apache-2.0.
+Apache-2.0. Copyright 2026 Crauzer <0xcrauzer@proton.me>.

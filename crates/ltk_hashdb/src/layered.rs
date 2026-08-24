@@ -1,9 +1,9 @@
 //! An in-memory overlay layered over an ordered list of read-only base tables.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 
-use crate::{Casing, HashDb, HashKind, KeyWidth};
+use crate::{Casing, HashDb, HashKind, KeyWidth, PathRef};
 
 /// The key configuration a base hashes under. Every base in a [`LayeredHashDb`]
 /// must agree on this triple; a base that diverges can never be hit by a caller's
@@ -15,9 +15,9 @@ fn base_config(db: &HashDb) -> (KeyWidth, HashKind, Casing) {
 /// A writable in-memory overlay on top of ordered read-only [`HashDb`] bases.
 ///
 /// Lookups consult the overlay first, then each base in push order; the first hit
-/// wins. Base files are never mutated. This generalises [`ExtendedHashDb`] (one
-/// base) to the N-base case consumers need when several tables (e.g. League's
-/// `game` and `lcu`) sit under one overlay.
+/// wins. Base files are never mutated. One base covers the "table plus my own
+/// runtime hashes" case; several cover the one consumers reach for when a workload
+/// spans more than one table (e.g. League's `game` and `lcu` under one overlay).
 ///
 /// # Base configuration invariant
 ///
@@ -31,8 +31,6 @@ fn base_config(db: &HashDb) -> (KeyWidth, HashKind, Casing) {
 /// [`from_bases`](Self::from_bases) `debug_assert!` this; release builds skip the
 /// check. League's `game`/`lcu` tables are uniform (XXH64 / U64 / case-insensitive),
 /// so the common path always satisfies it.
-///
-/// [`ExtendedHashDb`]: crate::ExtendedHashDb
 #[derive(Default)]
 pub struct LayeredHashDb {
     overlay: HashMap<u64, Box<str>>,
@@ -107,9 +105,9 @@ impl LayeredHashDb {
     }
 
     /// Overlay first, then each base in push order; the first hit wins.
-    pub fn get(&self, hash: u64) -> Option<Cow<'_, str>> {
+    pub fn get(&self, hash: u64) -> Option<PathRef<'_>> {
         if let Some(path) = self.overlay.get(&hash) {
-            return Some(Cow::Borrowed(&**path));
+            return Some(PathRef::borrowed(path));
         }
         self.bases.iter().find_map(|base| base.get(hash))
     }
@@ -125,9 +123,9 @@ impl LayeredHashDb {
     /// order. This is the payoff over calling [`get`](Self::get) N times.
     pub fn get_batch<'a>(
         &'a self,
-        hashes: &'a [u64],
-    ) -> impl Iterator<Item = (u64, Option<Cow<'a, str>>)> + 'a {
-        let mut results: Vec<Option<Cow<'a, str>>> = Vec::new();
+        hashes: &[u64],
+    ) -> impl Iterator<Item = (u64, Option<PathRef<'a>>)> + 'a {
+        let mut results: Vec<Option<PathRef<'a>>> = Vec::new();
         results.resize_with(hashes.len(), || None);
 
         // Layer 0: overlay, O(1) per hash. Positions still missing stay in
@@ -135,7 +133,7 @@ impl LayeredHashDb {
         let mut residual: Vec<usize> = Vec::new();
         for (i, &h) in hashes.iter().enumerate() {
             match self.overlay.get(&h) {
-                Some(path) => results[i] = Some(Cow::Borrowed(&**path)),
+                Some(path) => results[i] = Some(PathRef::borrowed(path)),
                 None => residual.push(i),
             }
         }
@@ -159,7 +157,101 @@ impl LayeredHashDb {
             residual = next;
         }
 
-        hashes.iter().copied().zip(results)
+        let out: Vec<(u64, Option<PathRef<'a>>)> = hashes.iter().copied().zip(results).collect();
+        out.into_iter()
+    }
+
+    /// Resolve a batch without collecting it, calling `f` per hash as it resolves.
+    ///
+    /// The streaming counterpart to [`get_batch`](Self::get_batch), with the same
+    /// staging: the overlay answers first, then each base takes the residual. Hits
+    /// arrive layer by layer and, within a base, in arena order rather than input
+    /// order, so the first argument is the hash's position in `hashes`; hashes no
+    /// layer answers are reported last.
+    pub fn for_each_batch(&self, hashes: &[u64], mut f: impl FnMut(usize, u64, Option<&str>)) {
+        let mut residual: Vec<usize> = Vec::new();
+        for (i, &hash) in hashes.iter().enumerate() {
+            match self.overlay.get(&hash) {
+                Some(path) => f(i, hash, Some(path)),
+                None => residual.push(i),
+            }
+        }
+
+        for base in &self.bases {
+            if residual.is_empty() {
+                break;
+            }
+
+            let sub: Vec<u64> = residual.iter().map(|&i| hashes[i]).collect();
+            let mut next: Vec<usize> = Vec::new();
+            base.for_each_batch(&sub, |p, hash, path| match path {
+                Some(path) => f(residual[p], hash, Some(path)),
+                None => next.push(residual[p]),
+            });
+            residual = next;
+        }
+
+        for i in residual {
+            f(i, hashes[i], None);
+        }
+    }
+
+    /// Copy a path into `buf`, replacing what was there. `false` for a miss.
+    ///
+    /// See [`HashDb::get_into`] - the layered form consults the overlay first, then
+    /// each base in push order.
+    pub fn get_into(&self, hash: u64, buf: &mut String) -> bool {
+        if let Some(path) = self.overlay.get(&hash) {
+            buf.clear();
+            buf.push_str(path);
+            return true;
+        }
+
+        self.bases.iter().any(|base| base.get_into(hash, buf))
+    }
+
+    /// Every entry, overlay first and then each base in priority order.
+    ///
+    /// Shadowed entries are yielded once, by the layer that answers them - so this
+    /// enumerates exactly what [`get`](Self::get) can resolve. Each base is walked in
+    /// its own arena order, so its frames decompress once.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, PathRef<'_>)> {
+        let overlay = self
+            .overlay
+            .iter()
+            .map(|(&hash, path)| (hash, PathRef::borrowed(path)));
+
+        let bases = self
+            .bases
+            .iter()
+            .enumerate()
+            .flat_map(move |(layer, base)| {
+                base.iter()
+                    .filter(move |(hash, _)| !self.shadows(*hash, layer))
+            });
+
+        overlay.chain(bases)
+    }
+
+    /// Whether a layer above `layer` already answers `hash`.
+    fn shadows(&self, hash: u64, layer: usize) -> bool {
+        self.overlay.contains_key(&hash)
+            || self.bases[..layer].iter().any(|base| base.contains(hash))
+    }
+
+    /// Entries across every base, counting a key that appears in several of them once
+    /// per base rather than once outright.
+    ///
+    /// An upper bound on what [`iter`](Self::iter) yields, and O(bases) to compute -
+    /// the exact figure would cost a lookup per entry, so it is `iter().count()` when
+    /// a caller genuinely needs it.
+    pub fn base_len(&self) -> usize {
+        self.bases.iter().map(HashDb::len).sum()
+    }
+
+    /// Whether every base has read cleanly so far - see [`HashDb::is_healthy`].
+    pub fn is_healthy(&self) -> bool {
+        self.bases.iter().all(HashDb::is_healthy)
     }
 
     /// The base tables, in priority order.
@@ -170,6 +262,16 @@ impl LayeredHashDb {
     /// Number of overlay entries.
     pub fn overlay_len(&self) -> usize {
         self.overlay.len()
+    }
+}
+
+impl fmt::Debug for LayeredHashDb {
+    /// Shape only - the overlay's size and each base's shape. Never entries.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LayeredHashDb")
+            .field("overlay", &self.overlay.len())
+            .field("bases", &self.bases)
+            .finish()
     }
 }
 
@@ -317,6 +419,71 @@ mod tests {
         let u32_base = raw_db_width(KeyWidth::U32, &[(2, "u32/two")]);
 
         let _ = LayeredHashDb::from_bases(vec![u64_base, u32_base]);
+    }
+
+    /// `iter` enumerates exactly what `get` can resolve: every shadowed key is
+    /// yielded once, by the layer that answers it.
+    #[test]
+    fn iter_yields_each_key_once_from_its_answering_layer() {
+        let base0 = raw_db(&[(1, "base0/one"), (2, "base0/two")]);
+        let base1 = raw_db(&[(2, "base1/two"), (3, "base1/three")]);
+        let mut db = LayeredHashDb::from_bases(vec![base0, base1]);
+        db.insert(1, "overlay/one");
+
+        let mut seen: Vec<(u64, String)> = db
+            .iter()
+            .map(|(hash, path)| (hash, path.into_owned()))
+            .collect();
+        seen.sort();
+
+        assert_eq!(
+            seen,
+            vec![
+                (1, "overlay/one".to_owned()),
+                (2, "base0/two".to_owned()),
+                (3, "base1/three".to_owned()),
+            ]
+        );
+
+        // Every yielded pair is what `get` answers with.
+        for (hash, path) in &seen {
+            assert_eq!(db.get(*hash).as_deref(), Some(path.as_str()));
+        }
+
+        // `base_len` counts the shadowed key in both bases, as documented.
+        assert_eq!(db.base_len(), 4);
+    }
+
+    #[test]
+    fn for_each_batch_matches_get_batch() {
+        let base0 = raw_db(&[(10, "base0/ten"), (20, "shadowed")]);
+        let base1 = raw_db(&[(20, "base1/twenty"), (30, "base1/thirty")]);
+        let mut db = LayeredHashDb::from_bases(vec![base0, base1]);
+        db.insert(5, "overlay/five");
+
+        let probes = [5u64, 10, 20, 30, 999, 10];
+        let mut streamed: Vec<(u64, Option<String>)> = vec![(0, None); probes.len()];
+        db.for_each_batch(&probes, |i, hash, path| {
+            streamed[i] = (hash, path.map(str::to_owned));
+        });
+
+        let collected: Vec<(u64, Option<String>)> = db
+            .get_batch(&probes)
+            .map(|(hash, path)| (hash, path.map(|p| p.into_owned())))
+            .collect();
+        assert_eq!(streamed, collected);
+    }
+
+    /// Debug prints shape, never entries.
+    #[test]
+    fn debug_prints_shape_only() {
+        let mut db = LayeredHashDb::from_bases(vec![raw_db(&[(1, "secret/path.bin")])]);
+        db.insert(2, "overlay/secret.bin");
+
+        let shown = format!("{db:?}");
+        assert!(shown.contains("overlay: 1"), "{shown}");
+        assert!(shown.contains("entries: 1"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
     }
 
     #[test]

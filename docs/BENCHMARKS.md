@@ -17,7 +17,7 @@ arena**, the **16 KiB default frame size**, and the **level 19** publishing defa
   ```
 
   `bench_real` also writes its measurements to `<out_dir>/bench_real.json`; the
-  README performance charts (`docs/assets/bench-*.svg`) regenerate from that report
+  performance charts in `DESIGN.md` (`docs/assets/bench-*.svg`) regenerate from that report
   via `cargo run -p ltk_hashdb --example gen_charts`. The arena-layout chart is the
   exception - its numbers come from `compression_lab` and live in `gen_charts.rs`.
 

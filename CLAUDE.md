@@ -21,13 +21,20 @@ Cargo workspace (`resolver = "2"`), four crates under `crates/`:
 
 | Crate | Role |
 |-------|------|
-| `ltk_hashdb`       | The `.hashdb` format: `mmap` reader (`HashDb`) + streaming writer (`HashDbWriter`), `ExtendedHashDb` overlay |
+| `ltk_hashdb`       | The `.hashdb` format: `mmap` reader (`HashDb`) + streaming writer (`HashDbWriter`), `LayeredHashDb` overlay |
 | `ltk_mimir_cache` | Shared cache dir, `manifest.json`, versioned publish, update lock, GC, in-process updater (`HashStore`, `HashStore::update`) |
 | `ltk_mimir_gen`   | Hash-discovery ("hunt") engine - guessers that resolve unknown hashes |
 | `ltk_mimir_cli`   | The `mimir` binary (`build` / `get` / `verify` / `stats` / `gen` / `update` / `merge` / `bundle`) |
 
-Docs live in `docs/`: `FORMAT.md` (byte-level spec, format version 1), `CONSUMERS.md`
-(integration API), `BENCHMARKS.md` (frame-size/compression measurements).
+Docs live in `docs/`: `DESIGN.md` (rationale, how the format works, measurements -
+the narrative the README used to carry), `FORMAT.md` (byte-level spec, format version 1),
+`CONSUMERS.md` (integration API), `BENCHMARKS.md` (frame-size/compression measurements),
+`ROADMAP.md` (planned work, in dependency order, with the additive-only constraints that
+govern it).
+
+`README.md` is the usage front door: install, quick start, the API surface with examples,
+and the CLI. Keep its examples true to the current API - they are typechecked by hand, not
+by CI.
 
 ## Conventions
 

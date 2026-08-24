@@ -1,10 +1,9 @@
 //! Round-trip and behavioral tests: txt-shaped data → `HashDbWriter` → `HashDb`.
 
-use std::borrow::Cow;
 use std::io::Cursor;
 
 use ltk_hashdb::{
-    BuildError, Casing, Compression, ExtendedHashDb, HashDb, HashDbWriter, HashKind, KeyWidth,
+    BuildError, Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth, LayeredHashDb,
     OpenError, VerifyError,
 };
 
@@ -42,13 +41,14 @@ const GAME_ENTRIES: &[(u64, &str)] = &[
     ),
 ];
 
-/// `docs/CONSUMERS.md` promises a `HashDb` can be shared across threads
-/// (all lookups take `&self`); keep this a compile-time guarantee.
+/// `docs/CONSUMERS.md` promises a reader can be shared across threads (all
+/// lookups take `&self`); keep this a compile-time guarantee for every public
+/// one, `LayeredHashDb` included - it is the type most consumers hold.
 #[test]
-fn hashdb_is_send_sync() {
+fn readers_are_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<HashDb>();
-    assert_send_sync::<ExtendedHashDb>();
+    assert_send_sync::<LayeredHashDb>();
 }
 
 #[test]
@@ -103,11 +103,12 @@ fn empty_table() {
     db.verify().expect("verify");
 }
 
+/// A raw arena lends its bytes straight out of the mapping - no copy per lookup.
 #[test]
-fn get_returns_borrowed_for_raw_arena() {
+fn get_borrows_from_a_raw_arena() {
     let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
-    assert!(matches!(db.get(1), Some(Cow::Borrowed(_))));
+    assert!(!db.get(1).expect("hit").is_owned());
 }
 
 #[test]
@@ -192,7 +193,12 @@ fn compressed_roundtrip() {
         assert!(db.is_compressed());
         for &(k, p) in GAME_ENTRIES {
             assert_eq!(db.get(k).as_deref(), Some(p), "frame_size {frame_size}");
-            assert!(matches!(db.get(k), Some(Cow::Owned(_))));
+            // A frame larger than the whole arena holds every entry whole, so the
+            // hit lends its bytes out of the cached frame rather than copying them.
+            // The tiny frame sizes above are the straddling case, which must splice.
+            if frame_size == 1 << 20 {
+                assert!(!db.get(k).expect("hit").is_owned());
+            }
         }
         assert_eq!(db.get(2), None);
         db.verify().expect("verify");
@@ -335,28 +341,28 @@ fn bad_magic_rejected() {
 }
 
 #[test]
-fn extended_overlay_first_then_base() {
+fn overlay_shadows_a_real_base_table() {
     let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
-    let mut ext = ExtendedHashDb::new(db);
+    let mut layered = LayeredHashDb::from_bases(vec![db]);
 
     // Base entries still resolve.
     assert_eq!(
-        ext.get(1).as_deref(),
+        layered.get(1).as_deref(),
         Some("assets/characters/aatrox/aatrox.bin")
     );
 
     // Overlay shadows the base.
-    ext.insert(1, "overridden/path.bin");
-    assert_eq!(ext.get(1).as_deref(), Some("overridden/path.bin"));
+    layered.insert(1, "overridden/path.bin");
+    assert_eq!(layered.get(1).as_deref(), Some("overridden/path.bin"));
 
-    // insert_path hashes with the base table's algorithm.
+    // insert_path hashes with the first base's algorithm.
     let path = "assets/custom/mod/thing.dds";
-    let h = ext.insert_path(path);
-    assert_eq!(h, ext.base().hash_path(path));
-    assert_eq!(ext.get(h).as_deref(), Some(path));
-    assert!(ext.contains(h));
-    assert_eq!(ext.overlay_len(), 2);
+    let h = layered.insert_path(path).expect("has a base");
+    assert_eq!(h, layered.bases()[0].hash_path(path));
+    assert_eq!(layered.get(h).as_deref(), Some(path));
+    assert!(layered.contains(h));
+    assert_eq!(layered.overlay_len(), 2);
 }
 
 #[test]

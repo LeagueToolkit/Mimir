@@ -4,9 +4,9 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/LeagueToolkit/mimir"
-authors = ["League Toolkit contributors"]
+authors = ["Crauzer <0xcrauzer@proton.me>", "League Toolkit contributors"]
 
 [workspace.dependencies]
 # Internal crates (path-linked within this workspace; the published ones also

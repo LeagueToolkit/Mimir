@@ -8,20 +8,21 @@
 //!
 //! See `docs/FORMAT.md` for the byte-level spec.
 
+mod cache;
 mod error;
-mod extended;
 mod hash;
 mod header;
 mod layered;
+mod path;
 mod reader;
 mod writer;
 
 pub use error::{BuildError, OpenError, VerifyError};
-pub use extended::ExtendedHashDb;
 pub use hash::{Casing, HashKind};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use layered::LayeredHashDb;
-pub use reader::HashDb;
+pub use path::PathRef;
+pub use reader::{HashDb, HashDbOptions, WeakHashDb, DEFAULT_FRAME_CACHE_BYTES};
 pub use writer::{BuildStats, HashDbWriter};
 
 /// Width of the integer keys in a table.

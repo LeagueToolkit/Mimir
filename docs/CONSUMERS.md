@@ -141,33 +141,32 @@ size in private memory, so reach for it last.
 ## Extending a table with custom hashes
 
 Mod tooling often introduces paths the community tables don't know. The sanctioned way
-is `ExtendedHashDb` - an in-memory overlay consulted before the immutable base, so you
-don't hand-roll a second map plus fallback:
+is `LayeredHashDb` - an in-memory overlay consulted before one or more immutable base
+tables, so you don't hand-roll a second map plus fallback:
 
 ```rust
-use ltk_hashdb::ExtendedHashDb;
+use ltk_hashdb::LayeredHashDb;
 
-let mut ext = ExtendedHashDb::new(store.open(Table::Game)?);
+let mut db = LayeredHashDb::from_bases(vec![store.open(Table::Game)?]);
 
-// Hashes with the base table's algorithm and returns the hash:
-let h = ext.insert_path("assets/mymod/custom.dds");
-ext.insert(precomputed_hash, "assets/mymod/other.bin"); // or bring your own hash
-ext.extend(pairs);                                       // or bulk-load
+// Hashes with the first base's algorithm and returns the hash:
+let h = db.insert_path("assets/mymod/custom.dds").expect("has a base");
+db.insert(precomputed_hash, "assets/mymod/other.bin"); // or bring your own hash
+db.extend(pairs);                                      // or bulk-load
 
-assert!(ext.contains(h));
-let path = ext.get(h);        // overlay first, then base
+assert!(db.contains(h));
+let path = db.get(h);         // overlay first, then each base in order
 ```
 
-The base file is never mutated. `ext.base()` exposes the underlying `HashDb`;
-`ext.overlay_len()` counts overlay-only entries. Overlay entries are per-process and
-not persisted - if you want them shared or durable, contribute them upstream to the
+Base files are never mutated. `db.bases()` exposes the underlying tables in priority
+order; `db.overlay_len()` counts overlay-only entries. Overlay entries are per-process
+and not persisted - if you want them shared or durable, contribute them upstream to the
 CommunityDragon txt lists (the canonical source).
 
 ### Layering several base tables under one overlay
 
-When a workload spans **more than one** table - WAD chunk resolution consults both
-`Game` and `Lcu` - reach for `LayeredHashDb` instead of hand-rolling a `Vec<HashDb>`
-plus fallback. It is `ExtendedHashDb` generalised to N ordered bases: lookups consult
+The same type takes N bases, which is what you want when a workload spans **more than
+one** table - WAD chunk resolution consults both `Game` and `Lcu`. Lookups consult
 the overlay first, then each base in push order, first hit wins.
 
 ```rust

@@ -427,3 +427,35 @@ fn gc_handles_mapped_superseded_file() {
     assert!(mapped.contains(0x2222));
     assert!(store.open(Table::Game).unwrap().contains(0x3333));
 }
+
+/// `open_shared` hands back the handle it already has, and follows the manifest to a
+/// new version once one is published.
+#[test]
+fn open_shared_reuses_handles_until_the_version_changes() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    let one = build_table(&tmp.path().join("game-1.build"), &[(1, "assets/one.bin")]);
+    store
+        .commit(&[CommitItem::new(Table::Game, "1", &one)], None)
+        .unwrap();
+
+    let first = store.open_shared(Table::Game).unwrap();
+    let second = store.open_shared(Table::Game).unwrap();
+    assert_eq!(first.get(1).as_deref(), Some("assets/one.bin"));
+    assert_eq!(second.get(1).as_deref(), Some("assets/one.bin"));
+
+    // Publishing a new version repoints the manifest, so the next call opens that one
+    // rather than serving the handle it already holds.
+    let two = build_table(
+        &tmp.path().join("game-2.build"),
+        &[(1, "assets/one.bin"), (2, "assets/two.bin")],
+    );
+    store
+        .commit(&[CommitItem::new(Table::Game, "2", &two)], None)
+        .unwrap();
+
+    let after = store.open_shared(Table::Game).unwrap();
+    assert_eq!(after.len(), 2, "followed the manifest to the new version");
+    assert_eq!(first.len(), 1, "the old handle keeps reading the old file");
+}

@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://github.com/LeagueToolkit">
-    <img src="https://avatars.githubusercontent.com/u/28510182?s=200&v=4" alt="LeagueToolkit logo" width="96" height="96">
+    <img src="docs/assets/logo.png" alt="mimir logo" width="96" height="96">
   </a>
   <h1>mimir</h1>
 </div>

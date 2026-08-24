@@ -143,6 +143,9 @@ publishing (`mimir bundle` + a scheduled CI job that ships every table as versio
 download-driven `mimir update` flow, and the hunt engine - including WAD string mining
 (`mimir gen --wad`) - are in place.
 
+Planned work - a reader frame cache, the pre-1.0 API cleanup, and arena-order indexing -
+is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
 ## License
 
 Licensed under either of

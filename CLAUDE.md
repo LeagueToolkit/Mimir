@@ -27,7 +27,8 @@ Cargo workspace (`resolver = "2"`), four crates under `crates/`:
 | `ltk_mimir_cli`   | The `mimir` binary (`build` / `get` / `verify` / `stats` / `gen` / `update` / `merge` / `bundle`) |
 
 Docs live in `docs/`: `FORMAT.md` (byte-level spec, format version 1), `CONSUMERS.md`
-(integration API), `BENCHMARKS.md` (frame-size/compression measurements).
+(integration API), `BENCHMARKS.md` (frame-size/compression measurements), `ROADMAP.md`
+(planned work, in dependency order, with the additive-only constraints that govern it).
 
 ## Conventions
 

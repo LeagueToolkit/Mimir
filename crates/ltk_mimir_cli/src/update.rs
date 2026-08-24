@@ -47,8 +47,14 @@ pub fn run(opts: &Options) -> Result<()> {
     let outcome = store.update(&fetch, UpdateOptions { force: opts.force })?;
     let report = match outcome {
         UpdateOutcome::Locked => {
+            let who = match store.lock_holder()? {
+                Some(holder) => format!("pid {} since {}", holder.pid, holder.since),
+                // It finished between the failed lock and this read, or never
+                // got as far as writing its name.
+                None => "another process".to_owned(),
+            };
             println!(
-                "another process is already updating {} - nothing to do",
+                "{who} is already updating {} - nothing to do",
                 store.dir().display()
             );
             return Ok(());

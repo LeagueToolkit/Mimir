@@ -321,6 +321,9 @@ Semantics worth relying on (both variants):
   mismatch, which errors before anything installs) leaves the old manifest intact.
 - **Single updater, many readers.** The update runs under a cross-process try-lock;
   a `Locked` outcome means someone else is already on it. Readers never take the lock.
+  `lock_holder()` names that someone - pid and start time - so a UI can say "syncing
+  since 14:02" instead of something that reads like a hang. `lock_update_timeout(d)`
+  queues behind the current updater for up to `d` instead of giving up at once.
 - **Forward compatibility.** A release published by a newer mimir is never fatal.
   Tables this build has no id for are skipped into `report.unknown_tables`; tables
   published in a `.hashdb` format it cannot open are skipped into

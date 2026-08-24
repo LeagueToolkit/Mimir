@@ -652,3 +652,89 @@ fn sha256_of(path: &std::path::Path) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+/// A held lock names its holder; a free one names nobody, even though the lock
+/// file is still lying there with a previous holder written in it.
+#[test]
+fn the_lock_says_who_holds_it() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    assert!(
+        HashStore::at(tmp.path().join("never-used"))
+            .lock_holder()
+            .unwrap()
+            .is_none(),
+        "a directory that does not exist has no updater"
+    );
+    assert!(
+        store.lock_holder().unwrap().is_none(),
+        "no lock file yet, so nobody holds it"
+    );
+    assert!(
+        !tmp.path().join(".update.lock").exists(),
+        "asking the question did not create the lock"
+    );
+
+    let held = store.try_lock_update().unwrap().expect("free");
+    let holder = store.lock_holder().unwrap().expect("someone holds it");
+    assert_eq!(holder.pid, std::process::id());
+    assert!(
+        holder.since_time().is_some(),
+        "the stamp parses: {:?}",
+        holder.since
+    );
+
+    drop(held);
+    assert!(
+        store.lock_holder().unwrap().is_none(),
+        "the body outlives the lock; the answer must not"
+    );
+}
+
+/// A bounded wait gives up rather than hanging, and reports the same `None` a
+/// non-blocking attempt would.
+#[test]
+fn a_bounded_wait_gives_up() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let _held = store.try_lock_update().unwrap().expect("free");
+
+    let waited = std::time::Instant::now();
+    let attempt = store
+        .lock_update_timeout(std::time::Duration::from_millis(60))
+        .unwrap();
+
+    assert!(attempt.is_none(), "the lock was never free");
+    assert!(
+        waited.elapsed() >= std::time::Duration::from_millis(50),
+        "it actually waited: {:?}",
+        waited.elapsed()
+    );
+}
+
+/// And it takes the lock as soon as the holder lets go.
+#[test]
+fn a_bounded_wait_takes_a_lock_that_frees_up() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let held = store.try_lock_update().unwrap().expect("free");
+
+    let releaser = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+            // Keep the store alive so the release, not a drop of the dir, is
+            // what the waiter observes.
+            drop(store);
+        })
+    };
+
+    let taken = store
+        .lock_update_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(taken.is_some(), "the wait outlasted the holder");
+
+    releaser.join().unwrap();
+}

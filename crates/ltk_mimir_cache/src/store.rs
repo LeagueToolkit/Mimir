@@ -4,19 +4,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use ltk_hashdb::{HashDb, LayeredHashDb, WeakHashDb};
 
 use crate::manifest::{Manifest, Source, TableEntry};
 use crate::{
-    dir, fsutil, CommitError, GcError, ManifestError, NoCacheDirError, OpenError, Table,
-    UniverseMismatch, UpdateLock,
+    dir, fsutil, CommitError, GcError, LockHolder, ManifestError, NoCacheDirError, OpenError,
+    Table, UniverseMismatch, UpdateLock,
 };
 
 /// The manifest filename inside the cache directory.
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
-/// The single-updater lock filename.
-const UPDATE_LOCK_FILE: &str = ".update.lock";
 /// Extension for published table files (League Toolkit convention).
 const TABLE_EXT: &str = "lhdb";
 
@@ -273,9 +272,36 @@ impl HashStore {
     /// Try to become the single updater without blocking. `Ok(None)` means another
     /// process is already updating. Hold the returned guard across
     /// download/build/[`commit`](HashStore::commit)/[`gc`](HashStore::gc).
+    ///
+    /// Ask [`lock_holder`](HashStore::lock_holder) who that other process is
+    /// before telling a user to wait for it.
     pub fn try_lock_update(&self) -> std::io::Result<Option<UpdateLock>> {
         std::fs::create_dir_all(&self.dir)?;
-        UpdateLock::try_acquire(&self.dir.join(UPDATE_LOCK_FILE))
+        UpdateLock::try_acquire(&self.dir)
+    }
+
+    /// Become the single updater, waiting up to `timeout` for the current one to
+    /// finish.
+    ///
+    /// For a tool that would rather queue behind a running update than tell the
+    /// user to try again - a setup script, say. `Ok(None)` means the timeout ran
+    /// out and someone still holds it. A zero timeout is exactly
+    /// [`try_lock_update`](HashStore::try_lock_update).
+    pub fn lock_update_timeout(&self, timeout: Duration) -> std::io::Result<Option<UpdateLock>> {
+        std::fs::create_dir_all(&self.dir)?;
+        UpdateLock::acquire_timeout(&self.dir, timeout)
+    }
+
+    /// Who is updating this cache right now, if anyone.
+    ///
+    /// `Ok(None)` means nobody holds the lock - not that the answer is unknown.
+    /// A held lock whose body is missing or unreadable also reads as `None`,
+    /// since the body is written best-effort and nothing depends on it.
+    ///
+    /// The pid can name a process that has since died: the OS releases the lock
+    /// when it does, so this reports `None` again from that moment.
+    pub fn lock_holder(&self) -> std::io::Result<Option<LockHolder>> {
+        UpdateLock::holder(&self.dir)
     }
 
     /// Install one or more freshly built tables and atomically flip the manifest to

@@ -29,7 +29,7 @@ pub use fetch::ReqwestFetch;
 pub use fetch::UreqFetch;
 #[cfg(any(feature = "ureq", feature = "reqwest"))]
 pub use fetch::{HttpFetchError, ReleaseSource};
-pub use lock::UpdateLock;
+pub use lock::{LockHolder, UpdateLock};
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
 pub use table::{HashUniverse, Table};

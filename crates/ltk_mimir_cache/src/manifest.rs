@@ -160,14 +160,7 @@ impl Manifest {
     /// `None` when the field is empty or not RFC-3339 - it is a string in the
     /// document, and a manifest is downloaded input.
     pub fn generated_at_time(&self) -> Option<SystemTime> {
-        let parsed = OffsetDateTime::parse(&self.generated_at, &Rfc3339).ok()?;
-        let secs = parsed.unix_timestamp();
-        // Pre-epoch stamps are nonsense here, but they are cheap to honour.
-        Some(if secs >= 0 {
-            UNIX_EPOCH + Duration::from_secs(secs as u64)
-        } else {
-            UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
-        })
+        parse_rfc3339(&self.generated_at)
     }
 
     /// Parse a manifest, refusing only what this build genuinely cannot use.
@@ -235,6 +228,24 @@ impl Manifest {
         fsutil::atomic_write(path, &json)?;
         Ok(())
     }
+}
+
+/// Parse an RFC-3339 stamp into a [`SystemTime`], or `None` if it is not one.
+///
+/// [`SystemTime`] rather than a `time` type: every stamp in this crate is one a
+/// consumer wants to subtract from `now`, and answering that should not pin them
+/// to our date library.
+pub(crate) fn parse_rfc3339(stamp: &str) -> Option<SystemTime> {
+    let secs = OffsetDateTime::parse(stamp, &Rfc3339)
+        .ok()?
+        .unix_timestamp();
+
+    // Pre-epoch stamps are nonsense here, but they are cheap to honour.
+    Some(if secs >= 0 {
+        UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+    })
 }
 
 /// The version label embedded in a release filename (`<id>-<version>.lhdb`).

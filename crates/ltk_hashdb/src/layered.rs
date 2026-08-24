@@ -15,9 +15,9 @@ fn base_config(db: &HashDb) -> (KeyWidth, HashKind, Casing) {
 /// A writable in-memory overlay on top of ordered read-only [`HashDb`] bases.
 ///
 /// Lookups consult the overlay first, then each base in push order; the first hit
-/// wins. Base files are never mutated. This generalises [`ExtendedHashDb`] (one
-/// base) to the N-base case consumers need when several tables (e.g. League's
-/// `game` and `lcu`) sit under one overlay.
+/// wins. Base files are never mutated. One base covers the "table plus my own
+/// runtime hashes" case; several cover the one consumers reach for when a workload
+/// spans more than one table (e.g. League's `game` and `lcu` under one overlay).
 ///
 /// # Base configuration invariant
 ///
@@ -31,8 +31,6 @@ fn base_config(db: &HashDb) -> (KeyWidth, HashKind, Casing) {
 /// [`from_bases`](Self::from_bases) `debug_assert!` this; release builds skip the
 /// check. League's `game`/`lcu` tables are uniform (XXH64 / U64 / case-insensitive),
 /// so the common path always satisfies it.
-///
-/// [`ExtendedHashDb`]: crate::ExtendedHashDb
 #[derive(Default)]
 pub struct LayeredHashDb {
     overlay: HashMap<u64, Box<str>>,

@@ -9,7 +9,6 @@
 //! See `docs/FORMAT.md` for the byte-level spec.
 
 mod error;
-mod extended;
 mod hash;
 mod header;
 mod layered;
@@ -17,7 +16,6 @@ mod reader;
 mod writer;
 
 pub use error::{BuildError, OpenError, VerifyError};
-pub use extended::ExtendedHashDb;
 pub use hash::{Casing, HashKind};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use layered::LayeredHashDb;

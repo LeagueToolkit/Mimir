@@ -265,7 +265,7 @@ fn build_table(
     // Every League table hashes the lowercased path.
     let mut writer = HashDbWriter::new(spec.key_width, compression)
         .hash_kind(spec.hash_kind)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     for file in files {
         read_hash_lines(file, |hash, _, path| {
             writer.insert(hash, path);

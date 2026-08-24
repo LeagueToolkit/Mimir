@@ -324,7 +324,7 @@ use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
 
 let mut w = HashDbWriter::new(KeyWidth::U64, Compression::default()) // 16 KiB frames, level 19
     .hash_kind(HashKind::Xxh64)         // recorded so readers can `hash_path`
-    .casing(Casing::Insensitive);       // keys hash the lowercased path (League rule);
+    .casing(Casing::AsciiInsensitive);       // keys hash the ASCII-lowercased path (League rule);
                                         // defaults to Sensitive (hash bytes as given)
 
 w.insert(hash, "assets/characters/aatrox/aatrox.bin");
@@ -357,7 +357,7 @@ use ltk_hashdb::{Casing, HashKind, KeyWidth};
 
 let mined = mine_wad("Ahri.wad.client".as_ref())?;      // seed strings + chunk hashes
 
-let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::Insensitive, KeyWidth::U64);
+let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::AsciiInsensitive, KeyWidth::U64);
 ctx.add_known(db.iter().map(|(_, p)| p.into_owned()));  // corpus to mutate from
 ctx.add_unknown(mined.chunk_hashes.into_iter().filter(|&h| !db.contains(h)));
 

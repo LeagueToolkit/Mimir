@@ -270,7 +270,7 @@ fn build(
 ) -> (u64, ltk_hashdb::BuildStats) {
     let mut w = HashDbWriter::new(key_width, compression)
         .hash_kind(hash_kind)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     w.extend(entries.iter().map(|(k, p)| (*k, p.as_str())));
     let file = BufWriter::new(File::create(out).expect("create output"));
     let stats = w.build(file).expect("build");

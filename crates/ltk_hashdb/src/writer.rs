@@ -46,7 +46,7 @@ impl HashDbWriter {
         self
     }
 
-    /// Record whether the keys hash the lowercased path ([`Casing::Insensitive`],
+    /// Record whether the keys hash the lowercased path ([`Casing::AsciiInsensitive`],
     /// all League tables) or the path as given. Defaults to [`Casing::Sensitive`].
     pub fn casing(mut self, casing: Casing) -> Self {
         self.casing = casing;
@@ -150,7 +150,7 @@ impl HashDbWriter {
                 (compressed, FLAG_ARENA_COMPRESSED)
             }
         };
-        if self.casing == Casing::Insensitive {
+        if self.casing == Casing::AsciiInsensitive {
             flags |= FLAG_CASE_INSENSITIVE;
         }
 

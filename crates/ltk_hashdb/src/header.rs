@@ -32,7 +32,12 @@ pub const HEADER_SIZE: usize = 80;
 /// Header flag: the arena is a zeekstd seekable stream rather than raw bytes.
 pub(crate) const FLAG_ARENA_COMPRESSED: u8 = 1 << 0;
 
-/// Header flag: the keys hash the lowercased path ([`Casing::Insensitive`]).
+/// Header flag: the keys hash the ASCII-lowercased path
+/// ([`Casing::AsciiInsensitive`]).
+///
+/// Should a Unicode-aware rule ever be wanted, it gets its own value in the
+/// reserved byte at offset 14 rather than a second flag bit - unknown flag bits
+/// are rejected, unknown reserved bytes are not.
 pub(crate) const FLAG_CASE_INSENSITIVE: u8 = 1 << 1;
 
 const KNOWN_FLAGS: u8 = FLAG_ARENA_COMPRESSED | FLAG_CASE_INSENSITIVE;
@@ -75,7 +80,7 @@ impl Header {
 
     pub fn casing(&self) -> Casing {
         if self.flags & FLAG_CASE_INSENSITIVE != 0 {
-            Casing::Insensitive
+            Casing::AsciiInsensitive
         } else {
             Casing::Sensitive
         }

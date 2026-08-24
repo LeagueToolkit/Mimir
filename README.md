@@ -193,7 +193,7 @@ use ltk_hashdb::{Casing, Compression, HashDbWriter, HashKind, KeyWidth};
 
 let mut writer = HashDbWriter::new(KeyWidth::U64, Compression::default())
     .hash_kind(HashKind::Xxh64)     // recorded, so readers can hash new paths
-    .casing(Casing::Insensitive);   // League tables hash the lowercased path
+    .casing(Casing::AsciiInsensitive);   // League tables hash the ASCII-lowercased path
 
 writer.insert(hash, "assets/characters/ahri/ahri.bin");
 writer.extend(pairs);

@@ -71,7 +71,7 @@ fn build_bytes(
 ) -> Vec<u8> {
     let mut w = HashDbWriter::new(key_width, compression)
         .hash_kind(hash_kind)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     w.extend(entries.iter().map(|(&k, p)| (k, p.as_str())));
     let mut out = Cursor::new(Vec::new());
     w.build(&mut out).expect("build");
@@ -138,7 +138,7 @@ fn golden_parity() {
         // independent xxh64) - so tolerate a handful, not zero.
         let mut mismatches = 0usize;
         for (&k, p) in &entries {
-            if hash_kind.hash(p, Casing::Insensitive, key_width) != k {
+            if hash_kind.hash(p, Casing::AsciiInsensitive, key_width) != k {
                 mismatches += 1;
                 if mismatches <= 5 {
                     eprintln!("{file}: upstream hash mismatch: {k:#x} {p:?}");

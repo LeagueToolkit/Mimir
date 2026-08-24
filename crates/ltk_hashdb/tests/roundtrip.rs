@@ -16,7 +16,7 @@ fn build_with(
     // The fixtures are League-shaped, so record the League casing rule.
     let mut w = HashDbWriter::new(key_width, compression)
         .hash_kind(hash_kind)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     w.extend(entries.iter().copied());
     let mut out = Cursor::new(Vec::new());
     let stats = w.build(&mut out).expect("build");
@@ -296,7 +296,7 @@ fn zero_frame_size_rejected() {
 fn hash_path_uses_table_algorithm() {
     let bytes = build(KeyWidth::U32, HashKind::Fnv1a32, &[]);
     let db = HashDb::open_bytes(bytes).expect("open");
-    assert_eq!(db.casing(), Casing::Insensitive);
+    assert_eq!(db.casing(), Casing::AsciiInsensitive);
     assert_eq!(db.hash_path("TEST"), 0xafd071e5);
 }
 

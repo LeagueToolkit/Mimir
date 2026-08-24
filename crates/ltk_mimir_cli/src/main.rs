@@ -58,7 +58,7 @@ impl Table {
 
     /// Every League table hashes the lowercased path.
     fn casing(self) -> Casing {
-        Casing::Insensitive
+        Casing::AsciiInsensitive
     }
 
     /// The corresponding shared-cache table.

@@ -21,7 +21,7 @@ fn hex_dump(bytes: &[u8]) -> String {
 fn fixture_file_bytes() {
     let mut w = HashDbWriter::new(KeyWidth::U64, Compression::None)
         .hash_kind(HashKind::Xxh64)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     w.insert(0x0123_4567_89ab_cdef, "assets/a.dds");
     w.insert(0x0000_0000_0000_0042, "data/b.bin");
     let mut out = Cursor::new(Vec::new());
@@ -34,7 +34,7 @@ fn fixture_file_bytes() {
 fn fixture_u32_header() {
     let mut w = HashDbWriter::new(KeyWidth::U32, Compression::None)
         .hash_kind(HashKind::Fnv1a32)
-        .casing(Casing::Insensitive);
+        .casing(Casing::AsciiInsensitive);
     w.insert(0xafd0_71e5, "test");
     let mut out = Cursor::new(Vec::new());
     w.build(&mut out).expect("build");

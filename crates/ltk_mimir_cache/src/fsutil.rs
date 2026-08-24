@@ -42,9 +42,57 @@ pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     fs::rename(&tmp, dst)
 }
 
-/// sha256 of an in-memory buffer, returned as lowercase hex.
-pub fn sha256_bytes(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+/// Move `src` onto `dst`, making `src` durable first.
+///
+/// The counterpart to [`atomic_copy`] for a file that was staged inside the
+/// cache directory for this purpose: same volume, so the rename is a metadata
+/// operation and the bytes are never read or written a second time.
+pub fn rename_into_place(src: &Path, dst: &Path) -> io::Result<()> {
+    // Re-open for writing to fsync: on Windows `FlushFileBuffers` needs write
+    // access, so a read-only handle would fail with `ERROR_ACCESS_DENIED`.
+    fs::OpenOptions::new().write(true).open(src)?.sync_all()?;
+    fs::rename(src, dst)
+}
+
+/// A sink that hashes every byte it forwards.
+///
+/// Wrapping the staging file in this is what lets a download be verified without
+/// a second pass over it: the digest is ready the moment the last byte lands.
+pub struct HashingWriter<W> {
+    inner: W,
+
+    hasher: Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// Flush the wrapped writer and return the hex digest of everything written.
+    pub fn finish(&mut self) -> io::Result<String> {
+        self.inner.flush()?;
+
+        Ok(hex(&self.hasher.clone().finalize()))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Hash what was actually taken, not what was offered: a short write
+        // leaves the rest for the next call.
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Streaming sha256 of a file, returned as lowercase hex.

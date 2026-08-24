@@ -341,12 +341,13 @@ fn recommit_identical_version_is_idempotent() {
     assert_eq!(before, after, "identical recommit left the file untouched");
 }
 
+/// `last_run` describes the run, so it is replaced wholesale every time -
+/// including by a run that records nothing.
 #[test]
-fn commit_overwrites_stale_source() {
+fn commit_overwrites_the_stale_run_record() {
     let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
-    // A first commit records provenance.
     let src = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);
     let source = Source {
         repo: Some("owner/repo".into()),
@@ -356,18 +357,110 @@ fn commit_overwrites_stale_source() {
     store
         .commit(&[CommitItem::new(Table::Game, "v1", &src)], Some(source))
         .unwrap();
-    assert!(store.manifest().unwrap().source.is_some());
+    assert!(store.manifest().unwrap().last_run.is_some());
 
-    // A later commit that omits `source` clears the stale value rather than keeping it,
-    // so the manifest always describes the inputs of the last commit.
     let src2 = build_table(&tmp.path().join("g2.lhdb"), ENTRIES);
     let manifest = store
         .commit(&[CommitItem::new(Table::Game, "v2", &src2)], None)
         .unwrap();
     assert!(
-        manifest.source.is_none(),
-        "a None source clears stale provenance"
+        manifest.last_run.is_none(),
+        "a None source clears the stale run record"
     );
+}
+
+/// The reason provenance sits on the entry: a run that publishes one table must
+/// not restamp the tables it never looked at.
+#[test]
+fn a_partial_commit_leaves_other_tables_provenance_alone() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let src = build_table(&tmp.path().join("t.lhdb"), ENTRIES);
+
+    let from = |commit: &str| Source {
+        repo: Some("owner/repo".into()),
+        commit: Some(commit.into()),
+        inputs_sha256: None,
+    };
+
+    store
+        .commit(
+            &[
+                CommitItem::new(Table::Game, "v1", &src),
+                CommitItem::new(Table::Lcu, "v1", &src),
+            ],
+            Some(from("aaaa")),
+        )
+        .unwrap();
+
+    // A second run rebuilds only `game`, from a different upstream commit.
+    let manifest = store
+        .commit(
+            &[CommitItem::new(Table::Game, "v2", &src)],
+            Some(from("bbbb")),
+        )
+        .unwrap();
+
+    let commit_of = |table| {
+        manifest
+            .entry(table)
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone()
+    };
+    assert_eq!(commit_of(Table::Game), Some("bbbb".into()));
+    assert_eq!(
+        commit_of(Table::Lcu),
+        Some("aaaa".into()),
+        "the untouched table still names the commit it was built from"
+    );
+    assert_eq!(manifest.last_run.unwrap().commit, Some("bbbb".into()));
+}
+
+/// An item can name its own inputs, for a run that builds several tables from
+/// several places.
+#[test]
+fn an_item_can_override_the_run_wide_source() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let src = build_table(&tmp.path().join("t.lhdb"), ENTRIES);
+
+    let run = Source {
+        repo: Some("owner/repo".into()),
+        commit: Some("aaaa".into()),
+        inputs_sha256: None,
+    };
+    let mirror = Source {
+        repo: Some("mirror/repo".into()),
+        commit: Some("bbbb".into()),
+        inputs_sha256: None,
+    };
+
+    let manifest = store
+        .commit(
+            &[
+                CommitItem::new(Table::Game, "v1", &src),
+                CommitItem::new(Table::Lcu, "v1", &src).with_source(mirror),
+            ],
+            Some(run),
+        )
+        .unwrap();
+
+    let repo_of = |table| {
+        manifest
+            .entry(table)
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .repo
+            .clone()
+    };
+    assert_eq!(repo_of(Table::Game), Some("owner/repo".into()));
+    assert_eq!(repo_of(Table::Lcu), Some("mirror/repo".into()));
 }
 
 /// N reader threads hammer `open`/`get` while the main thread recommits new versions;
@@ -493,4 +586,155 @@ fn open_shared_reuses_handles_until_the_version_changes() {
     let after = store.open_shared(Table::Game).unwrap();
     assert_eq!(after.len(), 2, "followed the manifest to the new version");
     assert_eq!(first.len(), 1, "the old handle keeps reading the old file");
+}
+
+/// A staged file is consumed, not copied: the bytes are written once, by
+/// whoever staged them, and `commit` only moves the name.
+#[test]
+fn commit_moves_a_staged_file_instead_of_copying_it() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    std::fs::create_dir_all(tmp.path()).unwrap();
+
+    // Staged inside the cache directory, the way the updater writes a download.
+    let staged = tmp.path().join("game-v1.lhdb.download.tmp");
+    build_table(&staged, ENTRIES);
+    let sha256 = sha256_of(&staged);
+
+    let manifest = store
+        .commit(
+            &[CommitItem::staged(Table::Game, "v1", &staged, &sha256)],
+            None,
+        )
+        .unwrap();
+
+    assert!(!staged.exists(), "the staged file was moved, not copied");
+    let installed = tmp.path().join("game-v1.lhdb");
+    assert!(installed.is_file());
+    assert_eq!(
+        manifest.entry(Table::Game).unwrap().sha256,
+        sha256,
+        "the digest computed while staging is the one recorded"
+    );
+    assert_eq!(
+        store.open(Table::Game).unwrap().len(),
+        ENTRIES.len(),
+        "and the moved file opens"
+    );
+}
+
+/// The copy path is still there for a table built somewhere else, which the
+/// caller keeps.
+#[test]
+fn commit_copies_a_file_it_was_not_handed() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path().join("cache"));
+
+    let built = tmp.path().join("built.lhdb");
+    build_table(&built, ENTRIES);
+
+    store
+        .commit(&[CommitItem::new(Table::Game, "v1", &built)], None)
+        .unwrap();
+
+    assert!(built.is_file(), "the caller's file is left where it was");
+    assert!(tmp.path().join("cache/game-v1.lhdb").is_file());
+}
+
+/// sha256 of a file, as lowercase hex - the digest a stager would have.
+fn sha256_of(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(path).unwrap());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A held lock names its holder; a free one names nobody, even though the lock
+/// file is still lying there with a previous holder written in it.
+#[test]
+fn the_lock_says_who_holds_it() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    assert!(
+        HashStore::at(tmp.path().join("never-used"))
+            .lock_holder()
+            .unwrap()
+            .is_none(),
+        "a directory that does not exist has no updater"
+    );
+    assert!(
+        store.lock_holder().unwrap().is_none(),
+        "no lock file yet, so nobody holds it"
+    );
+    assert!(
+        !tmp.path().join(".update.lock").exists(),
+        "asking the question did not create the lock"
+    );
+
+    let held = store.try_lock_update().unwrap().expect("free");
+    let holder = store.lock_holder().unwrap().expect("someone holds it");
+    assert_eq!(holder.pid, std::process::id());
+    assert!(
+        holder.since_time().is_some(),
+        "the stamp parses: {:?}",
+        holder.since
+    );
+
+    drop(held);
+    assert!(
+        store.lock_holder().unwrap().is_none(),
+        "the body outlives the lock; the answer must not"
+    );
+}
+
+/// A bounded wait gives up rather than hanging, and reports the same `None` a
+/// non-blocking attempt would.
+#[test]
+fn a_bounded_wait_gives_up() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let _held = store.try_lock_update().unwrap().expect("free");
+
+    let waited = std::time::Instant::now();
+    let attempt = store
+        .lock_update_timeout(std::time::Duration::from_millis(60))
+        .unwrap();
+
+    assert!(attempt.is_none(), "the lock was never free");
+    assert!(
+        waited.elapsed() >= std::time::Duration::from_millis(50),
+        "it actually waited: {:?}",
+        waited.elapsed()
+    );
+}
+
+/// And it takes the lock as soon as the holder lets go.
+#[test]
+fn a_bounded_wait_takes_a_lock_that_frees_up() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let held = store.try_lock_update().unwrap().expect("free");
+
+    let releaser = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+            // Keep the store alive so the release, not a drop of the dir, is
+            // what the waiter observes.
+            drop(store);
+        })
+    };
+
+    let taken = store
+        .lock_update_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(taken.is_some(), "the wait outlasted the holder");
+
+    releaser.join().unwrap();
 }

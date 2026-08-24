@@ -313,6 +313,92 @@ fn hash_path_respects_recorded_casing() {
     assert_eq!(db.hash_path("test"), 0xafd071e5);
 }
 
+/// The cheap tier still hashes every stored byte, so damage anywhere - arena
+/// included - is caught without decompressing a thing.
+#[test]
+fn verify_index_catches_damage_without_decoding() {
+    let good = build_with(
+        KeyWidth::U64,
+        HashKind::Xxh64,
+        Compression::Zeekstd {
+            frame_size: 128,
+            level: 3,
+        },
+        GAME_ENTRIES,
+    );
+    HashDb::open_bytes(good.clone())
+        .expect("open")
+        .verify_index()
+        .expect("a freshly built table passes");
+
+    // A bit flipped inside a compressed frame, the way bit rot arrives. Not the
+    // trailing bytes: those are the seek table, and `open` parses that already.
+    let arena_offset = u64::from_le_bytes(good[40..48].try_into().unwrap()) as usize;
+    let mut rotted = good.clone();
+    rotted[arena_offset + 8] ^= 0xff;
+    assert!(
+        matches!(
+            HashDb::open_bytes(rotted).expect("open").verify_index(),
+            Err(VerifyError::ChecksumMismatch)
+        ),
+        "damage inside the arena is caught without decompressing it"
+    );
+
+    // A flipped key, which `open` has no reason to look at either.
+    let keys_offset = u64::from_le_bytes(good[24..32].try_into().unwrap()) as usize;
+    let mut rotted = good;
+    rotted[keys_offset] ^= 0xff;
+    assert!(matches!(
+        HashDb::open_bytes(rotted).expect("open").verify_index(),
+        Err(VerifyError::ChecksumMismatch)
+    ));
+}
+
+/// Where the two tiers part company: an entry whose extent runs off the end of
+/// the arena is a well-formedness problem, not damage, so only the full pass
+/// finds it.
+#[test]
+fn verify_index_does_not_prove_entries_are_in_bounds() {
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
+
+    // Point the first entry's length past the end of the arena, then re-stamp
+    // the checksum the way a broken writer would have.
+    let entry_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+    let offsets_offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let offset_width = bytes[13] as usize;
+    let lengths_offset = offsets_offset + entry_count * offset_width;
+    bytes[lengths_offset..lengths_offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+    restamp_checksum(&mut bytes);
+
+    let db = HashDb::open_bytes(bytes).expect("the header and bounds still validate");
+    db.verify_index()
+        .expect("nothing was damaged: the bytes hash to what the header claims");
+    assert!(
+        matches!(db.verify(), Err(VerifyError::Malformed(_))),
+        "the full pass reads the entry and finds it runs off the arena"
+    );
+}
+
+/// Recompute the header checksum over the four stored sections.
+fn restamp_checksum(bytes: &mut [u8]) {
+    let u64_at = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+    let entry_count = u64_at(16) as usize;
+    let keys_offset = u64_at(24) as usize;
+    let offsets_offset = u64_at(32) as usize;
+    let arena_offset = u64_at(40) as usize;
+    let arena_len = u64_at(56) as usize;
+    let keys_len = entry_count * bytes[12] as usize;
+
+    // keys ‖ offsets ‖ lengths ‖ arena, each as stored, padding excluded.
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(&bytes[keys_offset..keys_offset + keys_len]);
+    hasher.update(&bytes[offsets_offset..arena_offset]);
+    hasher.update(&bytes[arena_offset..arena_offset + arena_len]);
+    let digest = hasher.digest();
+
+    bytes[64..72].copy_from_slice(&digest.to_le_bytes());
+}
+
 #[test]
 fn corruption_is_detected_by_verify() {
     let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
@@ -328,6 +414,31 @@ fn truncated_file_rejected_on_open() {
     for cut in [0, 10, 79, bytes.len() - 1] {
         assert!(HashDb::open_bytes(bytes[..cut].to_vec()).is_err());
     }
+}
+
+/// The point of splitting the flag byte: a build that predates an optional flag
+/// still reads the file, and reads it as if the bit were clear.
+#[test]
+fn unknown_optional_flags_are_ignored() {
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
+    bytes[14] = 0xff; // `opt_flags`: every bit this build has never heard of.
+
+    let db = HashDb::open_bytes(bytes).expect("an unknown optional flag is not an error");
+    let (key, path) = GAME_ENTRIES[0];
+    assert_eq!(db.get(key).as_deref(), Some(path));
+}
+
+/// The other half: a required flag changes how the file must be read, so an
+/// unknown one is still fatal.
+#[test]
+fn unknown_required_flags_rejected() {
+    let mut bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
+    bytes[11] |= 1 << 7;
+
+    assert!(matches!(
+        HashDb::open_bytes(bytes),
+        Err(OpenError::MalformedHeader(_))
+    ));
 }
 
 #[test]

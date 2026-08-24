@@ -170,7 +170,9 @@ let map = db.load_all();
 ### Updating the cache
 
 The crate ships no HTTP client of its own - you hand it a fetcher. `UreqFetch` (feature
-`ureq`) and `ReqwestFetch` (feature `reqwest`, async) cover the common case:
+`ureq`) and `ReqwestFetch` (feature `reqwest`, async) cover the common case; both stream
+into the cache rather than buffering a table, and wrapping either one is how you report
+progress or cancel a download (see [docs/CONSUMERS.md](docs/CONSUMERS.md)):
 
 ```rust
 use ltk_mimir_cache::{HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch};
@@ -225,7 +227,8 @@ frame cache. `Send + Sync`.
 | `get_batch` · `for_each_batch` | bulk resolve, collected or streamed |
 | `iter` · `load_all` | enumerate in arena order, or decode into an owned map |
 | `hash_path` | hash a string with this table's algorithm and casing |
-| `verify` · `is_healthy` | full integrity pass; sticky flag set by a failed read |
+| `verify_index` · `verify` | checksum + key order; the same plus a full arena walk |
+| `is_healthy` | sticky flag set by a failed read |
 | `len` · `key_width` · `hash_kind` · `casing` · `is_compressed` | shape |
 | `downgrade` | a `WeakHashDb` for registries that must not pin the table |
 
@@ -249,8 +252,10 @@ frame cache. `Send + Sync`.
 | `open` · `open_many` | open a fresh mapping, one table or several |
 | `open_layered` | open several of one universe into a `LayeredHashDb`, reporting per-table errors |
 | `manifest` · `path_for` | what is installed, and where |
+| `check` · `check_async` | what an update *would* do - no download, no lock |
 | `update` · `update_async` | compare → download → verify → install → GC |
-| `commit` · `gc` · `try_lock_update` | publish versions, sweep old ones, take the lock |
+| `commit` · `gc` | publish versions, sweep superseded ones |
+| `try_lock_update` · `lock_update_timeout` · `lock_holder` | take the update lock, wait for it, or ask who has it |
 
 **`Table`** - which logical table, and how it hashes.
 
@@ -273,11 +278,12 @@ mimir <COMMAND>
 
 build    Build a .hashdb table from a txt hash list (lines of `<hex-hash> <path>`)
 get      Resolve one hash from a .hashdb file or the shared cache
+check    Say what an update would do, without downloading or locking anything
 update   Download the latest published tables into the shared cache
 gen      Run the hunt engine: discover paths for still-unknown hashes
 merge    Sorted dedup merge of CDragon txt hash lists
 bundle   Build all tables + manifest from CDragon txt inputs, staged for a GH release
-verify   Structural + checksum validation of a .hashdb file
+verify   Structural + checksum validation of a .hashdb file (--index-only to skip the arena)
 stats    Sizes, entry counts, compression ratio of a .hashdb file
 ```
 
@@ -290,12 +296,14 @@ mimir get 0x1234abcd --file game.hashdb
 mimir get 0x1234abcd --table game
 
 # Keep the shared cache current (--url for a mirror, --dir for a private cache)
+mimir check
 mimir update
 mimir update --force
 
 # Inspect and validate
 mimir stats game.hashdb
 mimir verify game.hashdb
+mimir verify --index-only game.hashdb   # checksum + key order, no arena decode
 ```
 
 ## Crates

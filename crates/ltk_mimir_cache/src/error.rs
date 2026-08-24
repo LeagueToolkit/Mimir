@@ -60,8 +60,14 @@ pub enum ManifestError {
     #[error("no manifest at {0}")]
     Missing(PathBuf),
 
-    #[error("unsupported manifest schema version {0}")]
+    #[error("manifest schema {0} predates the first published one")]
     UnsupportedSchema(u32),
+
+    #[error(
+        "this manifest requires a reader that understands schema {required}, and this build \
+         understands {supported}"
+    )]
+    ReaderTooOld { required: u32, supported: u32 },
 }
 
 /// Errors from opening a cached table ([`HashStore::open`](crate::HashStore::open) /
@@ -134,6 +140,37 @@ pub enum GcError {
     Manifest(#[from] ManifestError),
 }
 
+/// Why a streaming fetch stopped ([`Fetch::fetch_to`](crate::Fetch::fetch_to)).
+///
+/// The two halves have different owners: `Transport` is the fetcher's problem,
+/// `Sink` is the caller's - a full disk, or a wrapping sink cancelling the
+/// download by refusing the next chunk.
+#[derive(Debug, Error)]
+pub enum FetchError<E> {
+    #[error(transparent)]
+    Transport(E),
+
+    #[error("writing the fetched bytes")]
+    Sink(#[source] std::io::Error),
+}
+
+/// Errors from a lock-free comparison ([`HashStore::check`](crate::HashStore::check)).
+///
+/// Deliberately smaller than [`UpdateError`]: `check` installs nothing, so there
+/// is no download to mis-checksum and no commit to fail.
+#[derive(Debug, Error)]
+pub enum CheckError<E> {
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+
+    #[error("fetching {file}")]
+    Fetch {
+        file: String,
+        #[source]
+        source: FetchError<E>,
+    },
+}
+
 /// Errors from an update run ([`HashStore::update`](crate::HashStore::update)).
 ///
 /// Generic over the fetcher's error type ([`Fetch::Error`](crate::Fetch::Error) /
@@ -151,7 +188,7 @@ pub enum UpdateError<E> {
     Fetch {
         file: String,
         #[source]
-        source: E,
+        source: FetchError<E>,
     },
 
     #[error("{file}: sha256 mismatch (manifest {expected}, downloaded {actual})")]

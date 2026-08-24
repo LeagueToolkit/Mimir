@@ -247,6 +247,44 @@ match store.update(&fetch, UpdateOptions::default())? {
 > `mimir update` is exactly this call plus a reqwest-backed `Fetch` - still the right
 > tool for cron jobs and setup scripts. **Readers need none of this** - they just `open`.
 
+#### Streaming, progress, and cancellation
+
+`fetch_to` is the trait's actual primitive; the closure form above buffers a whole
+asset because that is all a closure can do. Implementing `fetch_to` instead streams
+straight into the sink `update` hands you - which is a file in the cache directory,
+hashed as it fills - so a 38 MiB table is never in memory and its bytes are written
+once, not copied into place afterwards.
+
+That sink is also the progress and cancellation hook. Wrap a fetcher, pass the inner
+one a sink of your own, and you see every chunk:
+
+```rust
+use std::io::Write;
+use ltk_mimir_cache::{Fetch, FetchError};
+
+struct Reporting<F>(F);
+
+impl<F: Fetch> Fetch for Reporting<F> {
+    type Error = F::Error;
+
+    fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<Self::Error>> {
+        self.0.fetch_to(filename, &mut Counting { sink, done: 0 })
+    }
+}
+```
+
+`Counting::write` forwards to `sink`, adds up what it forwarded, and returns an
+`io::Error` to cancel - which arrives at the caller as `FetchError::Sink`, aborts the
+run, and removes the partial file. `FetchError::Transport` is the other half: the
+fetcher's own failure, kept separate so a dropped connection is never reported as a
+full disk.
+
+`mimir update` is this wrapper plus an `indicatif` spinner.
+
 Async apps (tokio + async reqwest, a GUI runtime) use `HashStore::update_async` with an
 `AsyncFetch` instead - same loop, same guarantees, awaiting each download. The future
 cannot borrow the filename, so build owned state before the `async move` block:
@@ -283,8 +321,52 @@ Semantics worth relying on (both variants):
   mismatch, which errors before anything installs) leaves the old manifest intact.
 - **Single updater, many readers.** The update runs under a cross-process try-lock;
   a `Locked` outcome means someone else is already on it. Readers never take the lock.
-- **Forward compatibility.** Tables in the remote manifest this build doesn't know are
-  skipped and reported in `report.unknown_tables`, never fatal.
+  `lock_holder()` names that someone - pid and start time - so a UI can say "syncing
+  since 14:02" instead of something that reads like a hang. `lock_update_timeout(d)`
+  queues behind the current updater for up to `d` instead of giving up at once.
+- **Forward compatibility.** A release published by a newer mimir is never fatal.
+  Tables this build has no id for are skipped into `report.unknown_tables`; tables
+  published in a `.hashdb` format it cannot open are skipped into
+  `report.unsupported_tables`, leaving whatever version the cache already holds in
+  place. A higher `schema` and manifest fields this build has never seen are simply
+  ignored - only an explicit `min_reader_schema` above this build refuses the
+  document outright.
+- **Format channels.** The updater asks for `manifest-v<format>.json` and falls back
+  to `manifest.json`, so a release that keeps building an older format keeps feeding
+  the builds pinned to it.
+
+### Asking without doing: `check`
+
+`update` takes the exclusive lock before it fetches anything, so it is the wrong
+call for "are we behind?". `check` fetches the published manifest, diffs it against
+the cache, and returns - no download, no install, no lock. Safe on a timer, and safe
+while another process is midway through an update.
+
+```rust
+use ltk_mimir_cache::{HashStore, ReleaseSource, UreqFetch};
+
+let store = HashStore::discover()?;
+let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir"));
+
+let report = store.check(&remote)?;
+if !report.is_up_to_date() {
+    println!("{} table(s) behind", report.behind());
+    for diff in &report.tables {
+        // `game: 2026-07-03 -> 2026-07-10 (outdated)`
+        let have = diff.local.as_ref().map_or("-", |local| &local.version);
+        println!("{}: {have} -> {} ({})", diff.table, diff.remote.version, diff.status);
+    }
+}
+```
+
+`TableStatus` distinguishes `Current`, `Absent`, `Stale`, `FileMissing` (the manifest
+points at a file that is gone), and `Unsupported` (a `.hashdb` format this build
+cannot open - reported, but not something an update could fix, so it does not count
+toward `behind()`).
+
+Two version labels can differ while the bytes do not: a release relabels every table
+it rebuilds, and `check` compares sha256s, so a table can read `Current` at an older
+label. That is the same test `update` makes before skipping a download.
 
 ### Custom pipelines: the primitives
 
@@ -301,6 +383,11 @@ let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
 
 // Install atomically: files are copied durable first, the manifest pointer
 // swaps last, so a concurrent reader never sees a half-written table.
+//
+// The source is recorded on every table this call installs and on the manifest's
+// `last_run`. Tables the call does not mention keep the provenance they were
+// installed with; pass `CommitItem::with_source` when one table came from
+// somewhere else.
 store.commit(
     &[CommitItem::new(Table::Game, "2026-07-10", built_game_path)],
     Some(Source { repo: Some("CommunityDragon/Data".into()), commit, inputs_sha256 }),
@@ -313,13 +400,21 @@ let report = store.gc()?;
 
 ### Verifying a table
 
-`open` validates structure only. After downloading from an untrusted channel - or when
-debugging - run the full check:
+`open` validates structure only. There are two checks above it:
 
 ```rust
-db.verify()?;   // xxh3 checksum over all sections, keys strictly ascending,
-                // every entry in bounds and valid UTF-8
+db.verify_index()?;  // xxh3 checksum over every stored byte, keys strictly ascending
+db.verify()?;        // the above, plus every entry in bounds and valid UTF-8
 ```
+
+Both hash the whole file, arena included, so both catch **damage** - bit rot, a
+truncating write, a half-finished copy. Only `verify` also decompresses the arena to
+prove the file is **well-formed**, which is what a table built by a broken writer
+fails. On the 42 MiB `game` table that is ~85 ms against ~940 ms.
+
+So: `verify_index` on a schedule or at startup, `verify` once after installing from
+an untrusted channel, or when a table is behaving strangely and you want to know why.
+`mimir verify --index-only` is the cheap tier from the command line.
 
 ## Building your own tables
 

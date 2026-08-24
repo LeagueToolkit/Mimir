@@ -9,16 +9,19 @@
 
 use std::fs;
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
-use ltk_mimir_cache::{AsyncFetch, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome};
+use ltk_mimir_cache::{
+    AsyncFetch, FetchError, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome,
+};
 use pollster::block_on;
 use tempfile::tempdir;
 
 mod common;
-use common::{completed, make_release};
+use common::{channel_asset, completed, edit_release_manifest, make_release, serve_asset};
 
 /// Serve "release assets" straight from a directory.
 struct DirFetch(PathBuf);
@@ -26,8 +29,12 @@ struct DirFetch(PathBuf);
 impl AsyncFetch for DirFetch {
     type Error = std::io::Error;
 
-    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
-        fs::read(self.0.join(filename))
+    async fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<std::io::Error>> {
+        serve_asset(&self.0.join(filename), sink)
     }
 }
 
@@ -67,6 +74,82 @@ fn fresh_install_downloads_everything() {
     assert!(report.unknown_tables.is_empty());
     let db = store.open(Table::Game).unwrap();
     assert_eq!(db.get(0x11aa).as_deref(), Some("assets/foo.bin"));
+}
+
+/// The async driver resolves the remote manifest the same way the blocking one
+/// does: this format's channel first, then the unversioned asset.
+#[test]
+fn the_manifest_comes_from_the_format_channel() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    fs::write(release.join("manifest.json"), b"not json at all").unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        block_on(store.update_async(&DirFetch(release), UpdateOptions::default())).unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+}
+
+#[test]
+fn a_channel_less_release_still_updates() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    fs::remove_file(release.join(channel_asset())).unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        block_on(store.update_async(&DirFetch(release), UpdateOptions::default())).unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+}
+
+/// A table in a format this build cannot open is skipped here too - the async
+/// driver shares `plan`, so this guards the wiring, not the decision.
+#[test]
+fn an_unreadable_format_is_skipped() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.get_mut("game").unwrap().format_version = 99;
+    });
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        block_on(store.update_async(&DirFetch(release), UpdateOptions::default())).unwrap(),
+    );
+
+    assert!(report.installed.is_empty());
+    assert_eq!(report.unsupported_tables.len(), 1);
+}
+
+/// `check_async` answers the same question `check` does, without the lock.
+#[test]
+fn check_async_diffs_without_installing() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release);
+
+    let report = block_on(store.check_async(&remote)).unwrap();
+    assert_eq!(report.behind(), 1);
+    assert!(!cache.join("manifest.json").exists());
+
+    completed(block_on(store.update_async(&remote, UpdateOptions::default())).unwrap());
+    assert!(block_on(store.check_async(&remote))
+        .unwrap()
+        .is_up_to_date());
 }
 
 #[test]
@@ -145,11 +228,16 @@ struct StallOnLcu(PathBuf);
 impl AsyncFetch for StallOnLcu {
     type Error = std::io::Error;
 
-    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
+    async fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<std::io::Error>> {
         if filename.starts_with("lcu-") {
             std::future::pending::<()>().await;
         }
-        fs::read(self.0.join(filename))
+
+        serve_asset(&self.0.join(filename), sink)
     }
 }
 

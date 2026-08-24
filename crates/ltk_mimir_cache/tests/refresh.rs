@@ -6,15 +6,16 @@
 //! test binary named `update*.exe` without elevation (os error 740).
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use ltk_mimir_cache::{
-    Fetch, HashStore, Manifest, Table, UpdateError, UpdateOptions, UpdateOutcome,
+    Fetch, FetchError, HashStore, Table, TableStatus, UpdateError, UpdateOptions, UpdateOutcome,
 };
 use tempfile::tempdir;
 
 mod common;
-use common::{completed, make_release};
+use common::{channel_asset, completed, edit_release_manifest, make_release, serve_asset};
 
 /// Serve "release assets" straight from a directory.
 struct DirFetch(PathBuf);
@@ -22,8 +23,12 @@ struct DirFetch(PathBuf);
 impl Fetch for DirFetch {
     type Error = std::io::Error;
 
-    fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
-        fs::read(self.0.join(filename))
+    fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<std::io::Error>> {
+        serve_asset(&self.0.join(filename), sink)
     }
 }
 
@@ -53,10 +58,27 @@ fn fresh_install_downloads_everything() {
     let db = store.open(Table::Game).unwrap();
     assert_eq!(db.get(0x11aa).as_deref(), Some("assets/foo.bin"));
     let manifest = store.manifest().unwrap();
+    let entry = manifest.entry(Table::Game).unwrap();
     assert_eq!(
-        manifest.source.unwrap().repo.as_deref(),
+        (entry.version.as_str(), entry.format_version),
+        ("2026-07-10", ltk_hashdb::FORMAT_VERSION),
+        "a consumer can name the version without parsing {:?}",
+        entry.file
+    );
+    assert!(
+        manifest.generated_at_time().is_some(),
+        "and can tell how stale it is: {:?}",
+        manifest.generated_at
+    );
+    assert_eq!(
+        entry.source.as_ref().unwrap().repo.as_deref(),
         Some("test/data"),
-        "release provenance carries over into the local manifest"
+        "release provenance travels with the table it describes"
+    );
+    assert_eq!(
+        manifest.last_run.unwrap().repo.as_deref(),
+        Some("test/data"),
+        "and the run record says what this update drew on"
     );
 }
 
@@ -228,7 +250,11 @@ fn release_race_errors_and_rerun_converges() {
     impl Fetch for RacingFetch {
         type Error = std::io::Error;
 
-        fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
+        fn fetch_to(
+            &self,
+            filename: &str,
+            sink: &mut (dyn Write + Send),
+        ) -> Result<u64, FetchError<std::io::Error>> {
             if filename.ends_with(".lhdb") {
                 self.flipped.set(true);
             }
@@ -237,7 +263,8 @@ fn release_race_errors_and_rerun_converges() {
             } else {
                 &self.old
             };
-            fs::read(dir.join(filename))
+
+            serve_asset(&dir.join(filename), sink)
         }
     }
 
@@ -290,18 +317,20 @@ fn unknown_remote_table_is_skipped() {
     make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
 
     // A future mimir publishes a ninth table this build doesn't know.
-    let manifest_path = release.join("manifest.json");
-    let mut manifest = Manifest::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest.tables.insert(
-        "shiny-new".into(),
-        ltk_mimir_cache::TableEntry {
-            file: "shiny-new-1.lhdb".into(),
-            sha256: "0".repeat(64),
-            entries: 0,
-            key_width: 8,
-        },
-    );
-    manifest.write_atomic(&manifest_path).unwrap();
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.insert(
+            "shiny-new".into(),
+            ltk_mimir_cache::TableEntry {
+                file: "shiny-new-1.lhdb".into(),
+                sha256: "0".repeat(64),
+                entries: 0,
+                key_width: 8,
+                version: "1".into(),
+                source: None,
+                format_version: ltk_hashdb::FORMAT_VERSION,
+            },
+        );
+    });
 
     let store = HashStore::at(&cache);
     let report = completed(
@@ -326,10 +355,9 @@ fn malformed_remote_filename_is_rejected() {
     make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
 
     // Point the game entry at a filename whose version would escape the cache dir.
-    let manifest_path = release.join("manifest.json");
-    let mut manifest = Manifest::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest.tables.get_mut("game").unwrap().file = "game-..\\evil.lhdb".into();
-    manifest.write_atomic(&manifest_path).unwrap();
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.get_mut("game").unwrap().file = "game-..\\evil.lhdb".into();
+    });
 
     let store = HashStore::at(&cache);
     let err = store
@@ -341,4 +369,398 @@ fn malformed_remote_filename_is_rejected() {
         "{err}"
     );
     assert!(store.manifest().is_err(), "nothing was installed");
+}
+
+/// A build asks for the manifest describing the format it can read, so a
+/// release that has moved on still hands it a table set it understands.
+#[test]
+fn the_manifest_comes_from_the_format_channel() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    // Stand in for a release whose unversioned manifest has moved to a format
+    // this build knows nothing about: if it were the one read, nothing works.
+    fs::write(release.join("manifest.json"), b"not json at all").unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        store
+            .update(&DirFetch(release), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+}
+
+/// Releases published before channels existed carry only `manifest.json`.
+#[test]
+fn a_channel_less_release_still_updates() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    fs::remove_file(release.join(channel_asset())).unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        store
+            .update(&DirFetch(release), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+}
+
+/// A release neither file nor channel can supply is still reported against the
+/// channel, since that is the request that should have worked.
+#[test]
+fn a_missing_manifest_names_the_channel() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    fs::remove_file(release.join(channel_asset())).unwrap();
+    fs::remove_file(release.join("manifest.json")).unwrap();
+
+    let store = HashStore::at(&cache);
+    let err = store
+        .update(&DirFetch(release), UpdateOptions::default())
+        .unwrap_err();
+
+    match err {
+        UpdateError::Fetch { file, .. } => assert_eq!(file, channel_asset()),
+        other => panic!("expected a fetch error, got {other}"),
+    }
+}
+
+/// The forward-compatibility contract in one run: a manifest from a newer tool
+/// carrying a higher schema, a field this build has never seen, a table it has
+/// no id for, and a table in a format it cannot open still installs everything
+/// it does understand.
+#[test]
+fn a_manifest_from_the_future_installs_what_it_can() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(
+        &release,
+        "1",
+        &[
+            (Table::Game, &[(0x1, "assets/foo.bin")]),
+            (Table::Lcu, &[(0x2, "plugins/thing.json")]),
+        ],
+    );
+
+    let channel = release.join(channel_asset());
+    let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&channel).unwrap()).unwrap();
+    let root = doc.as_object_mut().unwrap();
+    root.insert("schema".into(), 99.into());
+    root.insert(
+        "mirrors".into(),
+        serde_json::json!(["https://example.invalid"]),
+    );
+
+    let tables = root.get_mut("tables").unwrap().as_object_mut().unwrap();
+    tables.insert(
+        "shiny-new".into(),
+        serde_json::json!({
+            "file": "shiny-new-1.lhdb",
+            "sha256": "0".repeat(64),
+            "entries": 0,
+            "key_width": 8,
+            "format_version": 1,
+        }),
+    );
+    // `lcu` moved to a format version this build cannot open.
+    tables
+        .get_mut("lcu")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("format_version".into(), 99.into());
+    fs::write(&channel, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+
+    let store = HashStore::at(&cache);
+    let report = completed(
+        store
+            .update(&DirFetch(release), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game], "the readable table lands");
+    assert_eq!(report.unknown_tables, ["shiny-new"]);
+    assert_eq!(
+        report.unsupported_tables,
+        [ltk_mimir_cache::UnsupportedTable {
+            table: Table::Lcu,
+            format_version: 99,
+        }]
+    );
+    assert!(
+        store.open(Table::Lcu).is_err(),
+        "a table this build cannot read is never installed"
+    );
+}
+
+/// The unreadable table is skipped, not overwritten: whatever the cache already
+/// holds keeps being served.
+#[test]
+fn an_unreadable_new_format_leaves_the_installed_table_alone() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "old")])]);
+
+    let store = HashStore::at(&cache);
+    completed(
+        store
+            .update(&DirFetch(release.clone()), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    // The next release ships `game` in a format this build cannot open.
+    make_release(&release, "2", &[(Table::Game, &[(0x1, "new")])]);
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.get_mut("game").unwrap().format_version = 99;
+    });
+
+    let report = completed(
+        store
+            .update(&DirFetch(release), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    assert!(report.installed.is_empty());
+    assert_eq!(report.unsupported_tables.len(), 1);
+    assert_eq!(
+        store.open(Table::Game).unwrap().get(0x1).as_deref(),
+        Some("old"),
+        "the version the cache can read is still the one it serves"
+    );
+}
+
+/// The status a table has before and after an update, and the count a UI puts
+/// in front of a user.
+#[test]
+fn check_diffs_the_cache_against_the_release() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(
+        &release,
+        "2026-07-10",
+        &[(Table::Game, &[(0x1, "a")]), (Table::Lcu, &[(0x2, "b")])],
+    );
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release.clone());
+
+    let report = store.check(&remote).unwrap();
+    assert_eq!(report.behind(), 2, "an empty cache is behind on everything");
+    assert!(report
+        .tables
+        .iter()
+        .all(|diff| diff.status == TableStatus::Absent));
+    assert!(
+        !cache.join("manifest.json").exists(),
+        "check installs nothing"
+    );
+
+    completed(store.update(&remote, UpdateOptions::default()).unwrap());
+    let report = store.check(&remote).unwrap();
+    assert!(report.is_up_to_date());
+    assert_eq!(report.behind(), 0);
+
+    // The release moves on for one table only.
+    make_release(&release, "2026-07-17", &[(Table::Game, &[(0x1, "a2")])]);
+    let report = store.check(&DirFetch(release)).unwrap();
+    assert_eq!(report.behind(), 1);
+
+    let game = report
+        .tables
+        .iter()
+        .find(|diff| diff.table == Table::Game)
+        .unwrap();
+    assert_eq!(game.status, TableStatus::Stale);
+    assert_eq!(game.remote.version, "2026-07-17");
+    assert_eq!(
+        game.local.as_ref().unwrap().version,
+        "2026-07-10",
+        "both sides are named, so a UI can say what it would replace"
+    );
+}
+
+/// The point of the lock-free path: a status read works while someone else is
+/// midway through an update.
+#[test]
+fn check_does_not_take_the_update_lock() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let _held = store
+        .try_lock_update()
+        .unwrap()
+        .expect("nobody else holds it");
+
+    let report = store.check(&DirFetch(release)).unwrap();
+    assert_eq!(report.behind(), 1);
+}
+
+/// A file that vanished under the manifest reads as reinstallable, not as
+/// current - the same test `update` makes before skipping a table.
+#[test]
+fn check_notices_a_missing_file() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let remote = DirFetch(release);
+    completed(store.update(&remote, UpdateOptions::default()).unwrap());
+    fs::remove_file(cache.join("game-1.lhdb")).unwrap();
+
+    let report = store.check(&remote).unwrap();
+    assert_eq!(report.tables[0].status, TableStatus::FileMissing);
+    assert_eq!(report.behind(), 1);
+}
+
+/// A table this build cannot open is reported, but it is not something an
+/// update could fix - so it does not count as being behind.
+#[test]
+fn check_reports_an_unreadable_format_without_counting_it() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+    edit_release_manifest(&release, |manifest| {
+        manifest.tables.get_mut("game").unwrap().format_version = 99;
+    });
+
+    let report = HashStore::at(&cache).check(&DirFetch(release)).unwrap();
+    assert_eq!(report.tables[0].status, TableStatus::Unsupported);
+    assert!(report.is_up_to_date(), "no update would change this");
+}
+
+/// The sink is the cancellation point: a wrapper that refuses a chunk stops the
+/// download where it stands, and nothing is installed or left behind.
+#[test]
+fn a_sink_that_refuses_bytes_stops_the_download() {
+    /// Forwards a fixed number of bytes, then refuses.
+    struct StopsShort<F> {
+        inner: F,
+        limit: usize,
+    }
+
+    impl<F: Fetch> Fetch for StopsShort<F> {
+        type Error = F::Error;
+
+        fn fetch_to(
+            &self,
+            filename: &str,
+            sink: &mut (dyn Write + Send),
+        ) -> Result<u64, FetchError<Self::Error>> {
+            if !filename.ends_with(".lhdb") {
+                return self.inner.fetch_to(filename, sink);
+            }
+
+            let mut capped = Capped {
+                sink,
+                left: self.limit,
+            };
+            self.inner.fetch_to(filename, &mut capped)
+        }
+    }
+
+    struct Capped<'a> {
+        sink: &'a mut (dyn Write + Send),
+        left: usize,
+    }
+
+    impl Write for Capped<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("cancelled by the caller"));
+            }
+
+            let take = buf.len().min(self.left);
+            let n = self.sink.write(&buf[..take])?;
+            self.left -= n;
+
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.sink.flush()
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "assets/foo.bin")])]);
+
+    let store = HashStore::at(&cache);
+    let err = store
+        .update(
+            &StopsShort {
+                inner: DirFetch(release),
+                limit: 16,
+            },
+            UpdateOptions::default(),
+        )
+        .unwrap_err();
+
+    match err {
+        UpdateError::Fetch {
+            source: FetchError::Sink(_),
+            ..
+        } => {}
+        other => panic!("expected the sink to be blamed, got {other}"),
+    }
+
+    assert!(store.manifest().is_err(), "nothing was installed");
+    let leftovers: Vec<_> = fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the partial download was cleaned up: {leftovers:?}"
+    );
+}
+
+/// The staged download is consumed by the install, so a completed run leaves no
+/// second copy of a 38 MiB table lying about.
+#[test]
+fn a_completed_update_leaves_no_staging_file() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    completed(
+        store
+            .update(&DirFetch(release), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    let files: Vec<String> = fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        files.iter().all(|name| !name.ends_with(".tmp")),
+        "{files:?}"
+    );
+    assert!(files.iter().any(|name| name == "game-1.lhdb"), "{files:?}");
 }

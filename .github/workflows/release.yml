@@ -1,5 +1,6 @@
-# Release publishing: build every `.lhdb` hash table + `manifest.json` from the
-# source data repo and upload them as GitHub release assets.
+# Release publishing: build every `.lhdb` hash table + `manifest.json` (and its
+# per-format `manifest-v<n>.json` channel copy) from the source data repo and
+# upload them as GitHub release assets.
 #
 # The txt hash lists stay the canonical, mergeable source of truth in the
 # source repo - CommunityDragon/Data by default, overridable per
@@ -61,7 +62,9 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       # Fingerprint-skip: the latest release's manifest records the source repo and
-      # commit it was built from; both unchanged means identical inputs.
+      # commit it was built from; both unchanged means identical inputs. The
+      # unversioned manifest is used here on purpose - it is published by every
+      # release, whatever formats that release carries channels for.
       - name: Compare against the latest release
         id: fingerprint
         env:
@@ -150,7 +153,9 @@ jobs:
           {
             echo "League of Legends hash tables in the seekable \`.lhdb\` format, built from $src."
             echo
-            echo "\`manifest.json\` carries the sha256, entry count, and key width of each table."
+            echo "\`manifest.json\` carries the sha256, entry count, format version, and key width of each table."
+            echo
+            echo "The \`manifest-v<n>.json\` copies are per-format update channels: a build fetches the one naming the \`.hashdb\` format version it can read, so it keeps updating across a format bump it cannot follow."
             echo
             echo "| table | entries | file |"
             echo "|---|--:|---|"

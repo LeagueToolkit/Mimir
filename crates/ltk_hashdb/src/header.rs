@@ -6,10 +6,11 @@
 //! 0..8    magic                    [u8;8]  b"HASHDB\0\0"
 //! 8..10   version                  u16
 //! 10      hash_kind                u8      see HashKind
-//! 11      flags                    u8      bit0: arena_compressed, bit1: case_insensitive
+//! 11      flags                    u8      required; bit0: arena_compressed, bit1: case_insensitive
 //! 12      key_width                u8      4 = u32 table, 8 = u64 table
 //! 13      offset_width             u8      4 or 8; width of arena offsets
-//! 14..16  reserved                 [u8;2]  written as zero, ignored on read
+//! 14      opt_flags                u8      optional; unknown bits ignored, none defined yet
+//! 15      reserved                 u8      written as zero, ignored on read
 //! 16..24  entry_count              u64
 //! 24..32  keys_offset              u64     file offset, 8-aligned
 //! 32..40  offsets_offset           u64     file offset, offset_width-aligned
@@ -22,6 +23,13 @@
 //!
 //! The lengths section (`entry_count` × u16) has no header field: it sits
 //! immediately after the offsets, at `offsets_offset + entry_count × offset_width`.
+//!
+//! The two flag bytes differ in what an *unknown* bit means. A bit in `flags`
+//! changes how the file has to be read, so a build that does not know it must
+//! refuse the file; a bit in `opt_flags` only announces something a build may
+//! take advantage of, so a build that does not know it reads the file as if the
+//! bit were clear. Since `version` is an equality gate, `opt_flags` is the only
+//! way to announce a new capability to readers that already shipped.
 
 use crate::{Casing, HashKind, KeyWidth, OpenError};
 
@@ -35,11 +43,12 @@ pub(crate) const FLAG_ARENA_COMPRESSED: u8 = 1 << 0;
 /// Header flag: the keys hash the ASCII-lowercased path
 /// ([`Casing::AsciiInsensitive`]).
 ///
-/// Should a Unicode-aware rule ever be wanted, it gets its own value in the
-/// reserved byte at offset 14 rather than a second flag bit - unknown flag bits
-/// are rejected, unknown reserved bytes are not.
+/// Should a Unicode-aware rule ever be wanted, it gets a bit in `opt_flags`
+/// rather than a second `flags` bit, so that builds predating it keep reading
+/// the file - they resolve every ASCII path as before and miss the rest.
 pub(crate) const FLAG_CASE_INSENSITIVE: u8 = 1 << 1;
 
+/// Every required flag bit this build understands; any other rejects the file.
 const KNOWN_FLAGS: u8 = FLAG_ARENA_COMPRESSED | FLAG_CASE_INSENSITIVE;
 
 /// Width of the arena offsets: u32 unless the raw arena exceeds 4 GiB.
@@ -94,6 +103,8 @@ impl Header {
         buf[11] = self.flags;
         buf[12] = self.key_width.bytes() as u8;
         buf[13] = self.offset_width.bytes() as u8;
+        // Byte 14 (`opt_flags`) stays zero: this build announces no optional
+        // capability. Bytes 15 and 72..80 are reserved and likewise zero.
         buf[16..24].copy_from_slice(&self.entry_count.to_le_bytes());
         buf[24..32].copy_from_slice(&self.keys_offset.to_le_bytes());
         buf[32..40].copy_from_slice(&self.offsets_offset.to_le_bytes());
@@ -123,7 +134,7 @@ impl Header {
             HashKind::from_u8(buf[10]).ok_or(OpenError::MalformedHeader("unknown hash_kind"))?;
         let flags = buf[11];
         if flags & !KNOWN_FLAGS != 0 {
-            return Err(OpenError::MalformedHeader("unknown flag bits set"));
+            return Err(OpenError::MalformedHeader("unknown required flag bits set"));
         }
         let key_width = match buf[12] {
             4 => KeyWidth::U32,
@@ -135,6 +146,10 @@ impl Header {
             8 => OffsetWidth::U64,
             _ => return Err(OpenError::MalformedHeader("offset_width must be 4 or 8")),
         };
+        // `opt_flags` (byte 14) is deliberately not validated: an optional flag
+        // this build does not know describes a capability it simply will not
+        // use, and rejecting the file over one would defeat the point of having
+        // a second flag byte at all.
 
         let u64_at = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
         Ok(Self {

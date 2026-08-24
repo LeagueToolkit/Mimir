@@ -20,8 +20,8 @@ mod table;
 mod update;
 
 pub use error::{
-    CommitError, GcError, ManifestError, NoCacheDirError, OpenError, ParseTableError,
-    UniverseMismatch, UpdateError,
+    CheckError, CommitError, FetchError, GcError, ManifestError, NoCacheDirError, OpenError,
+    ParseTableError, UniverseMismatch, UpdateError,
 };
 #[cfg(feature = "reqwest")]
 pub use fetch::ReqwestFetch;
@@ -29,8 +29,11 @@ pub use fetch::ReqwestFetch;
 pub use fetch::UreqFetch;
 #[cfg(any(feature = "ureq", feature = "reqwest"))]
 pub use fetch::{HttpFetchError, ReleaseSource};
-pub use lock::UpdateLock;
+pub use lock::{LockHolder, UpdateLock};
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
 pub use table::{HashUniverse, Table};
-pub use update::{AsyncFetch, Fetch, UpdateOptions, UpdateOutcome, UpdateReport};
+pub use update::{
+    AsyncFetch, CheckReport, Fetch, TableDiff, TableStatus, UnsupportedTable, UpdateOptions,
+    UpdateOutcome, UpdateReport,
+};

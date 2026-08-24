@@ -14,8 +14,10 @@
 //! - `reqwest` feature → [`ReqwestFetch`], an async
 //!   [`AsyncFetch`](crate::AsyncFetch).
 //!
-//! Both fetchers are silent by design; per-file progress output stays with the
-//! caller (wrap the fetcher in a closure, which is itself a `Fetch`).
+//! Both fetchers stream into the caller's sink rather than buffering a whole
+//! table, and both are silent by design: per-file progress and cancellation stay
+//! with the caller, who wraps the fetcher and passes a sink of their own (see
+//! [`Fetch`](crate::Fetch)).
 
 /// Default `User-Agent` for the bundled fetchers, matching the mimir CLI.
 const USER_AGENT: &str = concat!("mimir/", env!("CARGO_PKG_VERSION"));
@@ -68,12 +70,17 @@ pub enum HttpFetchError {
     Status { status: u16, url: String },
 }
 
+/// The read buffer both fetchers pump through. Large enough that a 38 MiB table
+/// is a few hundred round trips, small enough to stay off the radar.
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
+const CHUNK: usize = 64 * 1024;
+
 #[cfg(feature = "ureq")]
 mod ureq_impl {
-    use std::io::Read;
+    use std::io::{Read, Write};
 
-    use super::{HttpFetchError, ReleaseSource, USER_AGENT};
-    use crate::Fetch;
+    use super::{HttpFetchError, ReleaseSource, CHUNK, USER_AGENT};
+    use crate::{Fetch, FetchError};
 
     /// A blocking [`Fetch`] over `ureq`, pulling assets from a [`ReleaseSource`].
     pub struct UreqFetch {
@@ -95,33 +102,49 @@ mod ureq_impl {
     impl Fetch for UreqFetch {
         type Error = HttpFetchError;
 
-        fn fetch(&self, filename: &str) -> Result<Vec<u8>, HttpFetchError> {
+        fn fetch_to(
+            &self,
+            filename: &str,
+            sink: &mut (dyn Write + Send),
+        ) -> Result<u64, FetchError<HttpFetchError>> {
             let url = self.source.asset_url(filename);
 
             // `call()` fails on non-2xx, so a 404 arrives as `Error::Status`.
             let response = match self.agent.get(&url).call() {
                 Ok(response) => response,
                 Err(ureq::Error::Status(status, _)) => {
-                    return Err(HttpFetchError::Status { status, url })
+                    return Err(FetchError::Transport(HttpFetchError::Status {
+                        status,
+                        url,
+                    }))
                 }
                 Err(err) => {
-                    return Err(HttpFetchError::Transport {
+                    return Err(FetchError::Transport(HttpFetchError::Transport {
                         url,
                         source: Box::new(err),
-                    })
+                    }))
                 }
             };
 
-            let mut bytes = Vec::new();
-            response
-                .into_reader()
-                .read_to_end(&mut bytes)
-                .map_err(|err| HttpFetchError::Transport {
-                    url,
-                    source: Box::new(err),
+            // Hand-rolled rather than `io::copy`, which would fold a mid-body
+            // read failure and the caller's sink refusing a chunk into one error.
+            let mut reader = response.into_reader();
+            let mut buf = vec![0u8; CHUNK];
+            let mut total = 0;
+            loop {
+                let read = reader.read(&mut buf).map_err(|err| {
+                    FetchError::Transport(HttpFetchError::Transport {
+                        url: url.clone(),
+                        source: Box::new(err),
+                    })
                 })?;
+                if read == 0 {
+                    return Ok(total);
+                }
 
-            Ok(bytes)
+                sink.write_all(&buf[..read]).map_err(FetchError::Sink)?;
+                total += read as u64;
+            }
         }
     }
 }
@@ -132,9 +155,10 @@ pub use ureq_impl::UreqFetch;
 #[cfg(feature = "reqwest")]
 mod reqwest_impl {
     use std::future::Future;
+    use std::io::Write;
 
     use super::{HttpFetchError, ReleaseSource, USER_AGENT};
-    use crate::AsyncFetch;
+    use crate::{AsyncFetch, FetchError};
 
     pub struct ReqwestFetch {
         source: ReleaseSource,
@@ -157,42 +181,49 @@ mod reqwest_impl {
     impl AsyncFetch for ReqwestFetch {
         type Error = HttpFetchError;
 
-        fn fetch(
-            &self,
-            filename: &str,
-        ) -> impl Future<Output = Result<Vec<u8>, HttpFetchError>> + Send {
-            // Own everything the future needs so it is `'static` and `Send`.
+        fn fetch_to<'a>(
+            &'a self,
+            filename: &'a str,
+            sink: &'a mut (dyn Write + Send),
+        ) -> impl Future<Output = Result<u64, FetchError<HttpFetchError>>> + Send + 'a {
+            // Own what the request needs; only the sink is borrowed.
             let url = self.source.asset_url(filename);
             let client = self.client.clone();
 
             async move {
-                let response =
-                    client
-                        .get(&url)
-                        .send()
-                        .await
-                        .map_err(|err| HttpFetchError::Transport {
-                            url: url.clone(),
-                            source: Box::new(err),
-                        })?;
+                let transport = |err: reqwest::Error, url: &str| {
+                    FetchError::Transport(HttpFetchError::Transport {
+                        url: url.to_owned(),
+                        source: Box::new(err),
+                    })
+                };
+
+                let mut response = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|err| transport(err, &url))?;
 
                 let status = response.status();
                 if !status.is_success() {
-                    return Err(HttpFetchError::Status {
+                    return Err(FetchError::Transport(HttpFetchError::Status {
                         status: status.as_u16(),
                         url,
-                    });
+                    }));
                 }
 
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|err| HttpFetchError::Transport {
-                        url: url.clone(),
-                        source: Box::new(err),
-                    })?;
+                // `chunk` rather than `bytes`, so the body never has to exist in
+                // memory all at once. It also keeps the transport failure and the
+                // sink failure apart.
+                let mut total = 0;
+                while let Some(chunk) =
+                    response.chunk().await.map_err(|err| transport(err, &url))?
+                {
+                    sink.write_all(&chunk).map_err(FetchError::Sink)?;
+                    total += chunk.len() as u64;
+                }
 
-                Ok(bytes.to_vec())
+                Ok(total)
             }
         }
     }
@@ -212,6 +243,7 @@ mod tests {
     use crate::AsyncFetch;
     #[cfg(feature = "ureq")]
     use crate::Fetch;
+    use crate::FetchError;
 
     /// A throwaway HTTP/1.1 server: serves `payload` at `ok_path`, 404s
     /// everything else, and handles exactly `connections` requests (one per
@@ -260,12 +292,18 @@ mod tests {
         let (base, server) = serve(payload.clone(), "/game-1.lhdb".to_string(), 2);
 
         // Two fetchers → two connections, matching the server's count.
+        // Straight into a caller's sink - no whole-table buffer anywhere.
         let ok = UreqFetch::new(ReleaseSource::base_url(&base));
-        assert_eq!(ok.fetch("game-1.lhdb").unwrap(), payload);
+        let mut sink = Vec::new();
+        assert_eq!(
+            ok.fetch_to("game-1.lhdb", &mut sink).unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(sink, payload);
 
         let missing = UreqFetch::new(ReleaseSource::base_url(&base));
         match missing.fetch("nope.lhdb") {
-            Err(HttpFetchError::Status { status: 404, .. }) => {}
+            Err(FetchError::Transport(HttpFetchError::Status { status: 404, .. })) => {}
             other => panic!("expected a 404 status error, got {other:?}"),
         }
 
@@ -285,11 +323,16 @@ mod tests {
 
         runtime.block_on(async {
             let ok = ReqwestFetch::new(ReleaseSource::base_url(&base));
-            assert_eq!(ok.fetch("game-1.lhdb").await.unwrap(), payload);
+            let mut sink = Vec::new();
+            assert_eq!(
+                ok.fetch_to("game-1.lhdb", &mut sink).await.unwrap(),
+                payload.len() as u64
+            );
+            assert_eq!(sink, payload);
 
             let missing = ReqwestFetch::new(ReleaseSource::base_url(&base));
             match missing.fetch("nope.lhdb").await {
-                Err(HttpFetchError::Status { status: 404, .. }) => {}
+                Err(FetchError::Transport(HttpFetchError::Status { status: 404, .. })) => {}
                 other => panic!("expected a 404 status error, got {other:?}"),
             }
         });

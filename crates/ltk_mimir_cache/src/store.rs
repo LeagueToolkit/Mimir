@@ -4,19 +4,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use ltk_hashdb::{HashDb, LayeredHashDb, WeakHashDb};
 
 use crate::manifest::{Manifest, Source, TableEntry};
 use crate::{
-    dir, fsutil, CommitError, GcError, ManifestError, NoCacheDirError, OpenError, Table,
-    UniverseMismatch, UpdateLock,
+    dir, fsutil, CommitError, GcError, LockHolder, ManifestError, NoCacheDirError, OpenError,
+    Table, UniverseMismatch, UpdateLock,
 };
 
 /// The manifest filename inside the cache directory.
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
-/// The single-updater lock filename.
-const UPDATE_LOCK_FILE: &str = ".update.lock";
 /// Extension for published table files (League Toolkit convention).
 const TABLE_EXT: &str = "lhdb";
 
@@ -51,15 +50,59 @@ pub struct CommitItem {
     /// The freshly built `.lhdb` to install; copied into the cache under its
     /// versioned name.
     pub path: PathBuf,
+
+    /// Where this table's inputs came from, recorded on its
+    /// [`TableEntry`](crate::TableEntry). Falls back to the run-wide source
+    /// [`commit`](HashStore::commit) is given.
+    pub source: Option<Source>,
+
+    /// Set when `path` is a file staged inside the cache directory for this
+    /// commit to consume, carrying the digest of its contents.
+    ///
+    /// [`commit`](HashStore::commit) then renames the file into place and trusts
+    /// this digest, rather than copying the bytes and reading them back to hash
+    /// them - which for a 38 MiB table is the difference between touching it
+    /// once and touching it three times. Set it through
+    /// [`staged`](CommitItem::staged), never by hand: a wrong digest is recorded
+    /// in the manifest as if it were right.
+    pub staged_sha256: Option<String>,
 }
 
 impl CommitItem {
+    /// A table built somewhere else, to be copied into the cache.
     pub fn new(table: Table, version: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
             table,
             version: version.into(),
             path: path.into(),
+            source: None,
+            staged_sha256: None,
         }
+    }
+
+    /// A table already staged inside the cache directory, with `sha256` computed
+    /// over the file as it was written.
+    ///
+    /// [`commit`](HashStore::commit) consumes it: the file is renamed into place
+    /// and is gone from `path` afterwards either way. This is what the updater
+    /// uses, having hashed the download as it streamed.
+    pub fn staged(
+        table: Table,
+        version: impl Into<String>,
+        path: impl Into<PathBuf>,
+        sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            staged_sha256: Some(sha256.into()),
+            ..Self::new(table, version, path)
+        }
+    }
+
+    /// Record where this table in particular was built from, overriding the
+    /// run-wide source.
+    pub fn with_source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
     }
 }
 
@@ -229,21 +272,55 @@ impl HashStore {
     /// Try to become the single updater without blocking. `Ok(None)` means another
     /// process is already updating. Hold the returned guard across
     /// download/build/[`commit`](HashStore::commit)/[`gc`](HashStore::gc).
+    ///
+    /// Ask [`lock_holder`](HashStore::lock_holder) who that other process is
+    /// before telling a user to wait for it.
     pub fn try_lock_update(&self) -> std::io::Result<Option<UpdateLock>> {
         std::fs::create_dir_all(&self.dir)?;
-        UpdateLock::try_acquire(&self.dir.join(UPDATE_LOCK_FILE))
+        UpdateLock::try_acquire(&self.dir)
+    }
+
+    /// Become the single updater, waiting up to `timeout` for the current one to
+    /// finish.
+    ///
+    /// For a tool that would rather queue behind a running update than tell the
+    /// user to try again - a setup script, say. `Ok(None)` means the timeout ran
+    /// out and someone still holds it. A zero timeout is exactly
+    /// [`try_lock_update`](HashStore::try_lock_update).
+    pub fn lock_update_timeout(&self, timeout: Duration) -> std::io::Result<Option<UpdateLock>> {
+        std::fs::create_dir_all(&self.dir)?;
+        UpdateLock::acquire_timeout(&self.dir, timeout)
+    }
+
+    /// Who is updating this cache right now, if anyone.
+    ///
+    /// `Ok(None)` means nobody holds the lock - not that the answer is unknown.
+    /// A held lock whose body is missing or unreadable also reads as `None`,
+    /// since the body is written best-effort and nothing depends on it.
+    ///
+    /// The pid can name a process that has since died: the OS releases the lock
+    /// when it does, so this reports `None` again from that moment.
+    pub fn lock_holder(&self) -> std::io::Result<Option<LockHolder>> {
+        UpdateLock::holder(&self.dir)
     }
 
     /// Install one or more freshly built tables and atomically flip the manifest to
     /// point at them.
     ///
-    /// Each source is copied in under an immutable `<table>-<version>.lhdb` name;
-    /// the manifest is swapped only after every file is durable, so a reader never
-    /// sees a pointer to a partial table. Concurrent mutators should hold
+    /// Each source is installed under an immutable `<table>-<version>.lhdb` name -
+    /// copied, or renamed when the item was staged in this directory
+    /// ([`CommitItem::staged`]) - and the manifest is swapped only after every
+    /// file is durable, so a reader never sees a pointer to a partial table. Concurrent mutators should hold
     /// [`try_lock_update`](HashStore::try_lock_update); readers need no coordination.
     ///
-    /// Committing zero items still refreshes the timestamp and replaces `source`,
-    /// so the manifest always describes the last commit.
+    /// `source` describes the run and lands in
+    /// [`Manifest::last_run`](crate::Manifest::last_run); it is also the
+    /// provenance recorded for any item that does not carry its own
+    /// ([`CommitItem::with_source`]). Tables this run does not touch keep the
+    /// provenance they were installed with - a run that publishes `game` must
+    /// not restamp the seven tables built from something else.
+    ///
+    /// Committing zero items still refreshes the timestamp and the run record.
     pub fn commit(
         &self,
         items: &[CommitItem],
@@ -258,7 +335,7 @@ impl HashStore {
             Err(e) => return Err(e.into()),
         };
         manifest.generated_at = crate::manifest::now_rfc3339();
-        manifest.source = source;
+        manifest.last_run = source.clone();
 
         for item in items {
             if !is_valid_version(&item.version) {
@@ -279,13 +356,29 @@ impl HashStore {
             // a version label; refuse.
             let sha256 = if dest.exists() {
                 let existing = fsutil::sha256_file(&dest)?;
-                if existing != fsutil::sha256_file(&item.path)? {
+                let incoming = match &item.staged_sha256 {
+                    Some(sha256) => sha256.clone(),
+                    None => fsutil::sha256_file(&item.path)?,
+                };
+                if existing != incoming {
                     return Err(CommitError::VersionReused {
                         table: item.table,
                         version: item.version.clone(),
                     });
                 }
+
+                // A staged file is ours to dispose of, and its twin is already
+                // installed. A file built elsewhere is the caller's; leave it.
+                if item.staged_sha256.is_some() {
+                    let _ = std::fs::remove_file(&item.path);
+                }
+
                 existing
+            } else if let Some(sha256) = &item.staged_sha256 {
+                // Already in this directory and already hashed: an in-volume
+                // move, no second pass over the bytes.
+                fsutil::rename_into_place(&item.path, &dest)?;
+                sha256.clone()
             } else {
                 fsutil::atomic_copy(&item.path, &dest)?;
                 fsutil::sha256_file(&dest)?
@@ -298,6 +391,10 @@ impl HashStore {
                     sha256,
                     entries,
                     key_width,
+                    version: item.version.clone(),
+                    source: item.source.clone().or_else(|| source.clone()),
+                    // We just opened it, and `open` is what enforces the version.
+                    format_version: ltk_hashdb::FORMAT_VERSION,
                 },
             );
         }

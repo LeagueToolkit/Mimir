@@ -309,6 +309,11 @@ let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
 
 // Install atomically: files are copied durable first, the manifest pointer
 // swaps last, so a concurrent reader never sees a half-written table.
+//
+// The source is recorded on every table this call installs and on the manifest's
+// `last_run`. Tables the call does not mention keep the provenance they were
+// installed with; pass `CommitItem::with_source` when one table came from
+// somewhere else.
 store.commit(
     &[CommitItem::new(Table::Game, "2026-07-10", built_game_path)],
     Some(Source { repo: Some("CommunityDragon/Data".into()), commit, inputs_sha256 }),

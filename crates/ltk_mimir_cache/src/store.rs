@@ -51,6 +51,11 @@ pub struct CommitItem {
     /// The freshly built `.lhdb` to install; copied into the cache under its
     /// versioned name.
     pub path: PathBuf,
+
+    /// Where this table's inputs came from, recorded on its
+    /// [`TableEntry`](crate::TableEntry). Falls back to the run-wide source
+    /// [`commit`](HashStore::commit) is given.
+    pub source: Option<Source>,
 }
 
 impl CommitItem {
@@ -59,7 +64,15 @@ impl CommitItem {
             table,
             version: version.into(),
             path: path.into(),
+            source: None,
         }
+    }
+
+    /// Record where this table in particular was built from, overriding the
+    /// run-wide source.
+    pub fn with_source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
     }
 }
 
@@ -242,8 +255,14 @@ impl HashStore {
     /// sees a pointer to a partial table. Concurrent mutators should hold
     /// [`try_lock_update`](HashStore::try_lock_update); readers need no coordination.
     ///
-    /// Committing zero items still refreshes the timestamp and replaces `source`,
-    /// so the manifest always describes the last commit.
+    /// `source` describes the run and lands in
+    /// [`Manifest::last_run`](crate::Manifest::last_run); it is also the
+    /// provenance recorded for any item that does not carry its own
+    /// ([`CommitItem::with_source`]). Tables this run does not touch keep the
+    /// provenance they were installed with - a run that publishes `game` must
+    /// not restamp the seven tables built from something else.
+    ///
+    /// Committing zero items still refreshes the timestamp and the run record.
     pub fn commit(
         &self,
         items: &[CommitItem],
@@ -258,7 +277,7 @@ impl HashStore {
             Err(e) => return Err(e.into()),
         };
         manifest.generated_at = crate::manifest::now_rfc3339();
-        manifest.source = source;
+        manifest.last_run = source.clone();
 
         for item in items {
             if !is_valid_version(&item.version) {
@@ -299,6 +318,7 @@ impl HashStore {
                     entries,
                     key_width,
                     version: item.version.clone(),
+                    source: item.source.clone().or_else(|| source.clone()),
                     // We just opened it, and `open` is what enforces the version.
                     format_version: ltk_hashdb::FORMAT_VERSION,
                 },

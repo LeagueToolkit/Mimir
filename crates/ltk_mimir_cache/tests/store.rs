@@ -341,12 +341,13 @@ fn recommit_identical_version_is_idempotent() {
     assert_eq!(before, after, "identical recommit left the file untouched");
 }
 
+/// `last_run` describes the run, so it is replaced wholesale every time -
+/// including by a run that records nothing.
 #[test]
-fn commit_overwrites_stale_source() {
+fn commit_overwrites_the_stale_run_record() {
     let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
 
-    // A first commit records provenance.
     let src = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);
     let source = Source {
         repo: Some("owner/repo".into()),
@@ -356,18 +357,110 @@ fn commit_overwrites_stale_source() {
     store
         .commit(&[CommitItem::new(Table::Game, "v1", &src)], Some(source))
         .unwrap();
-    assert!(store.manifest().unwrap().source.is_some());
+    assert!(store.manifest().unwrap().last_run.is_some());
 
-    // A later commit that omits `source` clears the stale value rather than keeping it,
-    // so the manifest always describes the inputs of the last commit.
     let src2 = build_table(&tmp.path().join("g2.lhdb"), ENTRIES);
     let manifest = store
         .commit(&[CommitItem::new(Table::Game, "v2", &src2)], None)
         .unwrap();
     assert!(
-        manifest.source.is_none(),
-        "a None source clears stale provenance"
+        manifest.last_run.is_none(),
+        "a None source clears the stale run record"
     );
+}
+
+/// The reason provenance sits on the entry: a run that publishes one table must
+/// not restamp the tables it never looked at.
+#[test]
+fn a_partial_commit_leaves_other_tables_provenance_alone() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let src = build_table(&tmp.path().join("t.lhdb"), ENTRIES);
+
+    let from = |commit: &str| Source {
+        repo: Some("owner/repo".into()),
+        commit: Some(commit.into()),
+        inputs_sha256: None,
+    };
+
+    store
+        .commit(
+            &[
+                CommitItem::new(Table::Game, "v1", &src),
+                CommitItem::new(Table::Lcu, "v1", &src),
+            ],
+            Some(from("aaaa")),
+        )
+        .unwrap();
+
+    // A second run rebuilds only `game`, from a different upstream commit.
+    let manifest = store
+        .commit(
+            &[CommitItem::new(Table::Game, "v2", &src)],
+            Some(from("bbbb")),
+        )
+        .unwrap();
+
+    let commit_of = |table| {
+        manifest
+            .entry(table)
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone()
+    };
+    assert_eq!(commit_of(Table::Game), Some("bbbb".into()));
+    assert_eq!(
+        commit_of(Table::Lcu),
+        Some("aaaa".into()),
+        "the untouched table still names the commit it was built from"
+    );
+    assert_eq!(manifest.last_run.unwrap().commit, Some("bbbb".into()));
+}
+
+/// An item can name its own inputs, for a run that builds several tables from
+/// several places.
+#[test]
+fn an_item_can_override_the_run_wide_source() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let src = build_table(&tmp.path().join("t.lhdb"), ENTRIES);
+
+    let run = Source {
+        repo: Some("owner/repo".into()),
+        commit: Some("aaaa".into()),
+        inputs_sha256: None,
+    };
+    let mirror = Source {
+        repo: Some("mirror/repo".into()),
+        commit: Some("bbbb".into()),
+        inputs_sha256: None,
+    };
+
+    let manifest = store
+        .commit(
+            &[
+                CommitItem::new(Table::Game, "v1", &src),
+                CommitItem::new(Table::Lcu, "v1", &src).with_source(mirror),
+            ],
+            Some(run),
+        )
+        .unwrap();
+
+    let repo_of = |table| {
+        manifest
+            .entry(table)
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .repo
+            .clone()
+    };
+    assert_eq!(repo_of(Table::Game), Some("owner/repo".into()));
+    assert_eq!(repo_of(Table::Lcu), Some("mirror/repo".into()));
 }
 
 /// N reader threads hammer `open`/`get` while the main thread recommits new versions;

@@ -196,7 +196,7 @@ impl HashStore {
             items.push(self.verify_and_stage(download, &bytes, &mut staged)?);
         }
 
-        self.finish(items, staged, remote_manifest.source.clone(), report)
+        self.finish(items, staged, remote_manifest.last_run.clone(), report)
     }
 
     /// Async twin of [`update`](HashStore::update): the same compare →
@@ -232,7 +232,7 @@ impl HashStore {
             items.push(self.verify_and_stage(download, &bytes, &mut staged)?);
         }
 
-        self.finish(items, staged, remote_manifest.source.clone(), report)
+        self.finish(items, staged, remote_manifest.last_run.clone(), report)
     }
 
     /// Decide what to download: every remote table whose sha256 differs from
@@ -312,7 +312,10 @@ impl HashStore {
             .dir()
             .join(format!("{}.download.tmp", download.entry.file));
         fs::write(&tmp, bytes)?;
-        let item = CommitItem::new(download.table, download.version, &tmp);
+        // The release says where this table came from; that travels with the
+        // table rather than being re-derived from whatever run installs it.
+        let mut item = CommitItem::new(download.table, download.version, &tmp);
+        item.source = download.entry.source.clone();
         staged.0.push(tmp);
 
         Ok(item)

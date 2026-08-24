@@ -38,13 +38,21 @@ pub struct Manifest {
     pub min_reader_schema: Option<u32>,
 
     pub generated_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<Source>,
+
+    /// The inputs the most recent commit to this cache drew on.
+    ///
+    /// This describes the *run*, not the contents: a run that installs one table
+    /// says nothing about where the other seven came from. Per-table provenance
+    /// lives on [`TableEntry::source`], which is the one to read when the
+    /// question is "where did this table come from".
+    #[serde(default, alias = "source", skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<Source>,
+
     #[serde(default)]
     pub tables: BTreeMap<String, TableEntry>,
 }
 
-/// Provenance of the inputs a manifest was built from.
+/// Provenance of the inputs one table - or one publishing run - was built from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Source {
     /// Where the txt hash lists came from: a git URL or a GitHub `owner/repo`
@@ -80,6 +88,14 @@ pub struct TableEntry {
     #[serde(default)]
     pub version: String,
 
+    /// Where this table's inputs came from, when the publisher recorded it.
+    ///
+    /// Self-contained on purpose: a commit hash is only interpretable next to
+    /// the repo it belongs to, and a later run that touches other tables must
+    /// not be able to change what this one claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+
     /// The `.hashdb` format version `file` is written in.
     ///
     /// Per table, not per manifest, so one release can carry a table in a new
@@ -113,7 +129,7 @@ impl Manifest {
             schema: SCHEMA_VERSION,
             min_reader_schema: None,
             generated_at: now_rfc3339(),
-            source: None,
+            last_run: None,
             tables: BTreeMap::new(),
         }
     }
@@ -339,6 +355,21 @@ mod tests {
         }"#;
         let manifest = Manifest::from_slice(json.as_bytes()).expect("parses");
         assert!(manifest.entry(Table::Game).unwrap().version.is_empty());
+    }
+
+    /// `last_run` was called `source` when it was the only provenance there was;
+    /// manifests already on disk still spell it that way.
+    #[test]
+    fn the_old_source_field_still_reads() {
+        let json = r#"{
+            "schema": 1,
+            "generated_at": "",
+            "source": {"repo": "CommunityDragon/Data", "commit": "abc123"},
+            "tables": {}
+        }"#;
+        let manifest = Manifest::from_slice(json.as_bytes()).expect("parses");
+        let last_run = manifest.last_run.expect("read under its old name");
+        assert_eq!(last_run.commit.as_deref(), Some("abc123"));
     }
 
     /// The pair a consumer asks "how stale is this cache" with.

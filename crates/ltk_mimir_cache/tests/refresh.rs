@@ -64,9 +64,14 @@ fn fresh_install_downloads_everything() {
         manifest.generated_at
     );
     assert_eq!(
-        manifest.source.unwrap().repo.as_deref(),
+        entry.source.as_ref().unwrap().repo.as_deref(),
         Some("test/data"),
-        "release provenance carries over into the local manifest"
+        "release provenance travels with the table it describes"
+    );
+    assert_eq!(
+        manifest.last_run.unwrap().repo.as_deref(),
+        Some("test/data"),
+        "and the run record says what this update drew on"
     );
 }
 
@@ -309,6 +314,7 @@ fn unknown_remote_table_is_skipped() {
                 entries: 0,
                 key_width: 8,
                 version: "1".into(),
+                source: None,
                 format_version: ltk_hashdb::FORMAT_VERSION,
             },
         );

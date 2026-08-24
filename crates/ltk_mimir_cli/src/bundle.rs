@@ -296,7 +296,7 @@ mod tests {
             ["game", "lcu"],
             "manifest lists exactly the built tables"
         );
-        let source = manifest.source.unwrap();
+        let source = manifest.entry(Table::Game).unwrap().source.clone().unwrap();
         assert_eq!(source.repo.as_deref(), Some("CommunityDragon/Data"));
         assert_eq!(source.commit.as_deref(), Some("abc123"));
         assert!(source.inputs_sha256.is_some());

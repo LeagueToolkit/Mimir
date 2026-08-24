@@ -6,15 +6,16 @@
 //! test binary named `update*.exe` without elevation (os error 740).
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use ltk_mimir_cache::{
-    Fetch, HashStore, Table, TableStatus, UpdateError, UpdateOptions, UpdateOutcome,
+    Fetch, FetchError, HashStore, Table, TableStatus, UpdateError, UpdateOptions, UpdateOutcome,
 };
 use tempfile::tempdir;
 
 mod common;
-use common::{channel_asset, completed, edit_release_manifest, make_release};
+use common::{channel_asset, completed, edit_release_manifest, make_release, serve_asset};
 
 /// Serve "release assets" straight from a directory.
 struct DirFetch(PathBuf);
@@ -22,8 +23,12 @@ struct DirFetch(PathBuf);
 impl Fetch for DirFetch {
     type Error = std::io::Error;
 
-    fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
-        fs::read(self.0.join(filename))
+    fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<std::io::Error>> {
+        serve_asset(&self.0.join(filename), sink)
     }
 }
 
@@ -245,7 +250,11 @@ fn release_race_errors_and_rerun_converges() {
     impl Fetch for RacingFetch {
         type Error = std::io::Error;
 
-        fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
+        fn fetch_to(
+            &self,
+            filename: &str,
+            sink: &mut (dyn Write + Send),
+        ) -> Result<u64, FetchError<std::io::Error>> {
             if filename.ends_with(".lhdb") {
                 self.flipped.set(true);
             }
@@ -254,7 +263,8 @@ fn release_race_errors_and_rerun_converges() {
             } else {
                 &self.old
             };
-            fs::read(dir.join(filename))
+
+            serve_asset(&dir.join(filename), sink)
         }
     }
 
@@ -635,4 +645,122 @@ fn check_reports_an_unreadable_format_without_counting_it() {
     let report = HashStore::at(&cache).check(&DirFetch(release)).unwrap();
     assert_eq!(report.tables[0].status, TableStatus::Unsupported);
     assert!(report.is_up_to_date(), "no update would change this");
+}
+
+/// The sink is the cancellation point: a wrapper that refuses a chunk stops the
+/// download where it stands, and nothing is installed or left behind.
+#[test]
+fn a_sink_that_refuses_bytes_stops_the_download() {
+    /// Forwards a fixed number of bytes, then refuses.
+    struct StopsShort<F> {
+        inner: F,
+        limit: usize,
+    }
+
+    impl<F: Fetch> Fetch for StopsShort<F> {
+        type Error = F::Error;
+
+        fn fetch_to(
+            &self,
+            filename: &str,
+            sink: &mut (dyn Write + Send),
+        ) -> Result<u64, FetchError<Self::Error>> {
+            if !filename.ends_with(".lhdb") {
+                return self.inner.fetch_to(filename, sink);
+            }
+
+            let mut capped = Capped {
+                sink,
+                left: self.limit,
+            };
+            self.inner.fetch_to(filename, &mut capped)
+        }
+    }
+
+    struct Capped<'a> {
+        sink: &'a mut (dyn Write + Send),
+        left: usize,
+    }
+
+    impl Write for Capped<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("cancelled by the caller"));
+            }
+
+            let take = buf.len().min(self.left);
+            let n = self.sink.write(&buf[..take])?;
+            self.left -= n;
+
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.sink.flush()
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "assets/foo.bin")])]);
+
+    let store = HashStore::at(&cache);
+    let err = store
+        .update(
+            &StopsShort {
+                inner: DirFetch(release),
+                limit: 16,
+            },
+            UpdateOptions::default(),
+        )
+        .unwrap_err();
+
+    match err {
+        UpdateError::Fetch {
+            source: FetchError::Sink(_),
+            ..
+        } => {}
+        other => panic!("expected the sink to be blamed, got {other}"),
+    }
+
+    assert!(store.manifest().is_err(), "nothing was installed");
+    let leftovers: Vec<_> = fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the partial download was cleaned up: {leftovers:?}"
+    );
+}
+
+/// The staged download is consumed by the install, so a completed run leaves no
+/// second copy of a 38 MiB table lying about.
+#[test]
+fn a_completed_update_leaves_no_staging_file() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    completed(
+        store
+            .update(&DirFetch(release), UpdateOptions::default())
+            .unwrap(),
+    );
+
+    let files: Vec<String> = fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        files.iter().all(|name| !name.ends_with(".tmp")),
+        "{files:?}"
+    );
+    assert!(files.iter().any(|name| name == "game-1.lhdb"), "{files:?}");
 }

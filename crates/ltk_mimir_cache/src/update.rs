@@ -7,32 +7,100 @@
 //! mirror, a directory in tests). Everything else - comparison, verification,
 //! atomic install, GC - lives here.
 
-use std::fs;
+use std::fs::{self, File};
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use crate::manifest::version_of;
 use crate::store::MANIFEST_FILE;
 use crate::{
-    fsutil, CheckError, CommitItem, GcReport, HashStore, Manifest, ManifestError, Source, Table,
-    TableEntry, UpdateError,
+    fsutil, CheckError, CommitItem, FetchError, GcReport, HashStore, Manifest, ManifestError,
+    Source, Table, TableEntry, UpdateError,
 };
 
 /// Fetch one release asset by filename (`manifest.json`,
 /// `game-<version>.lhdb`, ...).
 ///
-/// The error is an associated type, so [`HashStore::update`] fails with
-/// [`UpdateError<Self::Error>`](UpdateError) and callers see the transport's
-/// concrete error instead of a boxed one. For a GitHub release the asset URL is
+/// [`fetch_to`](Fetch::fetch_to) is the primitive: it streams an asset into a
+/// sink, so a 38 MiB table never has to exist in memory and the caller decides
+/// where the bytes land. [`fetch`](Fetch::fetch) is the convenience form over
+/// it, for the small assets (the manifest) where a buffer is simpler.
+///
+/// The error is an associated type, so callers see the transport's concrete
+/// error instead of a boxed one. For a GitHub release the asset URL is
 /// `https://github.com/<owner>/<repo>/releases/latest/download/<filename>`.
 /// Any `Fn(&str) -> Result<Vec<u8>, E>` closure whose error type meets the
-/// bounds is a `Fetch`.
+/// bounds is a `Fetch` - it just buffers rather than streams.
+///
+/// Wrapping a fetcher is how progress reporting and cancellation are done: pass
+/// the inner fetcher a sink of your own that counts bytes, and return an error
+/// from it to stop the download where it stands.
+///
+/// ```
+/// # use std::io::Write;
+/// # use ltk_mimir_cache::{Fetch, FetchError};
+/// struct Reporting<F>(F);
+///
+/// impl<F: Fetch> Fetch for Reporting<F> {
+///     type Error = F::Error;
+///
+///     fn fetch_to(
+///         &self,
+///         filename: &str,
+///         sink: &mut (dyn Write + Send),
+///     ) -> Result<u64, FetchError<Self::Error>> {
+///         let mut counting = Counting { sink, done: 0 };
+///         self.0.fetch_to(filename, &mut counting)
+///     }
+/// }
+///
+/// struct Counting<'a> {
+///     sink: &'a mut (dyn Write + Send),
+///     done: u64,
+/// }
+///
+/// impl Write for Counting<'_> {
+///     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+///         let n = self.sink.write(buf)?;
+///         self.done += n as u64;
+///         println!("{} bytes", self.done);
+///         Ok(n)
+///     }
+///
+///     fn flush(&mut self) -> std::io::Result<()> {
+///         self.sink.flush()
+///     }
+/// }
+/// ```
 pub trait Fetch {
     /// The error this fetcher fails with, surfaced in
     /// [`UpdateError::Fetch`] alongside the filename that failed.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn fetch(&self, filename: &str) -> Result<Vec<u8>, Self::Error>;
+    /// Stream one asset into `sink`, returning the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Transport`] for anything the fetcher itself hit, and
+    /// [`FetchError::Sink`] when `sink` refused the bytes - a full disk, or a
+    /// wrapper cancelling the download.
+    fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<Self::Error>>;
+
+    /// The whole asset in memory.
+    ///
+    /// The default collects [`fetch_to`](Fetch::fetch_to) into a `Vec`, which is
+    /// what the manifest wants and what a table does not.
+    fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError<Self::Error>> {
+        let mut buf = Vec::new();
+        self.fetch_to(filename, &mut buf)?;
+
+        Ok(buf)
+    }
 }
 
 impl<F, E> Fetch for F
@@ -42,15 +110,26 @@ where
 {
     type Error = E;
 
-    fn fetch(&self, filename: &str) -> Result<Vec<u8>, E> {
-        self(filename)
+    fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<E>> {
+        let bytes = self(filename).map_err(FetchError::Transport)?;
+        sink.write_all(&bytes).map_err(FetchError::Sink)?;
+
+        Ok(bytes.len() as u64)
+    }
+
+    fn fetch(&self, filename: &str) -> Result<Vec<u8>, FetchError<E>> {
+        self(filename).map_err(FetchError::Transport)
     }
 }
 
 /// Fetch one release asset by filename, asynchronously - the [`Fetch`]
 /// counterpart driven by [`HashStore::update_async`].
 ///
-/// The returned future must be `Send` so the update can run on multi-threaded
+/// The returned futures must be `Send` so the update can run on multi-threaded
 /// executors. Any `Fn(&str) -> Fut` closure returning such a future is an
 /// `AsyncFetch`; the future cannot borrow the filename, so build owned state
 /// (e.g. the URL) before the `async move` block:
@@ -60,7 +139,7 @@ where
 ///     let url = format!("{base}/{filename}");
 ///     async move {
 ///         let response = client.get(&url).send().await?.error_for_status()?;
-///         Ok::<_, reqwest::Error>(response.bytes().await?.to_vec())
+///         Ok::<_, HttpFetchError>(response.bytes().await?.to_vec())
 ///     }
 /// };
 /// ```
@@ -69,19 +148,65 @@ pub trait AsyncFetch {
     /// [`UpdateError::Fetch`] alongside the filename that failed.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn fetch(&self, filename: &str) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
+    /// Stream one asset into `sink`, returning the number of bytes written.
+    ///
+    /// The sink is written from the future, so it is borrowed for the whole
+    /// await - see [`Fetch::fetch_to`] for what the two failure modes mean.
+    fn fetch_to<'a>(
+        &'a self,
+        filename: &'a str,
+        sink: &'a mut (dyn Write + Send),
+    ) -> impl Future<Output = Result<u64, FetchError<Self::Error>>> + Send + 'a;
+
+    /// The whole asset in memory; the async twin of [`Fetch::fetch`].
+    ///
+    /// The default body holds `&self` across an await, so it needs a `Sync`
+    /// fetcher. Override it if yours is not one.
+    fn fetch(
+        &self,
+        filename: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, FetchError<Self::Error>>> + Send
+    where
+        Self: Sync,
+    {
+        // Owned so the future borrows nothing but `self`.
+        let filename = filename.to_owned();
+        async move {
+            let mut buf = Vec::new();
+            self.fetch_to(&filename, &mut buf).await?;
+
+            Ok(buf)
+        }
+    }
 }
 
 impl<F, Fut, E> AsyncFetch for F
 where
     F: Fn(&str) -> Fut,
-    Fut: Future<Output = Result<Vec<u8>, E>> + Send,
+    // `'static` is the documented contract already: the future cannot borrow the
+    // filename, so it can also outlive the sink it is handed.
+    Fut: Future<Output = Result<Vec<u8>, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = E;
 
-    fn fetch(&self, filename: &str) -> impl Future<Output = Result<Vec<u8>, E>> + Send {
-        self(filename)
+    fn fetch_to<'a>(
+        &'a self,
+        filename: &'a str,
+        sink: &'a mut (dyn Write + Send),
+    ) -> impl Future<Output = Result<u64, FetchError<E>>> + Send + 'a {
+        let fetched = self(filename);
+        async move {
+            let bytes = fetched.await.map_err(FetchError::Transport)?;
+            sink.write_all(&bytes).map_err(FetchError::Sink)?;
+
+            Ok(bytes.len() as u64)
+        }
+    }
+
+    fn fetch(&self, filename: &str) -> impl Future<Output = Result<Vec<u8>, FetchError<E>>> + Send {
+        let fetched = self(filename);
+        async move { fetched.await.map_err(FetchError::Transport) }
     }
 }
 
@@ -277,8 +402,11 @@ impl HashStore {
         let mut items = Vec::new();
         let mut staged = Staged(Vec::new());
         for download in &planned {
-            let bytes = fetch(remote, &download.entry.file)?;
-            items.push(self.verify_and_stage(download, &bytes, &mut staged)?);
+            let tmp = self.stage_path(download, &mut staged);
+            let mut sink = staging_sink(&tmp)?;
+            let sha256 = fetch_into(remote, &download.entry.file, &mut sink)?;
+
+            items.push(verified(download, &tmp, sha256)?);
         }
 
         self.finish(items, staged, remote_manifest.last_run.clone(), report)
@@ -313,8 +441,11 @@ impl HashStore {
         let mut items = Vec::new();
         let mut staged = Staged(Vec::new());
         for download in &self.plan(&remote_manifest, options, &mut report)? {
-            let bytes = fetch_async(remote, &download.entry.file).await?;
-            items.push(self.verify_and_stage(download, &bytes, &mut staged)?);
+            let tmp = self.stage_path(download, &mut staged);
+            let mut sink = staging_sink(&tmp)?;
+            let sha256 = fetch_into_async(remote, &download.entry.file, &mut sink).await?;
+
+            items.push(verified(download, &tmp, sha256)?);
         }
 
         self.finish(items, staged, remote_manifest.last_run.clone(), report)
@@ -456,34 +587,15 @@ impl HashStore {
         Ok(planned)
     }
 
-    /// Verify downloaded bytes against the planned entry's sha256 and stage
-    /// them as a `.download.tmp` next to their final name.
-    fn verify_and_stage<E>(
-        &self,
-        download: &PlannedDownload<'_>,
-        bytes: &[u8],
-        staged: &mut Staged,
-    ) -> Result<CommitItem, UpdateError<E>> {
-        let sha256 = fsutil::sha256_bytes(bytes);
-        if sha256 != download.entry.sha256 {
-            return Err(UpdateError::ChecksumMismatch {
-                file: download.entry.file.clone(),
-                expected: download.entry.sha256.clone(),
-                actual: sha256,
-            });
-        }
-
+    /// Where one planned download is staged, registered for cleanup before a
+    /// single byte is written so a failure mid-stream litters nothing.
+    fn stage_path(&self, download: &PlannedDownload<'_>, staged: &mut Staged) -> PathBuf {
         let tmp = self
             .dir()
             .join(format!("{}.download.tmp", download.entry.file));
-        fs::write(&tmp, bytes)?;
-        // The release says where this table came from; that travels with the
-        // table rather than being re-derived from whatever run installs it.
-        let mut item = CommitItem::new(download.table, download.version, &tmp);
-        item.source = download.entry.source.clone();
-        staged.0.push(tmp);
+        staged.0.push(tmp.clone());
 
-        Ok(item)
+        tmp
     }
 
     /// Install the staged items and sweep superseded versions - the shared
@@ -515,7 +627,7 @@ impl HashStore {
 /// Failure to obtain the remote manifest, before either caller has wrapped it in
 /// its own error type.
 pub(crate) enum ManifestFetch<E> {
-    Fetch { file: String, source: E },
+    Fetch { file: String, source: FetchError<E> },
     Parse(ManifestError),
 }
 
@@ -570,38 +682,91 @@ async fn fetch_manifest_async<F: AsyncFetch + ?Sized>(
     remote: &F,
 ) -> Result<Manifest, ManifestFetch<F::Error>> {
     let channel = Manifest::asset_for_format(ltk_hashdb::FORMAT_VERSION);
-    match remote.fetch(&channel).await {
-        Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
-        Err(source) => match remote.fetch(MANIFEST_FILE).await {
-            Ok(bytes) => Ok(Manifest::from_slice(&bytes)?),
-            Err(_) => Err(ManifestFetch::Fetch {
-                file: channel,
-                source,
-            }),
-        },
+    // `fetch_to` rather than `fetch`: the required method carries its own `Send`
+    // guarantee, so this works for a fetcher that is not `Sync`.
+    let mut buf = Vec::new();
+    match remote.fetch_to(&channel, &mut buf).await {
+        Ok(_) => Ok(Manifest::from_slice(&buf)?),
+        Err(source) => {
+            let mut buf = Vec::new();
+            match remote.fetch_to(MANIFEST_FILE, &mut buf).await {
+                Ok(_) => Ok(Manifest::from_slice(&buf)?),
+                Err(_) => Err(ManifestFetch::Fetch {
+                    file: channel,
+                    source,
+                }),
+            }
+        }
     }
 }
 
-/// Run one fetch, wrapping the fetcher's error with the filename.
-fn fetch<F: Fetch + ?Sized>(remote: &F, filename: &str) -> Result<Vec<u8>, UpdateError<F::Error>> {
-    remote.fetch(filename).map_err(|source| UpdateError::Fetch {
-        file: filename.to_string(),
-        source,
-    })
+/// A buffered, hashing sink over a fresh staging file.
+///
+/// Hashing as the bytes go past is what removes the second pass: the download is
+/// verified by the time it is on disk, and `commit` renames it rather than
+/// copying it and reading it again.
+fn staging_sink(tmp: &Path) -> std::io::Result<fsutil::HashingWriter<BufWriter<File>>> {
+    Ok(fsutil::HashingWriter::new(BufWriter::new(File::create(
+        tmp,
+    )?)))
 }
 
-/// Run one async fetch, wrapping the fetcher's error with the filename.
-async fn fetch_async<F: AsyncFetch + ?Sized>(
+/// Stream one asset into `sink` and return its hex sha256.
+fn fetch_into<F: Fetch + ?Sized>(
     remote: &F,
     filename: &str,
-) -> Result<Vec<u8>, UpdateError<F::Error>> {
+    sink: &mut fsutil::HashingWriter<BufWriter<File>>,
+) -> Result<String, UpdateError<F::Error>> {
     remote
-        .fetch(filename)
+        .fetch_to(filename, sink)
+        .map_err(|source| UpdateError::Fetch {
+            file: filename.to_string(),
+            source,
+        })?;
+
+    Ok(sink.finish()?)
+}
+
+/// Async twin of [`fetch_into`].
+async fn fetch_into_async<F: AsyncFetch + ?Sized>(
+    remote: &F,
+    filename: &str,
+    sink: &mut fsutil::HashingWriter<BufWriter<File>>,
+) -> Result<String, UpdateError<F::Error>> {
+    remote
+        .fetch_to(filename, sink)
         .await
         .map_err(|source| UpdateError::Fetch {
             file: filename.to_string(),
             source,
-        })
+        })?;
+
+    Ok(sink.finish()?)
+}
+
+/// Turn a staged download into a [`CommitItem`], or reject it.
+///
+/// The digest came off the stream, so this is a string compare rather than
+/// another pass over 38 MiB.
+fn verified<E>(
+    download: &PlannedDownload<'_>,
+    tmp: &Path,
+    sha256: String,
+) -> Result<CommitItem, UpdateError<E>> {
+    if sha256 != download.entry.sha256 {
+        return Err(UpdateError::ChecksumMismatch {
+            file: download.entry.file.clone(),
+            expected: download.entry.sha256.clone(),
+            actual: sha256,
+        });
+    }
+
+    // The release says where this table came from; that travels with the table
+    // rather than being re-derived from whatever run installs it.
+    let mut item = CommitItem::staged(download.table, download.version, tmp, sha256);
+    item.source = download.entry.source.clone();
+
+    Ok(item)
 }
 
 #[cfg(test)]

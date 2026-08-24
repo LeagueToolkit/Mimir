@@ -56,15 +56,46 @@ pub struct CommitItem {
     /// [`TableEntry`](crate::TableEntry). Falls back to the run-wide source
     /// [`commit`](HashStore::commit) is given.
     pub source: Option<Source>,
+
+    /// Set when `path` is a file staged inside the cache directory for this
+    /// commit to consume, carrying the digest of its contents.
+    ///
+    /// [`commit`](HashStore::commit) then renames the file into place and trusts
+    /// this digest, rather than copying the bytes and reading them back to hash
+    /// them - which for a 38 MiB table is the difference between touching it
+    /// once and touching it three times. Set it through
+    /// [`staged`](CommitItem::staged), never by hand: a wrong digest is recorded
+    /// in the manifest as if it were right.
+    pub staged_sha256: Option<String>,
 }
 
 impl CommitItem {
+    /// A table built somewhere else, to be copied into the cache.
     pub fn new(table: Table, version: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
             table,
             version: version.into(),
             path: path.into(),
             source: None,
+            staged_sha256: None,
+        }
+    }
+
+    /// A table already staged inside the cache directory, with `sha256` computed
+    /// over the file as it was written.
+    ///
+    /// [`commit`](HashStore::commit) consumes it: the file is renamed into place
+    /// and is gone from `path` afterwards either way. This is what the updater
+    /// uses, having hashed the download as it streamed.
+    pub fn staged(
+        table: Table,
+        version: impl Into<String>,
+        path: impl Into<PathBuf>,
+        sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            staged_sha256: Some(sha256.into()),
+            ..Self::new(table, version, path)
         }
     }
 
@@ -250,9 +281,10 @@ impl HashStore {
     /// Install one or more freshly built tables and atomically flip the manifest to
     /// point at them.
     ///
-    /// Each source is copied in under an immutable `<table>-<version>.lhdb` name;
-    /// the manifest is swapped only after every file is durable, so a reader never
-    /// sees a pointer to a partial table. Concurrent mutators should hold
+    /// Each source is installed under an immutable `<table>-<version>.lhdb` name -
+    /// copied, or renamed when the item was staged in this directory
+    /// ([`CommitItem::staged`]) - and the manifest is swapped only after every
+    /// file is durable, so a reader never sees a pointer to a partial table. Concurrent mutators should hold
     /// [`try_lock_update`](HashStore::try_lock_update); readers need no coordination.
     ///
     /// `source` describes the run and lands in
@@ -298,13 +330,29 @@ impl HashStore {
             // a version label; refuse.
             let sha256 = if dest.exists() {
                 let existing = fsutil::sha256_file(&dest)?;
-                if existing != fsutil::sha256_file(&item.path)? {
+                let incoming = match &item.staged_sha256 {
+                    Some(sha256) => sha256.clone(),
+                    None => fsutil::sha256_file(&item.path)?,
+                };
+                if existing != incoming {
                     return Err(CommitError::VersionReused {
                         table: item.table,
                         version: item.version.clone(),
                     });
                 }
+
+                // A staged file is ours to dispose of, and its twin is already
+                // installed. A file built elsewhere is the caller's; leave it.
+                if item.staged_sha256.is_some() {
+                    let _ = std::fs::remove_file(&item.path);
+                }
+
                 existing
+            } else if let Some(sha256) = &item.staged_sha256 {
+                // Already in this directory and already hashed: an in-volume
+                // move, no second pass over the bytes.
+                fsutil::rename_into_place(&item.path, &dest)?;
+                sha256.clone()
             } else {
                 fsutil::atomic_copy(&item.path, &dest)?;
                 fsutil::sha256_file(&dest)?

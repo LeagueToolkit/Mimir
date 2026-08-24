@@ -587,3 +587,68 @@ fn open_shared_reuses_handles_until_the_version_changes() {
     assert_eq!(after.len(), 2, "followed the manifest to the new version");
     assert_eq!(first.len(), 1, "the old handle keeps reading the old file");
 }
+
+/// A staged file is consumed, not copied: the bytes are written once, by
+/// whoever staged them, and `commit` only moves the name.
+#[test]
+fn commit_moves_a_staged_file_instead_of_copying_it() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    std::fs::create_dir_all(tmp.path()).unwrap();
+
+    // Staged inside the cache directory, the way the updater writes a download.
+    let staged = tmp.path().join("game-v1.lhdb.download.tmp");
+    build_table(&staged, ENTRIES);
+    let sha256 = sha256_of(&staged);
+
+    let manifest = store
+        .commit(
+            &[CommitItem::staged(Table::Game, "v1", &staged, &sha256)],
+            None,
+        )
+        .unwrap();
+
+    assert!(!staged.exists(), "the staged file was moved, not copied");
+    let installed = tmp.path().join("game-v1.lhdb");
+    assert!(installed.is_file());
+    assert_eq!(
+        manifest.entry(Table::Game).unwrap().sha256,
+        sha256,
+        "the digest computed while staging is the one recorded"
+    );
+    assert_eq!(
+        store.open(Table::Game).unwrap().len(),
+        ENTRIES.len(),
+        "and the moved file opens"
+    );
+}
+
+/// The copy path is still there for a table built somewhere else, which the
+/// caller keeps.
+#[test]
+fn commit_copies_a_file_it_was_not_handed() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path().join("cache"));
+
+    let built = tmp.path().join("built.lhdb");
+    build_table(&built, ENTRIES);
+
+    store
+        .commit(&[CommitItem::new(Table::Game, "v1", &built)], None)
+        .unwrap();
+
+    assert!(built.is_file(), "the caller's file is left where it was");
+    assert!(tmp.path().join("cache/game-v1.lhdb").is_file());
+}
+
+/// sha256 of a file, as lowercase hex - the digest a stager would have.
+fn sha256_of(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(path).unwrap());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

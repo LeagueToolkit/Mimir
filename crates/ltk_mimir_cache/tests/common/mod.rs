@@ -2,12 +2,13 @@
 //! updater suites: building tiny tables, staging fake releases, and unwrapping
 //! completed runs.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
 use ltk_mimir_cache::{
-    CommitItem, HashStore, Manifest, Source, Table, UpdateOutcome, UpdateReport,
+    CommitItem, FetchError, HashStore, Manifest, Source, Table, UpdateOutcome, UpdateReport,
 };
 
 /// Build a tiny raw `.lhdb` and return its path.
@@ -68,5 +69,27 @@ pub fn completed(outcome: UpdateOutcome) -> UpdateReport {
     match outcome {
         UpdateOutcome::Completed(report) => report,
         UpdateOutcome::Locked => panic!("expected a completed run, got Locked"),
+    }
+}
+
+/// Stream one "release asset" out of a directory, the way a real fetcher must:
+/// a read failure is the transport's, a write failure is the sink's.
+pub fn serve_asset(
+    path: &Path,
+    sink: &mut (dyn Write + Send),
+) -> Result<u64, FetchError<std::io::Error>> {
+    let mut file = File::open(path).map_err(FetchError::Transport)?;
+    // Deliberately tiny, so even the smallest fixture takes several chunks.
+    let mut buf = [0u8; 1024];
+    let mut total = 0;
+
+    loop {
+        let read = file.read(&mut buf).map_err(FetchError::Transport)?;
+        if read == 0 {
+            return Ok(total);
+        }
+
+        sink.write_all(&buf[..read]).map_err(FetchError::Sink)?;
+        total += read as u64;
     }
 }

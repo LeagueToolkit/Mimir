@@ -170,7 +170,9 @@ let map = db.load_all();
 ### Updating the cache
 
 The crate ships no HTTP client of its own - you hand it a fetcher. `UreqFetch` (feature
-`ureq`) and `ReqwestFetch` (feature `reqwest`, async) cover the common case:
+`ureq`) and `ReqwestFetch` (feature `reqwest`, async) cover the common case; both stream
+into the cache rather than buffering a table, and wrapping either one is how you report
+progress or cancel a download (see [docs/CONSUMERS.md](docs/CONSUMERS.md)):
 
 ```rust
 use ltk_mimir_cache::{HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch};

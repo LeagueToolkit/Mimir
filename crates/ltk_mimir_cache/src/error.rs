@@ -140,6 +140,20 @@ pub enum GcError {
     Manifest(#[from] ManifestError),
 }
 
+/// Why a streaming fetch stopped ([`Fetch::fetch_to`](crate::Fetch::fetch_to)).
+///
+/// The two halves have different owners: `Transport` is the fetcher's problem,
+/// `Sink` is the caller's - a full disk, or a wrapping sink cancelling the
+/// download by refusing the next chunk.
+#[derive(Debug, Error)]
+pub enum FetchError<E> {
+    #[error(transparent)]
+    Transport(E),
+
+    #[error("writing the fetched bytes")]
+    Sink(#[source] std::io::Error),
+}
+
 /// Errors from a lock-free comparison ([`HashStore::check`](crate::HashStore::check)).
 ///
 /// Deliberately smaller than [`UpdateError`]: `check` installs nothing, so there
@@ -153,7 +167,7 @@ pub enum CheckError<E> {
     Fetch {
         file: String,
         #[source]
-        source: E,
+        source: FetchError<E>,
     },
 }
 
@@ -174,7 +188,7 @@ pub enum UpdateError<E> {
     Fetch {
         file: String,
         #[source]
-        source: E,
+        source: FetchError<E>,
     },
 
     #[error("{file}: sha256 mismatch (manifest {expected}, downloaded {actual})")]

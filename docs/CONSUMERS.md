@@ -247,6 +247,44 @@ match store.update(&fetch, UpdateOptions::default())? {
 > `mimir update` is exactly this call plus a reqwest-backed `Fetch` - still the right
 > tool for cron jobs and setup scripts. **Readers need none of this** - they just `open`.
 
+#### Streaming, progress, and cancellation
+
+`fetch_to` is the trait's actual primitive; the closure form above buffers a whole
+asset because that is all a closure can do. Implementing `fetch_to` instead streams
+straight into the sink `update` hands you - which is a file in the cache directory,
+hashed as it fills - so a 38 MiB table is never in memory and its bytes are written
+once, not copied into place afterwards.
+
+That sink is also the progress and cancellation hook. Wrap a fetcher, pass the inner
+one a sink of your own, and you see every chunk:
+
+```rust
+use std::io::Write;
+use ltk_mimir_cache::{Fetch, FetchError};
+
+struct Reporting<F>(F);
+
+impl<F: Fetch> Fetch for Reporting<F> {
+    type Error = F::Error;
+
+    fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<Self::Error>> {
+        self.0.fetch_to(filename, &mut Counting { sink, done: 0 })
+    }
+}
+```
+
+`Counting::write` forwards to `sink`, adds up what it forwarded, and returns an
+`io::Error` to cancel - which arrives at the caller as `FetchError::Sink`, aborts the
+run, and removes the partial file. `FetchError::Transport` is the other half: the
+fetcher's own failure, kept separate so a dropped connection is never reported as a
+full disk.
+
+`mimir update` is this wrapper plus an `indicatif` spinner.
+
 Async apps (tokio + async reqwest, a GUI runtime) use `HashStore::update_async` with an
 `AsyncFetch` instead - same loop, same guarantees, awaiting each download. The future
 cannot borrow the filename, so build owned state before the `async move` block:

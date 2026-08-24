@@ -9,16 +9,19 @@
 
 use std::fs;
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
-use ltk_mimir_cache::{AsyncFetch, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome};
+use ltk_mimir_cache::{
+    AsyncFetch, FetchError, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome,
+};
 use pollster::block_on;
 use tempfile::tempdir;
 
 mod common;
-use common::{channel_asset, completed, edit_release_manifest, make_release};
+use common::{channel_asset, completed, edit_release_manifest, make_release, serve_asset};
 
 /// Serve "release assets" straight from a directory.
 struct DirFetch(PathBuf);
@@ -26,8 +29,12 @@ struct DirFetch(PathBuf);
 impl AsyncFetch for DirFetch {
     type Error = std::io::Error;
 
-    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
-        fs::read(self.0.join(filename))
+    async fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<std::io::Error>> {
+        serve_asset(&self.0.join(filename), sink)
     }
 }
 
@@ -221,11 +228,16 @@ struct StallOnLcu(PathBuf);
 impl AsyncFetch for StallOnLcu {
     type Error = std::io::Error;
 
-    async fn fetch(&self, filename: &str) -> Result<Vec<u8>, std::io::Error> {
+    async fn fetch_to(
+        &self,
+        filename: &str,
+        sink: &mut (dyn Write + Send),
+    ) -> Result<u64, FetchError<std::io::Error>> {
         if filename.starts_with("lcu-") {
             std::future::pending::<()>().await;
         }
-        fs::read(self.0.join(filename))
+
+        serve_asset(&self.0.join(filename), sink)
     }
 }
 

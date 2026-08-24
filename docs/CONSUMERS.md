@@ -147,7 +147,7 @@ tables, so you don't hand-roll a second map plus fallback:
 ```rust
 use ltk_hashdb::LayeredHashDb;
 
-let mut db = LayeredHashDb::from_bases(vec![store.open(Table::Game)?]);
+let mut db = LayeredHashDb::from_bases(vec![store.open(Table::Game)?])?;
 
 // Hashes with the first base's algorithm and returns the hash:
 let h = db.insert_path("assets/mymod/custom.dds").expect("has a base");
@@ -176,9 +176,9 @@ let store = HashStore::discover()?;
 
 // Open the WAD path tables into one layered reader; missing tables are reported,
 // not fatal - the tool stays usable and their hashes just miss.
-let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+let (mut db, errors) = store.open_layered(&[Table::Game, Table::Lcu])?;
 for (table, e) in &errors {
-    eprintln!("skipping {table:?}: {e}");
+    eprintln!("skipping {table}: {e}");
 }
 
 db.insert(precomputed_hash, "assets/mymod/custom.bin"); // overlay writes as before
@@ -192,6 +192,13 @@ for (hash, path) in db.get_batch(&chunk_hashes) {
     }
 }
 ```
+
+`open_layered` only fails outright on a set spanning more than one hash universe -
+`&[Table::BinEntries, Table::BinFields]`, say, where one table would answer the other's
+hashes with an unrelated path. That is checked before anything is opened. Everything
+else (a missing table, an unreadable file, a file that isn't the table it's filed under)
+comes back in the per-table error list, so a partial cache still gives you a usable
+reader.
 
 `open_layered` is the convenience most WAD consumers want; `open_many` is the
 lower-level primitive it's built from - it pairs each requested table with its

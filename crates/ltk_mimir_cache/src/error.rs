@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::Table;
+use crate::{HashUniverse, Table};
 
 /// Errors from resolving the platform cache directory
 /// ([`HashStore::discover`](crate::HashStore::discover)).
@@ -36,11 +36,35 @@ pub enum OpenError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
 
-    #[error("table {0:?} is not in the manifest")]
+    #[error("table {0} is not in the manifest")]
     TableNotFound(Table),
 
     #[error("opening the table file")]
     HashDb(#[from] ltk_hashdb::OpenError),
+
+    #[error("the table file does not hash its keys the way this table is defined to")]
+    KeyConfig(#[from] ltk_hashdb::KeyConfigMismatch),
+}
+
+/// Refusal to layer tables drawn from different hash universes
+/// ([`HashStore::open_layered`](crate::HashStore::open_layered)).
+#[derive(Debug, Clone, Copy, Error)]
+#[error(
+    "cannot layer {table} ({found}) with {first} ({expected}): a hash means nothing outside \
+     its own universe, so one table would answer the other with a confident, wrong path"
+)]
+pub struct UniverseMismatch {
+    /// The first table in the requested set - the universe the rest must match.
+    pub first: Table,
+
+    /// That table's universe.
+    pub expected: HashUniverse,
+
+    /// The table that does not belong to it.
+    pub table: Table,
+
+    /// The universe it belongs to instead.
+    pub found: HashUniverse,
 }
 
 /// Errors from installing tables ([`HashStore::commit`](crate::HashStore::commit)).

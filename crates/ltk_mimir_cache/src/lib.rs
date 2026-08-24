@@ -19,7 +19,9 @@ mod store;
 mod table;
 mod update;
 
-pub use error::{CommitError, GcError, ManifestError, NoCacheDirError, OpenError, UpdateError};
+pub use error::{
+    CommitError, GcError, ManifestError, NoCacheDirError, OpenError, UniverseMismatch, UpdateError,
+};
 #[cfg(feature = "reqwest")]
 pub use fetch::ReqwestFetch;
 #[cfg(feature = "ureq")]

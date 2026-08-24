@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ltk_hashdb::{Compression, HashDbWriter, KeyWidth};
 use ltk_mimir_cache::{
-    CommitError, CommitItem, HashStore, ManifestError, OpenError, Source, Table,
+    CommitError, CommitItem, HashStore, HashUniverse, ManifestError, OpenError, Source, Table,
 };
 use tempfile::tempdir;
 
@@ -148,7 +148,9 @@ fn open_layered_skips_missing_and_respects_order() {
 
     // Both present: no errors, each table's unique key resolves, and the earlier
     // table shadows the later one on the shared key.
-    let (db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+    let (db, errors) = store
+        .open_layered(&[Table::Game, Table::Lcu])
+        .expect("both are WAD path tables");
     assert!(errors.is_empty());
     assert_eq!(db.get(0x1111).as_deref(), Some("game/only"));
     assert_eq!(db.get(0x2222).as_deref(), Some("lcu/only"));
@@ -156,7 +158,9 @@ fn open_layered_skips_missing_and_respects_order() {
     assert_eq!(db.bases().len(), 2);
 
     // Reversing the request order flips which table wins the shared key.
-    let (db, _) = store.open_layered(&[Table::Lcu, Table::Game]);
+    let (db, _) = store
+        .open_layered(&[Table::Lcu, Table::Game])
+        .expect("both are WAD path tables");
     assert_eq!(db.get(0xAAAA).as_deref(), Some("lcu/shared"));
 }
 
@@ -177,7 +181,9 @@ fn open_layered_reports_missing_table_but_stays_usable() {
         )
         .unwrap();
 
-    let (db, errors) = store.open_layered(&[Table::Game, Table::Lcu]);
+    let (db, errors) = store
+        .open_layered(&[Table::Game, Table::Lcu])
+        .expect("both are WAD path tables");
 
     // The present table still resolves; the missing one is reported, not fatal.
     assert!(db.contains(0x1111));
@@ -187,6 +193,35 @@ fn open_layered_reports_missing_table_but_stays_usable() {
         errors[0],
         (Table::Lcu, OpenError::TableNotFound(Table::Lcu))
     ));
+}
+
+/// `binentries` and `binfields` are both u32 FNV-1a but mean different things, so
+/// layering them would answer a property hash with an object path. Refused up front,
+/// in release builds too - nothing is even opened.
+#[test]
+fn open_layered_refuses_tables_from_different_universes() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    let err = store
+        .open_layered(&[Table::BinEntries, Table::BinFields])
+        .expect_err("different universes");
+
+    assert_eq!(err.first, Table::BinEntries);
+    assert_eq!(err.expected, HashUniverse::BinEntry);
+    assert_eq!(err.table, Table::BinFields);
+    assert_eq!(err.found, HashUniverse::BinField);
+    assert_eq!(
+        Table::BinEntries.key_config(),
+        Table::BinFields.key_config(),
+        "refused despite sharing a key config - that is the point"
+    );
+
+    // No manifest was ever written here, so a set that did open would have failed
+    // with TableNotFound instead; the universe check runs before any of that.
+    assert!(store
+        .open_layered(&[Table::BinEntries, Table::BinEntries])
+        .is_ok());
 }
 
 #[test]

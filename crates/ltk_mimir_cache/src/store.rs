@@ -9,7 +9,8 @@ use ltk_hashdb::{HashDb, LayeredHashDb, WeakHashDb};
 
 use crate::manifest::{Manifest, Source, TableEntry};
 use crate::{
-    dir, fsutil, CommitError, GcError, ManifestError, NoCacheDirError, OpenError, Table, UpdateLock,
+    dir, fsutil, CommitError, GcError, ManifestError, NoCacheDirError, OpenError, Table,
+    UniverseMismatch, UpdateLock,
 };
 
 /// The manifest filename inside the cache directory.
@@ -179,17 +180,50 @@ impl HashStore {
     ///
     /// Tables are opened through [`open_shared`](HashStore::open_shared), so calling
     /// this twice does not map anything twice.
-    pub fn open_layered(&self, tables: &[Table]) -> (LayeredHashDb, Vec<(Table, OpenError)>) {
+    ///
+    /// # Errors
+    ///
+    /// [`UniverseMismatch`] if `tables` spans more than one
+    /// [`HashUniverse`](crate::HashUniverse) - `binentries` under `binfields`, say,
+    /// where one table would answer the other's hashes with an unrelated path. That
+    /// is decided before anything is opened.
+    ///
+    /// A table that is missing, unreadable, or keyed differently than it claims is
+    /// *not* an error here: it lands in the returned per-table list and is left out
+    /// of the layer.
+    pub fn open_layered(
+        &self,
+        tables: &[Table],
+    ) -> Result<(LayeredHashDb, Vec<(Table, OpenError)>), UniverseMismatch> {
+        if let Some((&first, rest)) = tables.split_first() {
+            let expected = first.universe();
+            if let Some(&table) = rest.iter().find(|t| t.universe() != expected) {
+                return Err(UniverseMismatch {
+                    first,
+                    expected,
+                    table,
+                    found: table.universe(),
+                });
+            }
+        }
+
         let mut layered = LayeredHashDb::new();
         let mut errors = Vec::new();
         for &table in tables {
             match self.open_shared(table) {
-                Ok(db) => layered.push_base(db),
+                // One universe implies one key config, so this only fires on a file
+                // that is not the table it is filed under - a mislabelled download,
+                // not a caller mistake. Skip it like any other unusable table.
+                Ok(db) => {
+                    if let Err(e) = layered.push_base(db) {
+                        errors.push((table, e.into()));
+                    }
+                }
                 Err(e) => errors.push((table, e)),
             }
         }
 
-        (layered, errors)
+        Ok((layered, errors))
     }
 
     /// Try to become the single updater without blocking. `Ok(None)` means another

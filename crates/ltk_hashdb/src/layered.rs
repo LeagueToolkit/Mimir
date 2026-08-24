@@ -3,14 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{Casing, HashDb, HashKind, KeyWidth, PathRef};
-
-/// The key configuration a base hashes under. Every base in a [`LayeredHashDb`]
-/// must agree on this triple; a base that diverges can never be hit by a caller's
-/// precomputed probe (see the type-level invariant).
-fn base_config(db: &HashDb) -> (KeyWidth, HashKind, Casing) {
-    (db.key_width(), db.hash_kind(), db.casing())
-}
+use crate::{HashDb, KeyConfigMismatch, PathRef};
 
 /// A writable in-memory overlay on top of ordered read-only [`HashDb`] bases.
 ///
@@ -24,13 +17,16 @@ fn base_config(db: &HashDb) -> (KeyWidth, HashKind, Casing) {
 /// Lookups take a `u64` the caller already computed, and each base binary-searches
 /// its own key set with that raw value - there is no per-base re-hashing. So every
 /// base (and any path registered via [`insert_path`](Self::insert_path)) must share
-/// the same key configuration: [`key_width`](HashDb::key_width),
-/// [`hash_kind`](HashDb::hash_kind), and [`casing`](HashDb::casing). A base that
-/// diverges is silently unreachable - the caller's probes were hashed for a
-/// different scheme, so they can never match it. [`push_base`](Self::push_base) and
-/// [`from_bases`](Self::from_bases) `debug_assert!` this; release builds skip the
-/// check. League's `game`/`lcu` tables are uniform (XXH64 / U64 / case-insensitive),
-/// so the common path always satisfies it.
+/// one [`KeyConfig`](crate::KeyConfig). A base that diverges is unreachable - the caller's probes were
+/// hashed for a different scheme, so they can never match it - which is why
+/// [`push_base`](Self::push_base) and [`from_bases`](Self::from_bases) refuse one
+/// instead of layering it. League's `game`/`lcu` tables are uniform (u64 / xxh64 /
+/// ascii-case-insensitive), so the common path always satisfies it.
+///
+/// A shared key config is necessary, not sufficient: it says two bases *can* answer
+/// each other's probes, not that they *should*. `binentries` and `binfields` share
+/// one and mean entirely different things, so `HashStore::open_layered` refuses that
+/// pairing on top of this check.
 #[derive(Default)]
 pub struct LayeredHashDb {
     overlay: HashMap<u64, Box<str>>,
@@ -46,39 +42,53 @@ impl LayeredHashDb {
     }
 
     /// Layer an empty overlay over `bases`, in the given priority order (`bases[0]`
-    /// shadows `bases[1]`, and so on). In debug builds, asserts every base shares
-    /// the first one's key configuration (see the type-level invariant).
-    pub fn from_bases(bases: Vec<HashDb>) -> Self {
+    /// shadows `bases[1]`, and so on).
+    ///
+    /// # Errors
+    ///
+    /// [`KeyConfigMismatch`] if any base hashes its keys differently from `bases[0]`
+    /// - see the type-level invariant.
+    pub fn from_bases(bases: Vec<HashDb>) -> Result<Self, KeyConfigMismatch> {
         if let Some((first, rest)) = bases.split_first() {
-            let cfg = base_config(first);
-            for db in rest {
-                debug_assert_eq!(
-                    base_config(db),
-                    cfg,
-                    "LayeredHashDb bases must share key config (key_width/hash_kind/casing); \
-                     a divergent base is unreachable by a caller's precomputed probe"
-                );
+            let expected = first.key_config();
+            for (i, db) in rest.iter().enumerate() {
+                let found = db.key_config();
+                if found != expected {
+                    return Err(KeyConfigMismatch {
+                        index: i + 1,
+                        expected,
+                        found,
+                    });
+                }
             }
         }
 
-        Self {
+        Ok(Self {
             overlay: HashMap::new(),
             bases,
-        }
+        })
     }
 
     /// Append a lower-priority base below all existing ones.
-    pub fn push_base(&mut self, db: HashDb) {
+    ///
+    /// # Errors
+    ///
+    /// [`KeyConfigMismatch`] if `db` hashes its keys differently from the first base
+    /// - see the type-level invariant. The layer is left untouched.
+    pub fn push_base(&mut self, db: HashDb) -> Result<(), KeyConfigMismatch> {
         if let Some(first) = self.bases.first() {
-            debug_assert_eq!(
-                base_config(&db),
-                base_config(first),
-                "LayeredHashDb bases must share key config (key_width/hash_kind/casing); \
-                 a divergent base is unreachable by a caller's precomputed probe"
-            );
+            let (expected, found) = (first.key_config(), db.key_config());
+            if found != expected {
+                return Err(KeyConfigMismatch {
+                    index: self.bases.len(),
+                    expected,
+                    found,
+                });
+            }
         }
 
         self.bases.push(db);
+        Ok(())
     }
 
     /// Insert an overlay entry (e.g. a runtime mod hash). Shadows every base.
@@ -328,7 +338,7 @@ mod tests {
     fn layering_order_shadows_lower_layers() {
         let base0 = raw_db(&[(1, "base0/one"), (2, "base0/two")]);
         let base1 = raw_db(&[(2, "base1/two"), (3, "base1/three")]);
-        let mut db = LayeredHashDb::from_bases(vec![base0, base1]);
+        let mut db = LayeredHashDb::from_bases(vec![base0, base1]).expect("uniform bases");
         db.insert(1, "overlay/one");
 
         // Overlay shadows base 0.
@@ -347,7 +357,7 @@ mod tests {
     fn get_and_get_batch_agree_in_input_order() {
         let base0 = raw_db(&[(10, "base0/ten"), (20, "shadowed")]);
         let base1 = raw_db(&[(20, "base1/twenty"), (30, "base1/thirty")]);
-        let mut db = LayeredHashDb::from_bases(vec![base0, base1]);
+        let mut db = LayeredHashDb::from_bases(vec![base0, base1]).expect("uniform bases");
         db.insert(5, "overlay/five");
 
         // Mixed set: overlay hit, base-0 hit, base-1 hit, miss, duplicate.
@@ -369,7 +379,7 @@ mod tests {
         let base = compressed_db(256);
         let frames = base.decompressions(); // 0 before any read
         assert_eq!(frames, 0);
-        let db = LayeredHashDb::from_bases(vec![base]);
+        let db = LayeredHashDb::from_bases(vec![base]).expect("uniform bases");
 
         // Batch every real key (i*3 for i in 0..100) plus some misses.
         let mut probes: Vec<u64> = (0..100u64).map(|i| i * 3).collect();
@@ -401,24 +411,33 @@ mod tests {
         assert!(db.bases().is_empty());
     }
 
+    /// A U32 base under a U64 one is unreachable, so it is refused - in release
+    /// builds too, which is the point of this not being a `debug_assert!`.
     #[test]
-    #[should_panic(expected = "must share key config")]
     fn push_base_rejects_divergent_key_config() {
         let u64_base = raw_db_width(KeyWidth::U64, &[(1, "u64/one")]);
         let u32_base = raw_db_width(KeyWidth::U32, &[(2, "u32/two")]);
-        let mut db = LayeredHashDb::from_bases(vec![u64_base]);
+        let mut db = LayeredHashDb::from_bases(vec![u64_base]).expect("one base");
 
-        // Debug-only guard: layering a U32 base under a U64 base is unreachable.
-        db.push_base(u32_base);
+        let err = db.push_base(u32_base).expect_err("divergent base refused");
+        assert_eq!(err.index, 1);
+        assert_eq!(err.expected.key_width(), KeyWidth::U64);
+        assert_eq!(err.found.key_width(), KeyWidth::U32);
+        assert_eq!(db.bases().len(), 1, "the layer is left untouched");
     }
 
     #[test]
-    #[should_panic(expected = "must share key config")]
     fn from_bases_rejects_divergent_key_config() {
         let u64_base = raw_db_width(KeyWidth::U64, &[(1, "u64/one")]);
         let u32_base = raw_db_width(KeyWidth::U32, &[(2, "u32/two")]);
 
-        let _ = LayeredHashDb::from_bases(vec![u64_base, u32_base]);
+        let err = LayeredHashDb::from_bases(vec![u64_base, u32_base]).expect_err("divergent base");
+        assert_eq!(err.index, 1);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("u64/") && msg.contains("u32/"),
+            "names both configs: {msg}"
+        );
     }
 
     /// `iter` enumerates exactly what `get` can resolve: every shadowed key is
@@ -427,7 +446,7 @@ mod tests {
     fn iter_yields_each_key_once_from_its_answering_layer() {
         let base0 = raw_db(&[(1, "base0/one"), (2, "base0/two")]);
         let base1 = raw_db(&[(2, "base1/two"), (3, "base1/three")]);
-        let mut db = LayeredHashDb::from_bases(vec![base0, base1]);
+        let mut db = LayeredHashDb::from_bases(vec![base0, base1]).expect("uniform bases");
         db.insert(1, "overlay/one");
 
         let mut seen: Vec<(u64, String)> = db
@@ -458,7 +477,7 @@ mod tests {
     fn for_each_batch_matches_get_batch() {
         let base0 = raw_db(&[(10, "base0/ten"), (20, "shadowed")]);
         let base1 = raw_db(&[(20, "base1/twenty"), (30, "base1/thirty")]);
-        let mut db = LayeredHashDb::from_bases(vec![base0, base1]);
+        let mut db = LayeredHashDb::from_bases(vec![base0, base1]).expect("uniform bases");
         db.insert(5, "overlay/five");
 
         let probes = [5u64, 10, 20, 30, 999, 10];
@@ -477,7 +496,8 @@ mod tests {
     /// Debug prints shape, never entries.
     #[test]
     fn debug_prints_shape_only() {
-        let mut db = LayeredHashDb::from_bases(vec![raw_db(&[(1, "secret/path.bin")])]);
+        let mut db =
+            LayeredHashDb::from_bases(vec![raw_db(&[(1, "secret/path.bin")])]).expect("one base");
         db.insert(2, "overlay/secret.bin");
 
         let shown = format!("{db:?}");
@@ -489,7 +509,7 @@ mod tests {
     #[test]
     fn insert_path_uses_first_base() {
         let base = raw_db(&[(1, "seed")]);
-        let mut db = LayeredHashDb::from_bases(vec![base]);
+        let mut db = LayeredHashDb::from_bases(vec![base]).expect("uniform bases");
         let path = "assets/characters/aatrox/aatrox.bin";
         let hash = db.insert_path(path).expect("has a base");
         assert_eq!(db.get(hash).as_deref(), Some(path));

@@ -3,6 +3,8 @@
 
 use thiserror::Error;
 
+use crate::KeyConfig;
+
 /// Errors from opening a `.hashdb` file ([`HashDb::open`] / [`HashDb::open_bytes`]):
 /// I/O, or the untrusted header/section-bounds validation rejecting the file.
 ///
@@ -70,4 +72,23 @@ pub enum BuildError {
 
     #[error("zstd seekable format error")]
     Zeekstd(#[from] zeekstd::Error),
+}
+
+/// A base rejected by [`LayeredHashDb`] because it does not hash its keys the way
+/// the rest of the layer does.
+///
+/// [`LayeredHashDb`]: crate::LayeredHashDb
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "base {index} is keyed {found}, but the layer is keyed {expected}; a base that hashes      differently can never be hit by a caller's precomputed probe"
+)]
+pub struct KeyConfigMismatch {
+    /// Position of the rejected base, counting the ones already layered.
+    pub index: usize,
+
+    /// What the layer hashes under - its first base's configuration.
+    pub expected: KeyConfig,
+
+    /// What the rejected base hashes under.
+    pub found: KeyConfig,
 }

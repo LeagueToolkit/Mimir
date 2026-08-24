@@ -344,7 +344,7 @@ fn bad_magic_rejected() {
 fn overlay_shadows_a_real_base_table() {
     let bytes = build(KeyWidth::U64, HashKind::Xxh64, GAME_ENTRIES);
     let db = HashDb::open_bytes(bytes).expect("open");
-    let mut layered = LayeredHashDb::from_bases(vec![db]);
+    let mut layered = LayeredHashDb::from_bases(vec![db]).expect("one base");
 
     // Base entries still resolve.
     assert_eq!(

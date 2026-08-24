@@ -8,7 +8,7 @@ use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use xxhash_rust::xxh3::Xxh3;
 use zeekstd::SeekTable;
@@ -105,6 +105,23 @@ impl HashDbOptions {
 #[derive(Clone)]
 pub struct HashDb {
     inner: Arc<Inner>,
+}
+
+/// A handle that does not keep its table mapped.
+///
+/// For a registry of open tables: keep these rather than [`HashDb`]s so the registry
+/// does not pin every table anyone ever opened. [`upgrade`](WeakHashDb::upgrade) hands
+/// back a live handle while one is still held elsewhere.
+#[derive(Clone, Debug)]
+pub struct WeakHashDb {
+    inner: Weak<Inner>,
+}
+
+impl WeakHashDb {
+    /// A live handle to the table, or `None` once the last one was dropped.
+    pub fn upgrade(&self) -> Option<HashDb> {
+        self.inner.upgrade().map(|inner| HashDb { inner })
+    }
 }
 
 /// Everything a table's clones share: the bytes, where the sections are, and the
@@ -237,6 +254,13 @@ impl HashDb {
     /// Open-time knobs - the frame cache budget, today.
     pub fn options() -> HashDbOptions {
         HashDbOptions::default()
+    }
+
+    /// A handle that does not keep this table mapped - see [`WeakHashDb`].
+    pub fn downgrade(&self) -> WeakHashDb {
+        WeakHashDb {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     fn from_backing(backing: Backing, options: HashDbOptions) -> Result<Self, OpenError> {

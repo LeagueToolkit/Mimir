@@ -1,9 +1,11 @@
 //! [`HashStore`]: the shared cache directory and everything that reads or mutates it -
 //! opening the active table, committing new immutable versions, and GC'ing old ones.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use ltk_hashdb::{HashDb, LayeredHashDb};
+use ltk_hashdb::{HashDb, LayeredHashDb, WeakHashDb};
 
 use crate::manifest::{Manifest, Source, TableEntry};
 use crate::{
@@ -21,9 +23,18 @@ const TABLE_EXT: &str = "lhdb";
 ///
 /// Construction is cheap and does not touch the filesystem; the directory is created
 /// lazily on the first [`commit`](HashStore::commit).
+///
+/// A store also remembers the tables it has opened through
+/// [`open_shared`](HashStore::open_shared), weakly - clones of a store share that
+/// register, two stores built separately do not, and a table drops out of it as soon as
+/// the last handle to it does.
 #[derive(Debug, Clone)]
 pub struct HashStore {
     dir: PathBuf,
+
+    /// Tables opened through `open_shared`, keyed by their active file. Weak, so the
+    /// register never keeps a superseded version mapped.
+    opened: Arc<Mutex<HashMap<PathBuf, WeakHashDb>>>,
 }
 
 /// One table to install in a [`commit`](HashStore::commit) call.
@@ -63,14 +74,15 @@ impl HashStore {
     /// Resolve the cache directory from the environment / platform. Does not
     /// create it.
     pub fn discover() -> Result<Self, NoCacheDirError> {
-        Ok(Self {
-            dir: dir::resolve()?,
-        })
+        Ok(Self::at(dir::resolve()?))
     }
 
     /// Use an explicit cache directory (tests, `--dir` overrides).
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            opened: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The cache directory.
@@ -103,8 +115,51 @@ impl HashStore {
     /// Structure is validated on open; the download-time sha256 in the manifest is
     /// trusted, so this stays cheap and lazy. Use [`HashDb::verify`] for a full
     /// checksum pass.
+    ///
+    /// Every call maps the file afresh. Use [`open_shared`](HashStore::open_shared)
+    /// when the same table may already be open in this process.
     pub fn open(&self, table: Table) -> Result<HashDb, OpenError> {
         Ok(HashDb::open(self.path_for(table)?)?)
+    }
+
+    /// Open the active version of `table`, reusing a handle this store already has.
+    ///
+    /// [`open`](HashStore::open) maps the file and parses its seek table every time -
+    /// on `game` that is over ten thousand frame records for a table the process may
+    /// already have open. This hands back the existing handle instead, and because the
+    /// register is keyed on the manifest's active filename, an update published in the
+    /// meantime opens the new version by itself rather than serving the old one.
+    ///
+    /// Prefer it wherever a table is opened more than once. The returned handle is a
+    /// [`HashDb`] like any other - cheap to clone, shared frame cache.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`open`](HashStore::open): a missing manifest, a table the manifest
+    /// does not carry, or a file that does not validate.
+    pub fn open_shared(&self, table: Table) -> Result<HashDb, OpenError> {
+        let path = self.path_for(table)?;
+        if let Some(db) = self.registered(&path) {
+            return Ok(db);
+        }
+
+        // Opened outside the lock: two threads racing on one table each get a working
+        // handle and the loser's simply isn't the one registered, which is cheaper than
+        // holding a lock across an mmap and a seek-table parse.
+        let db = HashDb::open(&path)?;
+
+        let mut opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
+        opened.insert(path, db.downgrade());
+        // Superseded versions leave dead entries behind; sweep them while we hold the
+        // lock, so a long-lived store doesn't accumulate one per update.
+        opened.retain(|_, weak| weak.upgrade().is_some());
+
+        Ok(db)
+    }
+
+    fn registered(&self, path: &Path) -> Option<HashDb> {
+        let opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
+        opened.get(path).and_then(WeakHashDb::upgrade)
     }
 
     /// Open several tables, pairing each with its result so callers can warn-and-skip
@@ -121,11 +176,14 @@ impl HashStore {
     /// A tool stays usable when a table is missing: its hashes just miss. This is
     /// the shape most WAD consumers want - e.g.
     /// `open_layered(&[Table::Game, Table::Lcu])`.
+    ///
+    /// Tables are opened through [`open_shared`](HashStore::open_shared), so calling
+    /// this twice does not map anything twice.
     pub fn open_layered(&self, tables: &[Table]) -> (LayeredHashDb, Vec<(Table, OpenError)>) {
         let mut layered = LayeredHashDb::new();
         let mut errors = Vec::new();
-        for (table, res) in self.open_many(tables) {
-            match res {
+        for &table in tables {
+            match self.open_shared(table) {
                 Ok(db) => layered.push_base(db),
                 Err(e) => errors.push((table, e)),
             }

@@ -22,7 +22,7 @@ pub use hash::{Casing, HashKind};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use layered::LayeredHashDb;
 pub use path::PathRef;
-pub use reader::{HashDb, HashDbOptions, DEFAULT_FRAME_CACHE_BYTES};
+pub use reader::{HashDb, HashDbOptions, WeakHashDb, DEFAULT_FRAME_CACHE_BYTES};
 pub use writer::{BuildStats, HashDbWriter};
 
 /// Width of the integer keys in a table.

@@ -51,6 +51,18 @@ fn fresh_install_downloads_everything() {
     let db = store.open(Table::Game).unwrap();
     assert_eq!(db.get(0x11aa).as_deref(), Some("assets/foo.bin"));
     let manifest = store.manifest().unwrap();
+    let entry = manifest.entry(Table::Game).unwrap();
+    assert_eq!(
+        (entry.version.as_str(), entry.format_version),
+        ("2026-07-10", ltk_hashdb::FORMAT_VERSION),
+        "a consumer can name the version without parsing {:?}",
+        entry.file
+    );
+    assert!(
+        manifest.generated_at_time().is_some(),
+        "and can tell how stale it is: {:?}",
+        manifest.generated_at
+    );
     assert_eq!(
         manifest.source.unwrap().repo.as_deref(),
         Some("test/data"),
@@ -296,6 +308,7 @@ fn unknown_remote_table_is_skipped() {
                 sha256: "0".repeat(64),
                 entries: 0,
                 key_width: 8,
+                version: "1".into(),
                 format_version: ltk_hashdb::FORMAT_VERSION,
             },
         );

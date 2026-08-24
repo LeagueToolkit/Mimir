@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -70,6 +70,16 @@ pub struct TableEntry {
     pub entries: u64,
     pub key_width: u8,
 
+    /// The version label this table was published under, e.g. `2026-07-10`.
+    ///
+    /// The same label the filename embeds, lifted out so a consumer can say
+    /// `game 2026-07-10` without knowing how release filenames are spelled.
+    /// Manifests written before this field existed are backfilled from the
+    /// filename on read, so it is empty only for an entry whose filename does
+    /// not follow the convention either.
+    #[serde(default)]
+    pub version: String,
+
     /// The `.hashdb` format version `file` is written in.
     ///
     /// Per table, not per manifest, so one release can carry a table in a new
@@ -124,6 +134,26 @@ impl Manifest {
         self.tables.get(table.id())
     }
 
+    /// When this manifest was written, parsed from
+    /// [`generated_at`](Manifest::generated_at).
+    ///
+    /// [`SystemTime`] rather than a `time` type on purpose: "how old is this
+    /// cache" is `manifest.generated_at_time()?.elapsed()`, and answering it
+    /// should not pin a consumer to this crate's date library.
+    ///
+    /// `None` when the field is empty or not RFC-3339 - it is a string in the
+    /// document, and a manifest is downloaded input.
+    pub fn generated_at_time(&self) -> Option<SystemTime> {
+        let parsed = OffsetDateTime::parse(&self.generated_at, &Rfc3339).ok()?;
+        let secs = parsed.unix_timestamp();
+        // Pre-epoch stamps are nonsense here, but they are cheap to honour.
+        Some(if secs >= 0 {
+            UNIX_EPOCH + Duration::from_secs(secs as u64)
+        } else {
+            UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+        })
+    }
+
     /// Parse a manifest, refusing only what this build genuinely cannot use.
     ///
     /// [`schema`](Manifest::schema) is not an equality gate. The document grows
@@ -145,7 +175,7 @@ impl Manifest {
     /// ever published, and [`ManifestError::ReaderTooOld`] when the manifest
     /// asks for a newer reader than this.
     pub fn from_slice(bytes: &[u8]) -> Result<Self, ManifestError> {
-        let manifest: Manifest = serde_json::from_slice(bytes)?;
+        let mut manifest: Manifest = serde_json::from_slice(bytes)?;
         if manifest.schema < OLDEST_SCHEMA {
             return Err(ManifestError::UnsupportedSchema(manifest.schema));
         }
@@ -155,6 +185,16 @@ impl Manifest {
                     required,
                     supported: SCHEMA_VERSION,
                 });
+            }
+        }
+
+        // Before `version` existed the label lived only in the filename, which
+        // is where every manifest we have ever written still spells it.
+        for (id, entry) in &mut manifest.tables {
+            if entry.version.is_empty() {
+                if let Some(version) = Table::from_id(id).and_then(|t| version_of(t, &entry.file)) {
+                    entry.version = version.to_owned();
+                }
             }
         }
 
@@ -179,6 +219,19 @@ impl Manifest {
         fsutil::atomic_write(path, &json)?;
         Ok(())
     }
+}
+
+/// The version label embedded in a release filename (`<id>-<version>.lhdb`).
+///
+/// The manifest is remote input and the filename is reused locally, so anything
+/// that is not a clean path component is rejected via [`is_valid_version`].
+pub(crate) fn version_of(table: Table, file: &str) -> Option<&str> {
+    let version = file
+        .strip_prefix(table.id())?
+        .strip_prefix('-')?
+        .strip_suffix(".lhdb")?;
+
+    crate::store::is_valid_version(version).then_some(version)
 }
 
 /// The current time as an RFC-3339 UTC string, e.g. `2026-07-08T12:34:56Z`.
@@ -263,6 +316,44 @@ mod tests {
         let json = r#"{"schema": 0, "generated_at": "", "tables": {}}"#;
         let err = Manifest::from_slice(json.as_bytes()).unwrap_err();
         assert!(matches!(err, ManifestError::UnsupportedSchema(0)), "{err}");
+    }
+
+    /// A manifest written before `version` existed still knows its versions -
+    /// the label has always been in the filename.
+    #[test]
+    fn a_versionless_entry_is_backfilled_from_its_filename() {
+        let manifest = Manifest::from_slice(FROM_THE_FUTURE.as_bytes()).expect("parses");
+        assert_eq!(manifest.entry(Table::Game).unwrap().version, "2026-07-10");
+    }
+
+    /// A filename that does not follow the convention leaves the version empty
+    /// rather than inventing one.
+    #[test]
+    fn an_unconventional_filename_backfills_nothing() {
+        let json = r#"{
+            "schema": 1,
+            "generated_at": "",
+            "tables": {
+                "game": {"file": "whatever.bin", "sha256": "", "entries": 0, "key_width": 8}
+            }
+        }"#;
+        let manifest = Manifest::from_slice(json.as_bytes()).expect("parses");
+        assert!(manifest.entry(Table::Game).unwrap().version.is_empty());
+    }
+
+    /// The pair a consumer asks "how stale is this cache" with.
+    #[test]
+    fn generated_at_parses_back_to_the_instant_it_records() {
+        // 2026-07-08T00:00:00Z, per `rfc3339_matches_known_epochs`.
+        let secs = 1_783_468_800;
+        let mut manifest = Manifest::empty();
+        manifest.generated_at = format_rfc3339(secs);
+
+        let at = manifest.generated_at_time().expect("round-trips");
+        assert_eq!(at.duration_since(UNIX_EPOCH).unwrap().as_secs(), secs);
+
+        manifest.generated_at = "the eighth of July".into();
+        assert!(manifest.generated_at_time().is_none(), "not a timestamp");
     }
 
     /// The channel a build asks for is named after the format it can read.

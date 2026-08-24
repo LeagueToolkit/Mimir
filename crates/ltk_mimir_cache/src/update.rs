@@ -11,7 +11,8 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 
-use crate::store::{is_valid_version, MANIFEST_FILE};
+use crate::manifest::version_of;
+use crate::store::MANIFEST_FILE;
 use crate::{
     fsutil, CommitItem, GcReport, HashStore, Manifest, ManifestError, Source, Table, TableEntry,
     UpdateError,
@@ -402,18 +403,6 @@ async fn fetch_async<F: AsyncFetch + ?Sized>(
             file: filename.to_string(),
             source,
         })
-}
-
-/// The version label embedded in a release filename (`<id>-<version>.lhdb`).
-/// The manifest is remote input and the filename is reused locally, so anything
-/// that is not a clean path component is rejected via [`is_valid_version`].
-fn version_of(table: Table, file: &str) -> Option<&str> {
-    let version = file
-        .strip_prefix(table.id())?
-        .strip_prefix('-')?
-        .strip_suffix(".lhdb")?;
-
-    is_valid_version(version).then_some(version)
 }
 
 #[cfg(test)]

@@ -298,6 +298,7 @@ impl HashStore {
                     sha256,
                     entries,
                     key_width,
+                    version: item.version.clone(),
                     // We just opened it, and `open` is what enforces the version.
                     format_version: ltk_hashdb::FORMAT_VERSION,
                 },

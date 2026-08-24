@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use ltk_hashdb::{Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Compression, HashDb, HashDbWriter, KeyConfig};
 use ltk_mimir_cache::{HashStore, Table as CacheTable};
 use ltk_mimir_gen::guessers::{
     CharacterSkin, CrossReference, ExtensionSwap, NumericRange, PrefixVariants, RegionLocale,
@@ -41,24 +41,10 @@ enum Table {
 }
 
 impl Table {
-    fn key_width(self) -> KeyWidth {
-        match self {
-            Self::Game | Self::Lcu | Self::Rst | Self::RstXxh3 => KeyWidth::U64,
-            _ => KeyWidth::U32,
-        }
-    }
-
-    fn hash_kind(self) -> HashKind {
-        match self {
-            Self::Game | Self::Lcu | Self::Rst => HashKind::Xxh64,
-            Self::RstXxh3 => HashKind::Xxh3,
-            _ => HashKind::Fnv1a32,
-        }
-    }
-
-    /// Every League table hashes the lowercased path.
-    fn casing(self) -> Casing {
-        Casing::AsciiInsensitive
+    /// Key width, hash algorithm, and casing rule - stated once, on the library
+    /// table this maps to.
+    fn key_config(self) -> KeyConfig {
+        self.cache().key_config()
     }
 
     /// The corresponding shared-cache table.
@@ -347,9 +333,7 @@ fn read_hash_lines(input: &Path, mut on_entry: impl FnMut(u64, &str, &str)) -> R
 }
 
 fn build(input: PathBuf, table: Table, out: PathBuf, compression: Compression) -> Result<()> {
-    let mut writer = HashDbWriter::new(table.key_width(), compression)
-        .hash_kind(table.hash_kind())
-        .casing(table.casing());
+    let mut writer = HashDbWriter::with_key_config(table.key_config(), compression);
     read_hash_lines(&input, |hash, _, path| {
         writer.insert(hash, path);
     })?;
@@ -380,7 +364,7 @@ fn gen_hashes(
     max_skin: u32,
     out: PathBuf,
 ) -> Result<()> {
-    let mut ctx = GuessContext::new(table.hash_kind(), table.casing(), table.key_width());
+    let mut ctx = GuessContext::new(table.key_config());
     let mut known_hashes = HashSet::new();
     for input in &known {
         let mut paths = Vec::new();
@@ -499,7 +483,7 @@ fn gen_hashes(
 
     let mut out_file =
         BufWriter::new(File::create(&out).with_context(|| format!("creating {}", out.display()))?);
-    let hex_width = 2 * table.key_width().bytes();
+    let hex_width = 2 * table.key_config().key_width().bytes();
     // The game-class CDragon lists store paths lowercased (the bin lists keep
     // original casing); match, so merging finds into a list never produces
     // case-only duplicates of the same hash.

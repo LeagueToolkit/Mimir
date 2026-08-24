@@ -132,6 +132,54 @@ impl fmt::Display for HashKind {
     }
 }
 
+/// How a table's keys were produced: key width, hash algorithm, casing rule.
+///
+/// The three only ever mean something together - a `u64` probe is answerable by a
+/// table only when all three of them agree - so they travel as one value.
+/// [`HashDb::key_config`](crate::HashDb::key_config) reports a table's, and
+/// [`LayeredHashDb`](crate::LayeredHashDb) requires every base to share one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyConfig {
+    key_width: KeyWidth,
+    hash_kind: HashKind,
+    casing: Casing,
+}
+
+impl KeyConfig {
+    /// A configuration from its three parts.
+    pub const fn new(key_width: KeyWidth, hash_kind: HashKind, casing: Casing) -> Self {
+        Self {
+            key_width,
+            hash_kind,
+            casing,
+        }
+    }
+
+    pub const fn key_width(self) -> KeyWidth {
+        self.key_width
+    }
+
+    pub const fn hash_kind(self) -> HashKind {
+        self.hash_kind
+    }
+
+    pub const fn casing(self) -> Casing {
+        self.casing
+    }
+
+    /// Hash `path` the way this table's keys were produced.
+    pub fn hash(self, path: &str) -> u64 {
+        self.hash_kind.hash(path, self.casing, self.key_width)
+    }
+}
+
+impl fmt::Display for KeyConfig {
+    /// `u64/xxh64/ascii-case-insensitive`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/{}", self.key_width, self.hash_kind, self.casing)
+    }
+}
+
 /// Mixed-case paths up to this length lowercase on the stack; longer ones fall
 /// back to a heap allocation. Real paths max out around 200 bytes.
 const LOWER_STACK: usize = 512;

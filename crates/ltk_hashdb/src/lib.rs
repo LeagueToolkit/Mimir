@@ -18,7 +18,7 @@ mod reader;
 mod writer;
 
 pub use error::{BuildError, OpenError, VerifyError};
-pub use hash::{Casing, HashKind};
+pub use hash::{Casing, HashKind, KeyConfig};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use layered::LayeredHashDb;
 pub use path::PathRef;

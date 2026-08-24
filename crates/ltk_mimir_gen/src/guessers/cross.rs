@@ -58,10 +58,14 @@ fn strip_plugin_mount(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ltk_hashdb::{Casing, HashKind, KeyWidth};
+    use ltk_hashdb::{Casing, HashKind, KeyConfig, KeyWidth};
 
     fn hunt(known: &[&str], unknown_paths: &[&str]) -> Vec<String> {
-        let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::AsciiInsensitive, KeyWidth::U64);
+        let mut ctx = GuessContext::new(KeyConfig::new(
+            KeyWidth::U64,
+            HashKind::Xxh64,
+            Casing::AsciiInsensitive,
+        ));
         ctx.add_known(known.iter().map(|s| s.to_string()));
         let hashes: Vec<u64> = unknown_paths
             .iter()

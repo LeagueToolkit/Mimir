@@ -353,11 +353,11 @@ for path-shaped tokens), and the chunk table *is* the unknown set:
 ```rust
 use ltk_mimir_gen::guessers::SeedStrings;
 use ltk_mimir_gen::{mine_wad, GuessContext, Hunt};
-use ltk_hashdb::{Casing, HashKind, KeyWidth};
+use ltk_mimir_cache::Table;
 
 let mined = mine_wad("Ahri.wad.client".as_ref())?;      // seed strings + chunk hashes
 
-let mut ctx = GuessContext::new(HashKind::Xxh64, Casing::AsciiInsensitive, KeyWidth::U64);
+let mut ctx = GuessContext::new(Table::Game.key_config());
 ctx.add_known(db.iter().map(|(_, p)| p.into_owned()));  // corpus to mutate from
 ctx.add_unknown(mined.chunk_hashes.into_iter().filter(|&h| !db.contains(h)));
 

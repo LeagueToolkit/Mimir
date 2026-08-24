@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use ltk_hashdb::{Casing, HashKind, KeyWidth};
+use ltk_hashdb::KeyConfig;
 
 use crate::guessers::util::champ_of;
 use crate::UnknownSet;
@@ -45,14 +45,12 @@ const BUILTIN_EXTENSIONS: &[&str] = &[
 ];
 
 /// Everything a [`crate::Guesser`] draws candidates from: the known-path corpus,
-/// the set of still-unknown hashes, and the table's hash algorithm.
+/// the set of still-unknown hashes, and the table's key configuration.
 ///
 /// [`crate::Hunt::run`] grows the corpus and shrinks the unknown set as rounds
 /// resolve hashes.
 pub struct GuessContext {
-    hash_kind: HashKind,
-    casing: Casing,
-    key_width: KeyWidth,
+    key_config: KeyConfig,
     known: Vec<Box<str>>,
     unknown: UnknownSet,
     // Derived from `known`; rebuilt lazily after each promotion.
@@ -62,11 +60,11 @@ pub struct GuessContext {
 }
 
 impl GuessContext {
-    pub fn new(hash_kind: HashKind, casing: Casing, key_width: KeyWidth) -> Self {
+    /// A context for a table hashed under `key_config` - for a League table,
+    /// `Table::key_config()`.
+    pub fn new(key_config: KeyConfig) -> Self {
         Self {
-            hash_kind,
-            casing,
-            key_width,
+            key_config,
             known: Vec::new(),
             unknown: UnknownSet::new(Vec::new()),
             wordlist: OnceLock::new(),
@@ -97,16 +95,9 @@ impl GuessContext {
         self.unknown = UnknownSet::new(keys);
     }
 
-    pub fn hash_kind(&self) -> HashKind {
-        self.hash_kind
-    }
-
-    pub fn casing(&self) -> Casing {
-        self.casing
-    }
-
-    pub fn key_width(&self) -> KeyWidth {
-        self.key_width
+    /// How this table's keys were produced - what candidates are hashed under.
+    pub fn key_config(&self) -> KeyConfig {
+        self.key_config
     }
 
     pub fn known_paths(&self) -> &[Box<str>] {
@@ -119,7 +110,7 @@ impl GuessContext {
 
     /// Hash a candidate with this table's algorithm and casing rule.
     pub fn hash_candidate(&self, candidate: &str) -> u64 {
-        self.hash_kind.hash(candidate, self.casing, self.key_width)
+        self.key_config.hash(candidate)
     }
 
     /// Vocabulary mined from the known corpus: path segments split on
@@ -160,7 +151,7 @@ impl GuessContext {
     }
 
     /// File extensions (no leading dot): everything seen in the known corpus
-    /// merged with [`BUILTIN_EXTENSIONS`]. Sorted and deduped.
+    /// merged with `BUILTIN_EXTENSIONS`. Sorted and deduped.
     pub fn extensions(&self) -> &[Box<str>] {
         self.extensions.get_or_init(|| {
             let mut exts: HashSet<&str> = BUILTIN_EXTENSIONS.iter().copied().collect();
@@ -204,9 +195,7 @@ impl GuessContext {
 /// Where guessers report candidates. Hashes the candidate, tests it against
 /// the unknown set, and collects hits. Shared across rayon threads.
 pub struct CandidateSink<'a> {
-    hash_kind: HashKind,
-    casing: Casing,
-    key_width: KeyWidth,
+    key_config: KeyConfig,
     unknown: &'a UnknownSet,
     tried: AtomicU64,
     found: Mutex<Vec<(u64, String)>>,
@@ -215,9 +204,7 @@ pub struct CandidateSink<'a> {
 impl<'a> CandidateSink<'a> {
     pub fn new(ctx: &'a GuessContext) -> Self {
         Self {
-            hash_kind: ctx.hash_kind,
-            casing: ctx.casing,
-            key_width: ctx.key_width,
+            key_config: ctx.key_config,
             unknown: &ctx.unknown,
             tried: AtomicU64::new(0),
             found: Mutex::new(Vec::new()),
@@ -228,7 +215,7 @@ impl<'a> CandidateSink<'a> {
     pub fn check(&self, candidate: &str) {
         self.tried.fetch_add(1, Ordering::Relaxed);
 
-        let hash = self.hash_kind.hash(candidate, self.casing, self.key_width);
+        let hash = self.key_config.hash(candidate);
         if !self.unknown.contains(hash) {
             return;
         }

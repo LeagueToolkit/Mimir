@@ -226,7 +226,14 @@ enum Command {
     },
 
     /// Structural + checksum validation of a .hashdb file.
-    Verify { file: PathBuf },
+    Verify {
+        file: PathBuf,
+
+        /// Check the checksum and key order only, without decompressing the
+        /// arena - enough to catch a damaged download or bit rot.
+        #[arg(long)]
+        index_only: bool,
+    },
 
     /// Sizes, entry counts, compression ratio of a .hashdb file.
     Stats { file: PathBuf },
@@ -263,7 +270,7 @@ fn main() -> Result<()> {
         } => gen_hashes(
             known, unknown, wad, table, seeds, words, max_number, max_skin, out,
         ),
-        Command::Verify { file } => verify(file),
+        Command::Verify { file, index_only } => verify(file, index_only),
         Command::Stats { file } => stats(file),
         Command::Bundle {
             inputs,
@@ -535,10 +542,20 @@ fn get(hash: &str, file: Option<PathBuf>, table: Option<Table>) -> Result<()> {
     }
 }
 
-fn verify(file: PathBuf) -> Result<()> {
+fn verify(file: PathBuf, index_only: bool) -> Result<()> {
     let db = HashDb::open(&file).with_context(|| format!("opening {}", file.display()))?;
-    db.verify()?;
-    println!("{}: ok ({} entries)", file.display(), db.len());
+
+    // Both hash every stored byte; only the full pass also decompresses the
+    // arena to prove each entry is in bounds and valid UTF-8.
+    let scope = if index_only {
+        db.verify_index()?;
+        "index ok"
+    } else {
+        db.verify()?;
+        "ok"
+    };
+
+    println!("{}: {scope} ({} entries)", file.display(), db.len());
     Ok(())
 }
 

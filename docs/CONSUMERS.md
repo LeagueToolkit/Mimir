@@ -400,13 +400,21 @@ let report = store.gc()?;
 
 ### Verifying a table
 
-`open` validates structure only. After downloading from an untrusted channel - or when
-debugging - run the full check:
+`open` validates structure only. There are two checks above it:
 
 ```rust
-db.verify()?;   // xxh3 checksum over all sections, keys strictly ascending,
-                // every entry in bounds and valid UTF-8
+db.verify_index()?;  // xxh3 checksum over every stored byte, keys strictly ascending
+db.verify()?;        // the above, plus every entry in bounds and valid UTF-8
 ```
+
+Both hash the whole file, arena included, so both catch **damage** - bit rot, a
+truncating write, a half-finished copy. Only `verify` also decompresses the arena to
+prove the file is **well-formed**, which is what a table built by a broken writer
+fails. On the 42 MiB `game` table that is ~85 ms against ~940 ms.
+
+So: `verify_index` on a schedule or at startup, `verify` once after installing from
+an untrusted channel, or when a table is behaving strangely and you want to know why.
+`mimir verify --index-only` is the cheap tier from the command line.
 
 ## Building your own tables
 

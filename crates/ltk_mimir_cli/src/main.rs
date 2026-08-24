@@ -11,9 +11,10 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use ltk_hashdb::{Compression, HashDb, HashDbWriter, KeyConfig};
-use ltk_mimir_cache::{HashStore, Table as CacheTable};
+use clap::builder::TypedValueParser as _;
+use clap::{Parser, Subcommand};
+use ltk_hashdb::{Compression, HashDb, HashDbWriter};
+use ltk_mimir_cache::{HashStore, Table};
 use ltk_mimir_gen::guessers::{
     CharacterSkin, CrossReference, ExtensionSwap, NumericRange, PrefixVariants, RegionLocale,
     SeedStrings, WordAdd, WordSubstitution,
@@ -27,39 +28,14 @@ struct Cli {
     command: Command,
 }
 
-/// The logical CDragon tables; picks key width and hash algorithm.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Table {
-    Game,
-    Lcu,
-    BinEntries,
-    BinTypes,
-    BinFields,
-    BinHashes,
-    Rst,
-    RstXxh3,
-}
-
-impl Table {
-    /// Key width, hash algorithm, and casing rule - stated once, on the library
-    /// table this maps to.
-    fn key_config(self) -> KeyConfig {
-        self.cache().key_config()
-    }
-
-    /// The corresponding shared-cache table.
-    fn cache(self) -> CacheTable {
-        match self {
-            Self::Game => CacheTable::Game,
-            Self::Lcu => CacheTable::Lcu,
-            Self::BinEntries => CacheTable::BinEntries,
-            Self::BinTypes => CacheTable::BinTypes,
-            Self::BinFields => CacheTable::BinFields,
-            Self::BinHashes => CacheTable::BinHashes,
-            Self::Rst => CacheTable::Rst,
-            Self::RstXxh3 => CacheTable::RstXxh3,
-        }
-    }
+/// Accept the library table ids (`game`, `binentries`, `rst-xxh3`, ...) as
+/// `--table` values, with completions and an error listing them.
+///
+/// `Table` is a foreign type, so it cannot derive clap's `ValueEnum`; restricting
+/// the raw value to `Table::ALL` and parsing it back is the same thing by hand.
+fn table_parser() -> impl clap::builder::TypedValueParser<Value = Table> {
+    clap::builder::PossibleValuesParser::new(Table::ALL.iter().map(|t| t.id()))
+        .map(|id| Table::from_id(&id).expect("clap accepted only known ids"))
 }
 
 #[derive(Subcommand)]
@@ -71,7 +47,7 @@ enum Command {
         input: PathBuf,
 
         /// Which logical table this is (sets key width + hash algorithm).
-        #[arg(long)]
+        #[arg(long, value_parser = table_parser())]
         table: Table,
 
         /// Output .hashdb file.
@@ -104,7 +80,12 @@ enum Command {
 
         /// Resolve from the shared cache's active version of this table instead
         /// (cache dir: MIMIR_DIR override, else the platform data dir).
-        #[arg(long, conflicts_with = "file", required_unless_present = "file")]
+        #[arg(
+            long,
+            conflicts_with = "file",
+            required_unless_present = "file",
+            value_parser = table_parser()
+        )]
         table: Option<Table>,
     },
 
@@ -148,7 +129,7 @@ enum Command {
         wad: Vec<PathBuf>,
 
         /// Which logical table (sets key width, hash algorithm, guesser preset).
-        #[arg(long)]
+        #[arg(long, value_parser = table_parser())]
         table: Table,
 
         /// Extra candidate strings (one per line) checked verbatim, e.g.
@@ -520,9 +501,9 @@ fn get(hash: &str, file: Option<PathBuf>, table: Option<Table>) -> Result<()> {
         (None, Some(table)) => {
             let store = HashStore::discover()?;
             let db = store
-                .open(table.cache())
-                .with_context(|| format!("opening {table:?} from the shared cache"))?;
-            (db, format!("the shared cache ({table:?})"))
+                .open(table)
+                .with_context(|| format!("opening {table} from the shared cache"))?;
+            (db, format!("the shared cache ({table})"))
         }
         (None, None) => unreachable!("clap requires --file or --table"),
     };

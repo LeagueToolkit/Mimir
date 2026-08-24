@@ -252,10 +252,19 @@ frame cache. `Send + Sync`.
 | `update` · `update_async` | compare → download → verify → install → GC |
 | `commit` · `gc` · `try_lock_update` | publish versions, sweep old ones, take the lock |
 
+**`Table`** - which logical table, and how it hashes.
+
+| Method | |
+|---|---|
+| `ALL` · `id` · `Display` · `FromStr` · serde | the stable spellings (`game`, `binentries`, `rst-xxh3`) |
+| `key_config` · `key_width` · `hash_kind` · `casing` | how this table's keys were produced |
+| `universe` | which hashes it can answer - only same-universe tables may be layered |
+
 **`PathRef`** - a resolved path. `Deref<Target = str>`, plus `as_str`, `is_owned`
 (whether the bytes were copied rather than borrowed), and `into_owned`.
 
-**`HashDbWriter`** - `new` → `hash_kind` / `casing` → `insert` / `extend` → `build`.
+**`HashDbWriter`** - `new` → `hash_kind` / `casing` → `insert` / `extend` → `build`, or
+`with_key_config` when a `Table` already states all three.
 
 ## CLI
 

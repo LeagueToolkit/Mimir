@@ -20,7 +20,8 @@ mod table;
 mod update;
 
 pub use error::{
-    CommitError, GcError, ManifestError, NoCacheDirError, OpenError, UniverseMismatch, UpdateError,
+    CommitError, GcError, ManifestError, NoCacheDirError, OpenError, ParseTableError,
+    UniverseMismatch, UpdateError,
 };
 #[cfg(feature = "reqwest")]
 pub use fetch::ReqwestFetch;

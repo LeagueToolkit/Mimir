@@ -13,6 +13,41 @@ use crate::{HashUniverse, Table};
 #[error("could not determine a platform cache directory")]
 pub struct NoCacheDirError;
 
+/// A string that names no [`Table`] ([`Table::from_str`](std::str::FromStr::from_str)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseTableError {
+    input: String,
+}
+
+impl ParseTableError {
+    pub(crate) fn new(input: &str) -> Self {
+        Self {
+            input: input.to_owned(),
+        }
+    }
+
+    /// The string that failed to parse.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
+
+impl std::fmt::Display for ParseTableError {
+    /// Lists every accepted id, so a typo is one message away from being fixed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown table {:?}; expected one of ", self.input)?;
+        for (i, table) in Table::ALL.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(table.id())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ParseTableError {}
+
 /// Errors from reading, parsing, or writing `manifest.json`.
 #[derive(Debug, Error)]
 pub enum ManifestError {

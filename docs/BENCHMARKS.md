@@ -12,6 +12,8 @@ arena**, the **16 KiB default frame size**, and the **level 19** publishing defa
   ```text
   cargo run --release -p ltk_hashdb --example bench_real -- data/cdragon data/build
   cargo run --release -p ltk_hashdb --example compression_lab   # ordering/level/dict study
+  cargo run --release -p ltk_hashdb --example arena_order -- game.lhdb out.lhdb
+  cargo run --release -p ltk_hashdb --example path_coding -- game.lhdb
   cargo bench -p ltk_hashdb            # criterion, uses the files built above
   MIMIR_CDRAGON_DIR=data/cdragon cargo test --release --test golden
   ```
@@ -112,14 +114,88 @@ sample resolved through `get_batch` (`batch hit`), and 1 M random probes (`miss`
 The defaults are writer-side choices only - the format records the seek table, so
 any frame size and level stay readable by every reader.
 
+## Arena order: storing the permutation vs sorting for it
+
+The arena is laid out by path and the offsets are stored by key, so anything that
+walks the arena forward - `iter`, `values`, `prefix`, `verify` - needs the
+permutation between the two. It can be sorted for, or read from the optional
+arena-order section. Measured against the published `game` table (2,291,347
+entries, 44,114,614 B) with `--example arena_order`, each phase against a freshly
+opened table:
+
+| | sorted for | stored in the file |
+|---|---:|---:|
+| file size | 44,114,614 B | 50,988,663 B (**+15.6 %**) |
+| first arena-order call | 516 ms | 11 ms |
+| `prefix`, 13,511 hits, warm | 1.4 ms | 1.6 ms |
+| `prefix`, 499 hits, warm | 0.3 ms | 0.4 ms |
+| `prefix`, no match, warm | 0.1 ms | 0.2 ms |
+| `values()`, whole table | 776 ms | 331 ms |
+
+So the section buys one thing: it removes a **~0.5 s sort** the first time a
+process walks the arena, plus the ~18 MB of scratch that sort needs and the
+6.9 MB it leaves behind per process. Warm, the two are the same code on the same
+bytes and measure the same. Across all eight published tables the section would
+cost **+16.5 %** (61.1 MiB → 71.3 MiB), paid by every consumer including the ones
+that only ever call `get`.
+
+That is why [`ArenaOrder::Omitted`] is the default and the published tables do not
+carry it: a prefix search is already single-digit milliseconds without it, and a
+half-second once per process is a smaller price than a sixth of the download for
+everyone. `mimir build --arena-order` is there for consumers who would rather pay
+the bytes - a long-running asset browser opening the table on every launch, say.
+
+[`ArenaOrder::Omitted`]: https://docs.rs/ltk_hashdb/latest/ltk_hashdb/enum.ArenaOrder.html
+
+## Would factoring the paths out be smaller?
+
+The 187 MB of paths in the `game` arena are enormously redundant - 2.29 M paths
+share only 78,792 directories - so it is worth asking whether storing each
+directory once beats leaving the redundancy to zstd. Measured with
+`--example path_coding`, all at level 19 against the same 44,114,614 B file:
+
+| arena encoding | on disk | paths per frame |
+|---|---:|---:|
+| **raw** (what ships) | 12,035,676 B | 199 |
+| front-coded | 7,274,750 B | 1,045 |
+| front-coded, at raw's frame granularity | 9,380,187 B | 199 |
+| raw, at front coding's frame granularity | 10,083,790 B | 1,045 |
+| interned: directory table + `(dir_id, filename)` | **16,728,132 B** | 199 |
+
+Two results.
+
+**Interning - each directory stored once, an id per entry - makes the file
+bigger**, by 39 % of the arena. The directory strings do compress away, but the
+`dir_id` array is 3 bytes per entry of *index*: read at random, so never
+compressed, and it costs more than the redundancy it removes. That is the general
+shape of the trap. The arena is only **27 % of the file** and compresses 15.6x;
+the other 73 % - keys, offsets, lengths - is random-access and stored raw. Any
+scheme that moves bytes from the arena into the index trades compressible bytes
+for incompressible ones.
+
+**Front coding is worth about 2.7 MB, not the 4.8 MB it first appears.** Comparing
+the top two rows is unfair: the same 16 KiB frame holds 5x more front-coded paths,
+so half the gain is a coarser lookup granularity that raw can also buy - and does,
+in row four - by raising `--frame-size` at the cost of hit latency. At equal paths
+per frame it is a real ~22 % off the arena, i.e. ~6 % off the file.
+
+That 6 % is not additive, though. A front-coded arena cannot be addressed by
+`(offset, length)`, so it needs a restart per frame, a replay to read any entry,
+and a `flags` bit - which is the one kind of change [FORMAT.md](FORMAT.md)'s
+compatibility rule rules out, because every reader already shipped would reject
+the file.
+
 ## Memory profile
 
 - `open` maps the file: no allocation proportional to table size; the OS pages in
   what lookups touch (keys for misses, plus one decompressed frame per hit -
   the frame buffer is the only per-lookup allocation).
-- `iter`/`load_all` materialize an index-ordering vector (8 bytes/entry) and
-  decompress one frame run at a time; `load_all` (opt-in) then owns everything
-  (~arena size + `HashMap` overhead) for the expand-once profile.
+- `iter`/`values`/`prefix` need the arena order: a table carrying the section
+  reads it out of the mapping and allocates nothing, and one without it sorts
+  once and keeps the result (1-8 bytes/entry, 3 on `game`) for as long as a handle
+  to the table is open - shared by every clone, not rebuilt per call.
+- `load_all` (opt-in) then owns everything (~arena size + `HashMap` overhead) for
+  the expand-once profile.
 
 ## Correctness vs the txt corpus (golden test)
 

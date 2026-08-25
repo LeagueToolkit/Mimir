@@ -8,13 +8,13 @@ use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use xxhash_rust::xxh3::Xxh3;
 use zeekstd::SeekTable;
 
 use crate::cache::{Frame, FrameCache};
-use crate::header::Header;
+use crate::header::{arena_order_width, Header, ARENA_ORDER_CHECKSUM_SIZE};
 use crate::{Casing, HashKind, KeyConfig, KeyWidth, OpenError, PathRef, VerifyError};
 
 /// Decompressed frame bytes a table caches by default: 4 MiB, i.e. 256 frames at the
@@ -137,6 +137,13 @@ struct Inner {
     /// Present iff the arena is a zeekstd seekable stream.
     seek_table: Option<SeekTable>,
 
+    /// The file's arena-order section, when it carries one.
+    stored_order: Option<StoredOrder>,
+
+    /// Sorted on first use when the file carries none, then shared by every
+    /// clone of the table for as long as one of them is open.
+    rebuilt_order: OnceLock<Box<[u8]>>,
+
     cache: FrameCache,
 
     /// Frames decompressed so far; misses must never bump it (see unit tests).
@@ -145,6 +152,39 @@ struct Inner {
     /// Cleared for good the first time a lookup swallows a decompression failure,
     /// so "this build knows nothing" can be told apart from "this file is broken".
     healthy: AtomicBool,
+}
+
+/// Where the file keeps its arena-order section, from the header.
+struct StoredOrder {
+    /// The packed entry indices, checksum excluded.
+    packed: Range<usize>,
+
+    /// Bytes per entry index, 1..=8.
+    width: usize,
+
+    /// xxh3-64 over `packed`, stored immediately after it.
+    checksum: u64,
+}
+
+/// `arena_rank → entry_index`: which entry's path sits where in the arena.
+///
+/// The same packing either way, so one accessor serves a table that stores the
+/// permutation and one that had to sort for it.
+#[derive(Clone, Copy)]
+struct ArenaRanks<'a> {
+    packed: &'a [u8],
+    width: usize,
+}
+
+impl ArenaRanks<'_> {
+    fn len(&self) -> usize {
+        self.packed.len() / self.width
+    }
+
+    /// The entry at `rank`. Untrusted: callers check it against `entry_count`.
+    fn get(&self, rank: usize) -> usize {
+        read_uint(self.packed, rank * self.width, self.width) as usize
+    }
 }
 
 enum Backing {
@@ -322,6 +362,33 @@ impl HashDb {
             None
         };
 
+        // The arena-order section, if the header claims one. Its contents are
+        // untrusted like everything else - each rank is range-checked where it is
+        // used, and `verify_index` proves the whole thing is a permutation.
+        let stored_order = match header.arena_order {
+            None => None,
+            Some(order) => {
+                if order.width < arena_order_width(header.entry_count) {
+                    return Err(OpenError::MalformedHeader(
+                        "arena_order_width too narrow for entry_count",
+                    ));
+                }
+
+                let len = order
+                    .len(header.entry_count)
+                    .ok_or(OpenError::MalformedHeader("section extent overflows"))?;
+                let whole = section(data.len(), order.offset, len)?;
+                let packed = whole.start..whole.end - ARENA_ORDER_CHECKSUM_SIZE;
+                let checksum = u64::from_le_bytes(data[packed.end..whole.end].try_into().unwrap());
+
+                Some(StoredOrder {
+                    packed,
+                    width: order.width,
+                    checksum,
+                })
+            }
+        };
+
         // Size the cache to this table: never more slots than it has frames, and
         // nothing at all for a raw arena, which is read straight out of the mmap.
         let cache = match &seek_table {
@@ -344,6 +411,8 @@ impl HashDb {
                 lengths,
                 arena,
                 seek_table,
+                stored_order,
+                rebuilt_order: OnceLock::new(),
                 cache,
                 decompressions: AtomicU64::new(0),
                 healthy: AtomicBool::new(true),
@@ -505,6 +574,17 @@ impl HashDb {
         self.inner.header.arena_compressed_size
     }
 
+    /// Bytes this file spends on the arena-order section, or `None` if it
+    /// carries none and the reader sorts for the order instead.
+    ///
+    /// See [`ArenaOrder`](crate::ArenaOrder) for what that costs either way.
+    pub fn arena_order_size(&self) -> Option<u64> {
+        self.inner
+            .stored_order
+            .as_ref()
+            .map(|stored| (stored.packed.len() + ARENA_ORDER_CHECKSUM_SIZE) as u64)
+    }
+
     /// Number of zstd frames this table has decompressed over its lifetime.
     #[cfg(test)]
     pub(crate) fn decompressions(&self) -> u64 {
@@ -520,9 +600,68 @@ impl HashDb {
 
     /// Iterate entries in arena order (path order, **not** key order) so each frame
     /// decompresses once. Entries that fail to decompress are skipped; `verify()` reports them.
+    ///
+    /// Reads the arena-order section when the table carries one and otherwise
+    /// sorts for it once, so the permutation is not rebuilt per call either way -
+    /// see [`ArenaOrder`](crate::ArenaOrder).
     pub fn iter(&self) -> impl Iterator<Item = (u64, PathRef<'_>)> {
-        self.inner.arena_order().into_iter().filter_map(move |i| {
-            let bytes = self.inner.lookup(i)?;
+        let ranks = self.inner.arena_ranks();
+
+        (0..ranks.len()).filter_map(move |rank| {
+            let i = ranks.get(rank);
+            let bytes = self.inner.lookup_rank(i)?;
+            Some((self.inner.key_at(i), PathRef::from(bytes)))
+        })
+    }
+
+    /// Every path in the table, in arena order, without reading a key.
+    ///
+    /// [`iter`](HashDb::iter) without the key array: the same walk, the same
+    /// one-decompression-per-frame, and nothing paged in from the keys. What a
+    /// name list, an autocomplete corpus, or a dump of the table wants.
+    ///
+    /// Paths that will not decompress are skipped, exactly as `iter` skips them.
+    pub fn values(&self) -> impl Iterator<Item = PathRef<'_>> {
+        let ranks = self.inner.arena_ranks();
+
+        (0..ranks.len()).filter_map(move |rank| {
+            let bytes = self.inner.lookup_rank(ranks.get(rank))?;
+            Some(PathRef::from(bytes))
+        })
+    }
+
+    /// Every entry whose path starts with `prefix`, in path order.
+    ///
+    /// The arena is sorted by path, so the matches are one contiguous run and
+    /// finding it is a binary search - about `log2(entries)` frames decompressed,
+    /// however many entries the table holds and however many the prefix matches.
+    /// The iterator is lazy: `take(n)` stops the walk rather than filtering a
+    /// list that was already built.
+    ///
+    /// ```no_run
+    /// # use ltk_hashdb::HashDb;
+    /// # let db = HashDb::open("game.lhdb")?;
+    /// for (hash, path) in db.prefix("assets/characters/ahri/").take(20) {
+    ///     println!("{hash:016x}  {path}");
+    /// }
+    /// # Ok::<(), ltk_hashdb::OpenError>(())
+    /// ```
+    ///
+    /// Only meaningful for a table whose arena is in path order. That is the
+    /// reference writer's layout and what every published table does, but the
+    /// format lets a writer lay the arena out however it likes, so this is a
+    /// convention the reader trusts rather than a rule it can check - `verify`
+    /// proves the arena order is a permutation, not that it is sorted.
+    ///
+    /// An empty prefix matches every entry, which makes this the keyed
+    /// counterpart to [`values`](HashDb::values).
+    pub fn prefix<'a>(&'a self, prefix: &str) -> impl Iterator<Item = (u64, PathRef<'a>)> + 'a {
+        let ranks = self.inner.arena_ranks();
+        let range = self.inner.prefix_ranks(&ranks, prefix.as_bytes());
+
+        range.filter_map(move |rank| {
+            let i = ranks.get(rank);
+            let bytes = self.inner.lookup_rank(i)?;
             Some((self.inner.key_at(i), PathRef::from(bytes)))
         })
     }
@@ -550,6 +689,7 @@ impl HashDb {
         let inner = &*self.inner;
         inner.verify_checksum()?;
         inner.verify_key_order()?;
+        inner.verify_arena_order()?;
 
         // Compressed arenas are walked in arena order so each frame decompresses once
         // and only the current run is resident - never the whole arena at once. A raw
@@ -559,8 +699,9 @@ impl HashDb {
                 inner.verify_entry(i)?;
             }
         } else {
-            for i in inner.arena_order() {
-                inner.verify_entry(i)?;
+            let ranks = inner.arena_ranks();
+            for rank in 0..ranks.len() {
+                inner.verify_entry(ranks.get(rank))?;
             }
         }
 
@@ -587,12 +728,14 @@ impl HashDb {
     /// # Errors
     ///
     /// [`VerifyError::ChecksumMismatch`] if the stored bytes do not hash to the
-    /// header's digest, or [`VerifyError::Malformed`] if the keys are not
-    /// strictly ascending.
+    /// header's digest or the arena-order section does not hash to its own, or
+    /// [`VerifyError::Malformed`] if the keys are not strictly ascending or the
+    /// arena order is not a permutation running forward through the arena.
     pub fn verify_index(&self) -> Result<(), VerifyError> {
         let inner = &*self.inner;
         inner.verify_checksum()?;
-        inner.verify_key_order()
+        inner.verify_key_order()?;
+        inner.verify_arena_order()
     }
 }
 
@@ -616,6 +759,7 @@ impl fmt::Debug for HashDb {
                 &inner.seek_table.as_ref().map_or(0, SeekTable::num_frames),
             )
             .field("cached_frames", &inner.cache.capacity())
+            .field("stores_arena_order", &inner.stored_order.is_some())
             .finish()
     }
 }
@@ -625,12 +769,89 @@ impl Inner {
         self.header.entry_count as usize
     }
 
-    /// Entry indices sorted by arena offset (path order); walking them this way
-    /// decompresses each frame once, keeping only the current run resident.
-    fn arena_order(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.len()).collect();
-        order.sort_unstable_by_key(|&i| self.offset_at(i));
-        order
+    /// Entry indices in arena order (path order): read from the file's section,
+    /// or sorted for on first use and kept.
+    ///
+    /// Walking them decompresses each frame once and keeps only the current run
+    /// resident, which is why every full-table read goes through here.
+    fn arena_ranks(&self) -> ArenaRanks<'_> {
+        match &self.stored_order {
+            Some(stored) => ArenaRanks {
+                packed: &self.backing.bytes()[stored.packed.clone()],
+                width: stored.width,
+            },
+            None => ArenaRanks {
+                packed: self.rebuilt_order.get_or_init(|| self.rebuild_order()),
+                width: arena_order_width(self.header.entry_count),
+            },
+        }
+    }
+
+    /// Sort the permutation the file did not carry, packed the way it would have
+    /// been so that one accessor serves both.
+    fn rebuild_order(&self) -> Box<[u8]> {
+        let n = self.len();
+        let width = arena_order_width(self.header.entry_count);
+
+        // Ties are entries sharing one arena extent: identical paths, and the
+        // empty path against whatever was written next. Length breaks them the
+        // way path order does - the empty string first - so this reproduces a
+        // stored section rather than merely resembling one.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&i| (self.offset_at(i), self.len_at(i)));
+
+        let mut packed = Vec::with_capacity(n * width);
+        for i in order {
+            packed.extend_from_slice(&(i as u64).to_le_bytes()[..width]);
+        }
+
+        packed.into_boxed_slice()
+    }
+
+    /// The half-open rank range whose paths start with `prefix`.
+    ///
+    /// Two binary searches over one sorted sequence: the first rank not below the
+    /// prefix, and the first past the run that carries it.
+    fn prefix_ranks(&self, ranks: &ArenaRanks<'_>, prefix: &[u8]) -> Range<usize> {
+        let start = self.partition_ranks(ranks, |path| path < prefix);
+        let end = self.partition_ranks(ranks, |path| path < prefix || path.starts_with(prefix));
+
+        start..end
+    }
+
+    /// `partition_point` over the ranks, reading one path per probe.
+    fn partition_ranks(&self, ranks: &ArenaRanks<'_>, below: impl Fn(&[u8]) -> bool) -> usize {
+        let mut lo = 0;
+        let mut hi = ranks.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            // A path that will not decompress sorts to the left, which is the
+            // same "skipped" the rest of the read path gives it.
+            let before = match self.lookup_rank(ranks.get(mid)) {
+                Some(bytes) => below(bytes.as_slice()),
+                None => true,
+            };
+
+            if before {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        lo
+    }
+
+    /// Entry `i`'s bytes for an arena-order walk, where `i` came from an
+    /// untrusted rank: out of range reads as a miss and marks the table
+    /// unhealthy, like any other corruption the read path swallows.
+    fn lookup_rank(&self, i: usize) -> Option<Bytes<'_>> {
+        if i >= self.len() {
+            self.healthy.store(false, Ordering::Relaxed);
+            return None;
+        }
+
+        self.lookup(i)
     }
 
     fn index_of(&self, hash: u64) -> Option<usize> {
@@ -738,7 +959,6 @@ impl Inner {
         }
     }
 
-    /// Check one entry the way `verify` needs it checked: in bounds and valid UTF-8.
     /// The header's digest against the bytes as they sit on disk. Compressed
     /// arenas are hashed compressed, so nothing is decoded to run this.
     fn verify_checksum(&self) -> Result<(), VerifyError> {
@@ -768,6 +988,56 @@ impl Inner {
         Ok(())
     }
 
+    /// The arena-order section, when the file carries one: its own digest, that
+    /// it names every entry exactly once, and that it runs forward through the
+    /// arena.
+    ///
+    /// Index-only - nothing here decompresses a frame. What stays unproven is
+    /// that the arena is in *path* order, which is a writer convention rather
+    /// than something the format states; see [`HashDb::prefix`].
+    fn verify_arena_order(&self) -> Result<(), VerifyError> {
+        let Some(stored) = &self.stored_order else {
+            return Ok(());
+        };
+
+        let packed = &self.backing.bytes()[stored.packed.clone()];
+        let mut hasher = Xxh3::new();
+        hasher.update(packed);
+        if hasher.digest() != stored.checksum {
+            return Err(VerifyError::ChecksumMismatch);
+        }
+
+        // n distinct in-range indices over n ranks is a permutation, so one
+        // seen-bit per entry settles it; the extent check then settles that the
+        // permutation is the arena's own order.
+        let ranks = ArenaRanks {
+            packed,
+            width: stored.width,
+        };
+        let mut seen = vec![false; self.len()];
+        let mut prev = (0u64, 0u16);
+        for rank in 0..ranks.len() {
+            let i = ranks.get(rank);
+            let slot = seen.get_mut(i).ok_or(VerifyError::Malformed(
+                "arena order names an entry that does not exist",
+            ))?;
+            if std::mem::replace(slot, true) {
+                return Err(VerifyError::Malformed("arena order names an entry twice"));
+            }
+
+            let here = (self.offset_at(i), self.len_at(i));
+            if here < prev {
+                return Err(VerifyError::Malformed(
+                    "arena order does not run forward through the arena",
+                ));
+            }
+            prev = here;
+        }
+
+        Ok(())
+    }
+
+    /// Check one entry the way `verify` needs it checked: in bounds and valid UTF-8.
     fn verify_entry(&self, i: usize) -> Result<(), VerifyError> {
         let bytes = self
             .bytes_at(i)?
@@ -952,6 +1222,24 @@ mod tests {
 
         // Entries in the untouched frames still resolve.
         assert!(keys.iter().any(|&k| db.get(k).is_some()));
+    }
+
+    /// `prefix` is a binary search, so finding a run in a many-frame table must
+    /// cost frames proportional to `log2(entries)` - not to the table.
+    #[test]
+    fn prefix_does_not_walk_the_whole_arena() {
+        let db = compressed_db(128);
+        let frames = db.inner.seek_table.as_ref().unwrap().num_frames() as u64;
+        assert!(frames > 8, "fixture should span many frames");
+
+        // `champ1` without the slash would also match champ10..champ19; with it,
+        // exactly one path.
+        assert_eq!(db.prefix("assets/characters/champ1/").count(), 1);
+        assert!(
+            db.decompressions() < frames,
+            "{} frames decompressed of {frames}",
+            db.decompressions()
+        );
     }
 
     #[test]

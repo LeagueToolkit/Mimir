@@ -3,8 +3,8 @@
 use std::io::Cursor;
 
 use ltk_hashdb::{
-    BuildError, Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth, LayeredHashDb,
-    OpenError, VerifyError,
+    ArenaOrder, BuildError, Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth,
+    LayeredHashDb, OpenError, VerifyError,
 };
 
 fn build_with(
@@ -26,6 +26,45 @@ fn build_with(
 
 fn build(key_width: KeyWidth, hash_kind: HashKind, entries: &[(u64, &str)]) -> Vec<u8> {
     build_with(key_width, hash_kind, Compression::None, entries)
+}
+
+/// What `build_with` produces, plus the arena-order section.
+fn build_ordered(compression: Compression, entries: &[(u64, &str)]) -> Vec<u8> {
+    let mut w = HashDbWriter::new(KeyWidth::U64, compression)
+        .hash_kind(HashKind::Xxh64)
+        .casing(Casing::AsciiInsensitive)
+        .arena_order(ArenaOrder::Stored);
+    w.extend(entries.iter().copied());
+
+    let mut out = Cursor::new(Vec::new());
+    let stats = w.build(&mut out).expect("build");
+    assert_eq!(stats.file_len, out.get_ref().len() as u64);
+
+    out.into_inner()
+}
+
+/// The two arena-order header fields and the entry count, straight off the wire.
+fn arena_order_at(bytes: &[u8]) -> (usize, usize, usize) {
+    let offset = u64::from_le_bytes(bytes[72..80].try_into().unwrap()) as usize;
+    let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+
+    (offset, bytes[15] as usize, count)
+}
+
+/// Recompute the section's trailing digest, the way a writer that meant to
+/// produce these bytes would have.
+fn restamp_arena_order(bytes: &mut [u8]) {
+    let (offset, width, count) = arena_order_at(bytes);
+    let end = offset + count * width;
+
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(&bytes[offset..end]);
+    bytes[end..end + 8].copy_from_slice(&hasher.digest().to_le_bytes());
+}
+
+/// Every path, in the order the arena holds them.
+fn values(db: &HashDb) -> Vec<String> {
+    db.values().map(|p| p.into_owned()).collect()
 }
 
 const GAME_ENTRIES: &[(u64, &str)] = &[
@@ -517,4 +556,199 @@ fn iter_yields_paths_in_lexicographic_order() {
     let db = HashDb::open_bytes(bytes).expect("open");
     let paths: Vec<String> = db.iter().map(|(_, p)| p.into_owned()).collect();
     assert_eq!(paths, ["a/1", "b/2", "c/3"]);
+}
+
+/// The whole compatibility argument for adding a section without a version bump:
+/// a reader built before it exists must find the file it always found. So the
+/// section may only *append*, and the two header fields it fills were reserved
+/// and zero in every build that shipped - including byte 64..72, the checksum,
+/// which stays defined over keys‖offsets‖lengths‖arena and is covered here by
+/// the head comparison.
+#[test]
+fn the_arena_order_section_only_appends() {
+    for compression in [
+        Compression::None,
+        Compression::Zeekstd {
+            frame_size: 128,
+            level: 3,
+        },
+    ] {
+        let plain = build_with(KeyWidth::U64, HashKind::Xxh64, compression, GAME_ENTRIES);
+        let ordered = build_ordered(compression, GAME_ENTRIES);
+
+        // Four entries fit in one byte each, plus the section's own digest.
+        assert_eq!(ordered.len() - plain.len(), GAME_ENTRIES.len() + 8);
+
+        let mut head = ordered[..plain.len()].to_vec();
+        head[15] = 0;
+        head[72..80].fill(0);
+        assert_eq!(
+            head, plain,
+            "only the two reserved header fields differ before the section"
+        );
+    }
+}
+
+/// A stored permutation and one a reader sorts for are the same permutation, or
+/// one of them is wrong. The empty path is the tie that could break differently:
+/// it occupies no arena bytes, so it shares its offset with whatever was written
+/// next - and `binhashes` really does contain it.
+#[test]
+fn a_stored_arena_order_matches_the_one_a_reader_sorts_for() {
+    let entries: &[(u64, &str)] = &[
+        (1, ""),
+        (2, "assets/z.bin"),
+        (3, "assets/a.bin"),
+        (4, "assets/a.bin"),
+        (5, "b"),
+    ];
+
+    for compression in [
+        Compression::None,
+        Compression::Zeekstd {
+            frame_size: 16,
+            level: 3,
+        },
+    ] {
+        let sorted = HashDb::open_bytes(build_with(
+            KeyWidth::U64,
+            HashKind::Xxh64,
+            compression,
+            entries,
+        ))
+        .expect("open");
+        let stored = HashDb::open_bytes(build_ordered(compression, entries)).expect("open");
+
+        assert_eq!(sorted.arena_order_size(), None);
+        assert_eq!(stored.arena_order_size(), Some(entries.len() as u64 + 8));
+
+        let paths = values(&sorted);
+        assert_eq!(paths, values(&stored));
+        assert!(
+            paths.windows(2).all(|w| w[0] <= w[1]),
+            "the arena is in path order: {paths:?}"
+        );
+
+        let by_key = |db: &HashDb| -> Vec<(u64, String)> {
+            db.iter().map(|(k, p)| (k, p.into_owned())).collect()
+        };
+        assert_eq!(by_key(&sorted), by_key(&stored));
+    }
+}
+
+/// A prefix names a contiguous run of the arena, and `prefix` returns exactly it
+/// - whether the run is read out of a stored permutation or a sorted one.
+#[test]
+fn prefix_returns_the_run_under_it() {
+    let entries: &[(u64, &str)] = &[
+        (1, "assets/characters/ahri/ahri.bin"),
+        (2, "assets/characters/ahri/skins/skin01.bin"),
+        (3, "assets/characters/ahriX.bin"),
+        (4, "assets/characters/aatrox/aatrox.bin"),
+        (5, "data/menu/main.bin"),
+    ];
+
+    for bytes in [
+        build_with(KeyWidth::U64, HashKind::Xxh64, Compression::None, entries),
+        build_ordered(Compression::None, entries),
+    ] {
+        let db = HashDb::open_bytes(bytes).expect("open");
+        let hits = |prefix: &str| -> Vec<String> {
+            db.prefix(prefix).map(|(_, p)| p.into_owned()).collect()
+        };
+
+        assert_eq!(
+            hits("assets/characters/ahri/"),
+            [
+                "assets/characters/ahri/ahri.bin",
+                "assets/characters/ahri/skins/skin01.bin"
+            ]
+        );
+        // The trailing slash is what separates a directory from a sibling whose
+        // name merely starts the same way.
+        assert_eq!(hits("assets/characters/ahri").len(), 3);
+        assert_eq!(hits("data/"), ["data/menu/main.bin"]);
+        assert_eq!(hits("assets/characters/ahri/ahri.bin").len(), 1);
+        assert!(hits("nothing/").is_empty());
+        assert!(hits("zzz").is_empty());
+
+        // An empty prefix is the whole table, keyed - `values` with the keys on.
+        assert_eq!(hits(""), values(&db));
+
+        // And the keys come back with the paths they belong to.
+        for (key, path) in db.prefix("assets/characters/ahri/") {
+            assert_eq!(db.get(key).as_deref(), Some(&*path));
+        }
+    }
+}
+
+/// The section is untrusted like every other: a bad one must be reported by
+/// `verify_index` without decompressing anything, and must degrade reads to
+/// misses rather than panicking or reading out of bounds.
+#[test]
+fn a_damaged_arena_order_is_caught_and_survived() {
+    let good = build_ordered(Compression::None, GAME_ENTRIES);
+    HashDb::open_bytes(good.clone())
+        .expect("open")
+        .verify_index()
+        .expect("a freshly built section passes");
+
+    let (at, ..) = arena_order_at(&good);
+
+    // Damage, caught by the section's own digest - the header's does not cover it.
+    let mut rotted = good.clone();
+    rotted[at] ^= 0xff;
+    assert!(matches!(
+        HashDb::open_bytes(rotted).expect("open").verify_index(),
+        Err(VerifyError::ChecksumMismatch)
+    ));
+
+    // A forgery that hashes correctly still has to be a permutation...
+    let mut twice = good.clone();
+    twice[at + 1] = twice[at];
+    restamp_arena_order(&mut twice);
+    assert!(matches!(
+        HashDb::open_bytes(twice).expect("open").verify_index(),
+        Err(VerifyError::Malformed(_))
+    ));
+
+    // ...running forward through the arena...
+    let mut backwards = good.clone();
+    backwards.swap(at, at + 1);
+    restamp_arena_order(&mut backwards);
+    assert!(matches!(
+        HashDb::open_bytes(backwards).expect("open").verify_index(),
+        Err(VerifyError::Malformed(_))
+    ));
+
+    // ...over entries that exist. This one also has to stay readable: a rank
+    // pointing past the table reads as a miss and says the table is unhealthy.
+    let mut phantom = good;
+    phantom[at] = 200;
+    restamp_arena_order(&mut phantom);
+    let db = HashDb::open_bytes(phantom).expect("open");
+    assert!(matches!(db.verify_index(), Err(VerifyError::Malformed(_))));
+    assert_eq!(db.values().count(), GAME_ENTRIES.len() - 1);
+    assert!(!db.is_healthy());
+    assert!(
+        db.get(GAME_ENTRIES[0].0).is_some(),
+        "lookups are unaffected"
+    );
+}
+
+/// A width too narrow to address the table cannot describe a real permutation,
+/// so it is a malformed header rather than a section to ignore.
+#[test]
+fn an_unusable_arena_order_width_is_rejected() {
+    let entries: Vec<(u64, String)> = (0..300u64).map(|i| (i, format!("p/{i:04}"))).collect();
+    let borrowed: Vec<(u64, &str)> = entries.iter().map(|(k, p)| (*k, p.as_str())).collect();
+
+    let mut bytes = build_ordered(Compression::None, &borrowed);
+    assert_eq!(bytes[15], 2, "300 entries need two bytes per rank");
+
+    bytes[15] = 1;
+    assert!(matches!(
+        HashDb::open_bytes(bytes),
+        Err(OpenError::MalformedHeader(_))
+    ));
 }

@@ -26,6 +26,8 @@ format under the `.lhdb` extension (identical bytes, League convention).
 │ Lengths  (entry_count × 2)                   │
 ├──────────────────────────────────────────────┤
 │ Arena    (arena_compressed_size bytes)       │
+├─ optional ───────────────────────────────────┤
+│ Arena order (entry_count × width + 8 bytes)  │
 └──────────────────────────────────────────────┘
 ```
 
@@ -46,7 +48,7 @@ stored once).
 | 12 | `key_width` | `u8` | 4 = u32 table, 8 = u64 table |
 | 13 | `offset_width` | `u8` | 4 or 8; the writer picks 4 while `arena_decompressed_size` fits in a u32, else 8; the reader honors whatever is declared |
 | 14 | `opt_flags` | `u8` | **optional** flags: none defined yet; an unrecognized bit **must** be ignored |
-| 15 | reserved | `u8` | written as zero, ignored on read |
+| 15 | `arena_order_width` | `u8` | bytes per entry in the arena-order section, `1..=8`; `0` when there is none |
 | 16 | `entry_count` | `u64` | |
 | 24 | `keys_offset` | `u64` | file offset of the keys section; writers must 8-align it (the reference writer emits 80), readers bounds-check and honor the declared value |
 | 32 | `offsets_offset` | `u64` | file offset of the offsets section; writers must `offset_width`-align it |
@@ -54,7 +56,7 @@ stored once).
 | 48 | `arena_decompressed_size` | `u64` | raw (decompressed) arena length |
 | 56 | `arena_compressed_size` | `u64` | arena bytes on disk; == decompressed if raw |
 | 64 | `checksum` | `u64` | xxh3-64 of keys ‖ offsets ‖ lengths ‖ arena, each as stored on disk (inter-section padding excluded) |
-| 72 | reserved | `[u8;8]` | written as zero, ignored on read |
+| 72 | `arena_order_offset` | `u64` | file offset of the arena-order section; `0` = the file carries none |
 
 The lengths section has no header field: it sits immediately after the offsets, at
 `offsets_offset + entry_count × offset_width` (u16 entries are always 2-aligned there).
@@ -74,6 +76,12 @@ the two flag bytes:
 So an index that speeds up a scan is an `opt_flags` bit; a different arena
 encoding is a `flags` bit. When in doubt, ask what a reader that ignores the bit
 would produce: a correct answer more slowly, or a wrong one.
+
+A capability that needs a field of its own does not also need a bit. The
+arena-order section is announced by its own offset being non-zero - bytes 72..80
+and byte 15 were reserved-and-zero in every build that shipped, so a reader
+predating the section sees zeroes it already ignores, and there is no flag that
+could disagree with the offset beside it.
 
 ### `hash_kind`
 
@@ -127,6 +135,9 @@ refusing the file outright.
   Zstandard Seekable Format stream whose decompressed content is the raw arena (its
   seek table lives inside the stream; the whole arena is also a valid ordinary zstd
   stream).
+- **Arena order** (optional) - `entry_count` entry indices, `arena_order_width`
+  bytes each, listing the entries in the order their paths sit in the arena;
+  followed by an xxh3-64 of those bytes. Present iff `arena_order_offset != 0`.
 
 Sections are contiguous except for zero padding between keys and offsets when
 `offsets_offset` needs realignment (only possible for a u32-key table with u64 offsets).
@@ -140,6 +151,40 @@ a directory into the same compression frames. Measured on the real CDragon game
 table this compresses ~4× better than key order (see `docs/BENCHMARKS.md`) and makes
 directory-local batch lookups touch fewer frames. It also lets identical paths under
 different keys share one arena extent.
+
+### Arena order
+
+The arena is laid out by path while offsets and lengths are stored by key, so
+walking the arena forward - or binary-searching it for a path prefix - means
+knowing the permutation between the two orders. A reader can always recover it by
+sorting the offsets; this section is that permutation written down.
+
+```
+arena_order[rank] = entry index, for rank in 0 .. entry_count
+```
+
+- Entries are `arena_order_width` little-endian bytes each, wide enough to hold
+  `entry_count - 1`. The reference writer picks the narrowest such width (3 bytes
+  for the ~2.3M-entry League `game` table); a reader honors whatever is declared
+  and rejects a width too narrow to address the table.
+- The `entry_count × width` bytes are followed by an **xxh3-64 of themselves**.
+  The header's `checksum` deliberately does not cover this section: it is defined
+  over keys‖offsets‖lengths‖arena, and a reader built before the section existed
+  still computes it that way, so the section carries its own digest instead.
+- The permutation must name every entry exactly once, and must run forward: for
+  consecutive ranks, `(offset, length)` never decreases. That ordering is what
+  makes an arena walk decompress each frame once, and is checked by `verify`.
+- It records the order, not the *rule*. That the arena is sorted by path is the
+  reference writer's layout (see *Arena ordering*) and what a prefix search
+  depends on, but the format does not require it and a reader cannot check it
+  cheaply.
+
+**Adding it does not change any other byte.** The section is appended after the
+arena and the two header fields it fills were reserved and zero, so a reader that
+predates it opens the file, reads it, and checksums it exactly as before. It is
+therefore optional in both directions: a writer may leave it out, and a reader
+may ignore it and sort for the order instead. See `docs/BENCHMARKS.md` for what
+each choice costs.
 
 ## Lookup
 
@@ -165,7 +210,11 @@ On open, before trusting any offset:
 - for compressed arenas: the trailing seek table parses, its total decompressed size
   equals `arena_decompressed_size`, and no frame's decompressed size exceeds the
   seekable-format maximum (1 GiB);
-- all section extents in bounds (overflow-checked).
+- all section extents in bounds (overflow-checked);
+- if `arena_order_offset != 0`: `arena_order_width` is `1..=8` and wide enough for
+  `entry_count`, and the section is in bounds. Its *contents* are not read at open -
+  each rank is range-checked where it is used, and a rank naming an entry that does
+  not exist reads as a miss.
 
 Per-entry extents are **not** validated at open (that would touch every offsets/lengths
 page); instead every read bounds-checks its own extent against
@@ -174,7 +223,8 @@ stay untrusted after open too: every frame extent and decompressed size is re-ch
 when the frame is read, a lookup whose frame fails to decompress reports a miss, and
 invalid UTF-8 is replaced lossily rather than erroring.
 
-`verify()` additionally checks the xxh3 checksum, strict key ordering, and that every
-entry's extent is in bounds and valid UTF-8 in the (decompressed) arena - it is opt-in
+`verify()` additionally checks the xxh3 checksum, strict key ordering, the arena-order
+section (its own digest, that it is a permutation, and that it runs forward), and that
+every entry's extent is in bounds and valid UTF-8 in the (decompressed) arena - it is opt-in
 so `open` stays lazy (the shared-cache manifest carries a sha256 checked at download
 time).

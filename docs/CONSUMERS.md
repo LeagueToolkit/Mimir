@@ -7,13 +7,13 @@ The CLI is covered [at the end](#the-cli).
 
 ## Which crate do I need?
 
-| You want to… | Depend on |
-|---|---|
-| Resolve hashes against the machine-shared League tables (the common case) | `ltk_mimir_cache` (+ `ltk_hashdb` for the `HashDb` type it hands back) |
-| Keep that shared cache up to date from your app (no CLI) | `ltk_mimir_cache` - `HashStore::update` / `update_async` + your HTTP client |
-| Open a specific `.hashdb`/`.lhdb` file, or bytes you embedded/downloaded yourself | `ltk_hashdb` |
-| Build your own tables (the format is general-purpose: any `u64 → str` map) | `ltk_hashdb` (writer) |
-| Brute-force unknown hashes back into paths | `ltk_mimir_gen` |
+| You want to…                                                                      | Depend on                                                                   |
+| --------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Resolve hashes against the machine-shared League tables (the common case)         | `ltk_mimir_cache` (+ `ltk_hashdb` for the `HashDb` type it hands back)      |
+| Keep that shared cache up to date from your app (no CLI)                          | `ltk_mimir_cache` - `HashStore::update` / `update_async` + your HTTP client |
+| Open a specific `.hashdb`/`.lhdb` file, or bytes you embedded/downloaded yourself | `ltk_hashdb`                                                                |
+| Build your own tables (the format is general-purpose: any `u64 → str` map)        | `ltk_hashdb` (writer)                                                       |
+| Brute-force unknown hashes back into paths                                        | `ltk_mimir_gen`                                                             |
 
 ## Resolving hashes
 
@@ -246,8 +246,9 @@ miss stays in your tool - mimir returns `Option`, it never invents a hex string.
 
 Tables are published as GitHub release assets: each release carries every table as an
 immutable `<table>-<version>.lhdb` plus the `manifest.json` describing them
-(per-table filename, sha256, entry count, key width, and input provenance).
-`releases/latest/download/manifest.json` is the stable URL for the current set.
+(per-table filename, sha256, entry count, key width, download size, and input
+provenance). `releases/latest/download/manifest.json` is the stable URL for the
+current set.
 
 The whole loop - fetch the remote manifest, keep every table whose sha256 already
 matches, download and checksum-verify the rest, install atomically, GC superseded
@@ -281,7 +282,57 @@ match store.update(&fetch, UpdateOptions::default())? {
 > `mimir update` is exactly this call plus a reqwest-backed `Fetch` - still the right
 > tool for cron jobs and setup scripts. **Readers need none of this** - they just `open`.
 
-#### Streaming, progress, and cancellation
+#### Progress: `UpdateObserver`
+
+A download UI needs two things a fetcher cannot tell it: how many tables the run will
+install, and how many bytes that is in total. `fetch_to` is handed one filename at a
+time and never learns how many follow, so both answers have to come from `update`
+itself. They do, through an observer on `UpdateOptions`:
+
+```rust
+use std::sync::Mutex;
+use ltk_mimir_cache::{HashStore, PlannedTable, Table, UpdateObserver, UpdateOptions};
+
+#[derive(Default)]
+struct Bar {
+    state: Mutex<(u64, u64)>,   // bytes done before this table, total for the run
+}
+
+impl UpdateObserver for Bar {
+    fn planned(&self, tables: &[PlannedTable]) {
+        // `Option` sums to `None` if any table is missing a size - a release
+        // published before sizes were recorded - so count tables instead.
+        let total: Option<u64> = tables.iter().map(|table| table.size_bytes).sum();
+        self.state.lock().unwrap().1 = total.unwrap_or(0);
+        println!("{} table(s), {:?} bytes", tables.len(), total);
+    }
+
+    fn progressed(&self, table: Table, done: u64, total: Option<u64>) {
+        let (base, run_total) = *self.state.lock().unwrap();
+        println!("{table}: {done}/{total:?} - run at {}/{run_total}", base + done);
+    }
+
+    fn downloaded(&self, table: Table) {
+        println!("{table} verified");
+    }
+}
+
+let observer = Bar::default();
+store.update(&remote, UpdateOptions::default().observed_by(&observer))?;
+```
+
+`planned` fires once before the first connection - with an empty slice when the cache
+is already current, which is the cue to dismiss the bar rather than leave it waiting.
+`progressed` fires once at zero bytes per table and then per chunk, carrying that
+table's own size so a per-table bar needs nothing else. `downloaded` fires when a
+table has streamed and matched its checksum; the install itself happens once, at the
+end, for every table at once. All three are called on the thread or task driving the
+update, while the lock is held - so keep them cheap.
+
+The observer is a borrowed `&dyn`, so it costs no allocation and no `Arc`; it must be
+`Sync` because `update_async` holds it across every await.
+
+#### Streaming and cancellation
 
 `fetch_to` is the trait's actual primitive; the closure form above buffers a whole
 asset because that is all a closure can do. Implementing `fetch_to` instead streams
@@ -289,16 +340,19 @@ straight into the sink `update` hands you - which is a file in the cache directo
 hashed as it fills - so a 38 MiB table is never in memory and its bytes are written
 once, not copied into place afterwards.
 
-That sink is also the progress and cancellation hook. Wrap a fetcher, pass the inner
-one a sink of your own, and you see every chunk:
+That sink is the cancellation hook. Wrap a fetcher, pass the inner one a sink of your
+own, and refuse a chunk to stop the transfer:
 
 ```rust
 use std::io::Write;
 use ltk_mimir_cache::{Fetch, FetchError};
 
-struct Reporting<F>(F);
+struct Cancellable<F> {
+    inner: F,
+    cancelled: AtomicBool,
+}
 
-impl<F: Fetch> Fetch for Reporting<F> {
+impl<F: Fetch> Fetch for Cancellable<F> {
     type Error = F::Error;
 
     fn fetch_to(
@@ -306,18 +360,18 @@ impl<F: Fetch> Fetch for Reporting<F> {
         filename: &str,
         sink: &mut (dyn Write + Send),
     ) -> Result<u64, FetchError<Self::Error>> {
-        self.0.fetch_to(filename, &mut Counting { sink, done: 0 })
+        self.inner.fetch_to(filename, &mut Stopping { sink, cancelled: &self.cancelled })
     }
 }
 ```
 
-`Counting::write` forwards to `sink`, adds up what it forwarded, and returns an
-`io::Error` to cancel - which arrives at the caller as `FetchError::Sink`, aborts the
-run, and removes the partial file. `FetchError::Transport` is the other half: the
-fetcher's own failure, kept separate so a dropped connection is never reported as a
-full disk.
+`Stopping::write` forwards to `sink` until the flag is set, then returns an
+`io::Error` - which arrives at the caller as `FetchError::Sink`, aborts the run, and
+removes the partial file. `FetchError::Transport` is the other half: the fetcher's own
+failure, kept separate so a dropped connection is never reported as a full disk.
 
-`mimir update` is this wrapper plus an `indicatif` spinner.
+`mimir update` is an `indicatif` bar behind an `UpdateObserver`, and no fetcher wrapper
+at all.
 
 Async apps (tokio + async reqwest, a GUI runtime) use `HashStore::update_async` with an
 `AsyncFetch` instead - same loop, same guarantees, awaiting each download. The future
@@ -384,7 +438,10 @@ let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir"));
 
 let report = store.check(&remote)?;
 if !report.is_up_to_date() {
-    println!("{} table(s) behind", report.behind());
+    // `download_bytes` is `None` against a release published before the manifest
+    // recorded sizes; the table count always answers.
+    println!("{} table(s) behind, {:?} bytes", report.behind(), report.download_bytes());
+
     for diff in &report.tables {
         // `game: 2026-07-03 -> 2026-07-10 (outdated)`
         let have = diff.local.as_ref().map_or("-", |local| &local.version);

@@ -130,7 +130,9 @@ merges. The binary is a generated release artifact, rebuilt from them, never the
 of truth.
 
 Tables ship as versioned GitHub release assets (`game-2026-08-14.lhdb`) alongside a
-`manifest.json` naming the active version, sha256, and entry count per table. A machine
+`manifest.json` naming the active version, sha256, entry count, and download size per
+table - the size being what lets an updater quote a run in bytes before it starts. A machine
+
 keeps one shared cache directory - `%LOCALAPPDATA%\LeagueToolkit\hashes` on Windows,
 `$XDG_DATA_HOME/LeagueToolkit/hashes` on Linux, `~/Library/Application Support/…` on
 macOS - so every mimir-backed tool on it reads the same files through the same page

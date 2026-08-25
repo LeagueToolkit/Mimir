@@ -12,10 +12,12 @@ use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 
 use ltk_mimir_cache::{
-    AsyncFetch, FetchError, HashStore, Table, UpdateError, UpdateOptions, UpdateOutcome,
+    AsyncFetch, FetchError, HashStore, PlannedTable, Table, UpdateError, UpdateObserver,
+    UpdateOptions, UpdateOutcome,
 };
 use pollster::block_on;
 use tempfile::tempdir;
@@ -39,11 +41,16 @@ impl AsyncFetch for DirFetch {
 }
 
 /// Compile-time check: the update future is `Send` (given a `Sync` fetcher),
-/// so callers can drive it from multi-threaded executors.
+/// so callers can drive it from multi-threaded executors - including while an
+/// observer is watching, which the future holds across every await.
 #[allow(dead_code)]
 fn update_future_is_send(store: &HashStore, remote: &DirFetch) {
+    struct Silent;
+    impl UpdateObserver for Silent {}
+
     fn assert_send<T: Send>(_: T) {}
     assert_send(store.update_async(remote, UpdateOptions::default()));
+    assert_send(store.update_async(remote, UpdateOptions::default().observed_by(&Silent)));
 }
 
 #[test]
@@ -171,8 +178,9 @@ fn second_run_is_up_to_date() {
     let rerun = completed(block_on(store.update_async(&remote, UpdateOptions::default())).unwrap());
     assert!(rerun.is_up_to_date());
 
-    let forced =
-        completed(block_on(store.update_async(&remote, UpdateOptions { force: true })).unwrap());
+    let forced = completed(
+        block_on(store.update_async(&remote, UpdateOptions::default().forced())).unwrap(),
+    );
     assert_eq!(forced.installed, [Table::Game], "force reinstalls a match");
 }
 
@@ -283,4 +291,57 @@ fn no_tmp_litter(cache: &std::path::Path) -> bool {
         .unwrap()
         .filter_map(|e| e.ok())
         .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+}
+
+/// The async driver reports a run the same way the blocking one does: the plan
+/// first, then bytes, then the table.
+#[test]
+fn an_observer_follows_an_async_run() {
+    #[derive(Default)]
+    struct Counting {
+        planned: AtomicUsize,
+
+        /// The last byte count seen, which must land on the file's size.
+        done: AtomicU64,
+
+        downloaded: AtomicUsize,
+    }
+
+    impl UpdateObserver for Counting {
+        fn planned(&self, tables: &[PlannedTable]) {
+            self.planned.store(tables.len(), Ordering::Relaxed);
+        }
+
+        fn progressed(&self, _table: Table, done: u64, _total: Option<u64>) {
+            self.done.store(done, Ordering::Relaxed);
+        }
+
+        fn downloaded(&self, _table: Table) {
+            self.downloaded.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    let observer = Counting::default();
+    let report = completed(
+        block_on(store.update_async(
+            &DirFetch(release),
+            UpdateOptions::default().observed_by(&observer),
+        ))
+        .unwrap(),
+    );
+
+    assert_eq!(report.installed, [Table::Game]);
+    assert_eq!(observer.planned.load(Ordering::Relaxed), 1);
+    assert_eq!(observer.downloaded.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        observer.done.load(Ordering::Relaxed),
+        fs::metadata(cache.join("game-1.lhdb")).unwrap().len(),
+        "progress ends on the installed file's size"
+    );
 }

@@ -16,6 +16,8 @@
 //! | Resolve one table's hashes | [`HashStore::open_shared`] |
 //! | Ask whether an update is available | [`HashStore::check`] - lock-free, downloads nothing |
 //! | Install the latest release | [`HashStore::update`], or [`HashStore::update_async`] |
+//! | Draw a bar while it installs | [`UpdateObserver`] on [`UpdateOptions`] |
+
 //! | Report what the cache holds | [`HashStore::manifest`] |
 //! | Publish tables built elsewhere | [`HashStore::commit`], then [`HashStore::gc`] |
 //!
@@ -86,13 +88,20 @@
 //! ```
 //!
 //! [`check`](HashStore::check) is that same comparison without the lock and
-//! without the downloads, for a UI showing "3 tables behind" while some other
-//! process is midway through installing them.
+//! without the downloads, for a UI showing "3 tables behind" - or, via
+//! [`download_bytes`](CheckReport::download_bytes), "112 MiB to download" -
+//! while some other process is midway through installing them.
 //!
-//! Implementing [`Fetch`] is how a caller adds progress reporting, cancellation,
-//! or a directory of files in tests - it streams into a sink, so a 38 MiB table
-//! never has to exist in memory. The `ureq` and `reqwest` features ship one
-//! ready-made, over a GitHub release or a mirror.
+//! An [`UpdateObserver`] on [`UpdateOptions`] follows a run as it happens: the
+//! plan, with a size per table, before the first connection, then the bytes as
+//! each table streams in. That is what a progress bar needs and what wrapping a
+//! fetcher cannot supply, since [`fetch_to`](Fetch::fetch_to) is handed one
+//! filename at a time.
+//!
+//! Implementing [`Fetch`] is how a caller adds cancellation, or a directory of
+//! files in tests - it streams into a sink, so a 38 MiB table never has to exist
+//! in memory. The `ureq` and `reqwest` features ship one ready-made, over a
+//! GitHub release or a mirror.
 //!
 //! # Publishing tables built elsewhere
 //!
@@ -170,6 +179,6 @@ pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
 pub use table::{HashUniverse, Table};
 pub use update::{
-    AsyncFetch, CheckReport, Fetch, TableDiff, TableStatus, UnsupportedTable, UpdateOptions,
-    UpdateOutcome, UpdateReport,
+    AsyncFetch, CheckReport, Fetch, PlannedTable, TableDiff, TableStatus, UnsupportedTable,
+    UpdateObserver, UpdateOptions, UpdateOutcome, UpdateReport,
 };

@@ -8,10 +8,13 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use ltk_mimir_cache::{
-    Fetch, FetchError, HashStore, Table, TableStatus, UpdateError, UpdateOptions, UpdateOutcome,
+    Fetch, FetchError, HashStore, PlannedTable, Table, TableStatus, UpdateError, UpdateObserver,
+    UpdateOptions, UpdateOutcome,
 };
+
 use tempfile::tempdir;
 
 mod common;
@@ -104,7 +107,7 @@ fn second_run_is_up_to_date() {
 
     let forced = completed(
         store
-            .update(&remote, UpdateOptions { force: true })
+            .update(&remote, UpdateOptions::default().forced())
             .unwrap(),
     );
     assert_eq!(forced.installed, [Table::Game], "force reinstalls a match");
@@ -325,6 +328,7 @@ fn unknown_remote_table_is_skipped() {
                 sha256: "0".repeat(64),
                 entries: 0,
                 key_width: 8,
+                size_bytes: Some(4096),
                 version: "1".into(),
                 source: None,
                 format_version: ltk_hashdb::FORMAT_VERSION,
@@ -763,4 +767,193 @@ fn a_completed_update_leaves_no_staging_file() {
         "{files:?}"
     );
     assert!(files.iter().any(|name| name == "game-1.lhdb"), "{files:?}");
+}
+
+/// An observer that keeps everything it was told, in order.
+#[derive(Default)]
+struct Recording {
+    plan: Mutex<Option<Vec<PlannedTable>>>,
+
+    progress: Mutex<Vec<(Table, u64, Option<u64>)>>,
+
+    downloaded: Mutex<Vec<Table>>,
+}
+
+impl UpdateObserver for Recording {
+    fn planned(&self, tables: &[PlannedTable]) {
+        *self.plan.lock().unwrap() = Some(tables.to_vec());
+    }
+
+    fn progressed(&self, table: Table, done: u64, total: Option<u64>) {
+        self.progress.lock().unwrap().push((table, done, total));
+    }
+
+    fn downloaded(&self, table: Table) {
+        self.downloaded.lock().unwrap().push(table);
+    }
+}
+
+/// The whole run's shape reaches a consumer before the first byte does, and the
+/// byte counts reach it while the tables stream - neither of which a `Fetch`
+/// wrapper can see, since `fetch_to` is handed one filename at a time.
+#[test]
+fn an_observer_is_told_the_plan_and_then_the_progress() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(
+        &release,
+        "2026-07-10",
+        &[
+            (Table::Game, &[(0x11aa, "assets/foo.bin")]),
+            (Table::Lcu, &[(0x33cc, "plugins/thing.json")]),
+        ],
+    );
+
+    let store = HashStore::at(&cache);
+    let observer = Recording::default();
+    let report = completed(
+        store
+            .update(
+                &DirFetch(release),
+                UpdateOptions::default().observed_by(&observer),
+            )
+            .unwrap(),
+    );
+    assert_eq!(report.installed.len(), 2);
+
+    let plan = observer.plan.lock().unwrap().clone().expect("planned once");
+    assert_eq!(plan.len(), 2, "the whole run, up front: {plan:?}");
+
+    let manifest = store.manifest().unwrap();
+    for planned in &plan {
+        let entry = manifest.entry(planned.table).unwrap();
+        assert_eq!(planned.version, "2026-07-10");
+        assert_eq!(
+            planned.size_bytes,
+            Some(fs::metadata(cache.join(&entry.file)).unwrap().len()),
+            "the size a bar is sized from is the file's real one"
+        );
+    }
+
+    let progress = observer.progress.lock().unwrap().clone();
+    for planned in &plan {
+        let mine: Vec<_> = progress
+            .iter()
+            .filter(|(table, ..)| *table == planned.table)
+            .collect();
+
+        assert_eq!(
+            mine.first().map(|(_, done, _)| *done),
+            Some(0),
+            "announced before its first chunk: {mine:?}"
+        );
+        assert_eq!(
+            mine.last().map(|(_, done, _)| *done),
+            planned.size_bytes,
+            "and ends on the size it promised: {mine:?}"
+        );
+        assert!(
+            mine.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "monotonic: {mine:?}"
+        );
+        assert!(
+            mine.iter()
+                .all(|(_, _, total)| *total == planned.size_bytes),
+            "every report carries the total: {mine:?}"
+        );
+    }
+
+    let downloaded = observer.downloaded.lock().unwrap().clone();
+    assert_eq!(downloaded.len(), 2, "one per table: {downloaded:?}");
+    assert!(
+        report
+            .installed
+            .iter()
+            .all(|table| downloaded.contains(table)),
+        "{downloaded:?}"
+    );
+}
+
+/// An up-to-date run still says so, rather than leaving a bar waiting on
+/// progress that will never come.
+#[test]
+fn an_observer_is_told_when_there_is_nothing_to_do() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(&release, "1", &[(Table::Game, &[(0x1, "a")])]);
+
+    let store = HashStore::at(&cache);
+    store
+        .update(&DirFetch(release.clone()), UpdateOptions::default())
+        .unwrap();
+
+    let observer = Recording::default();
+    completed(
+        store
+            .update(
+                &DirFetch(release),
+                UpdateOptions::default().observed_by(&observer),
+            )
+            .unwrap(),
+    );
+
+    assert_eq!(
+        observer.plan.lock().unwrap().as_deref(),
+        Some(&[][..]),
+        "planned with nothing in it"
+    );
+    assert!(observer.progress.lock().unwrap().is_empty());
+    assert!(observer.downloaded.lock().unwrap().is_empty());
+}
+
+/// `check` can quote a download in bytes, not just in tables - the number a
+/// sync button wants before it commits the user to anything.
+#[test]
+fn check_totals_the_download_in_bytes() {
+    let tmp = tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let cache = tmp.path().join("cache");
+    make_release(
+        &release,
+        "1",
+        &[(Table::Game, &[(0x1, "a")]), (Table::Lcu, &[(0x2, "b")])],
+    );
+
+    let store = HashStore::at(&cache);
+    let report = store.check(&DirFetch(release.clone())).unwrap();
+    let expected: u64 = report
+        .tables
+        .iter()
+        .map(|diff| diff.remote.size_bytes.expect("published with a size"))
+        .sum();
+
+    assert_eq!(report.behind(), 2);
+    assert_eq!(report.download_bytes(), Some(expected));
+
+    store
+        .update(&DirFetch(release.clone()), UpdateOptions::default())
+        .unwrap();
+    assert_eq!(
+        store
+            .check(&DirFetch(release.clone()))
+            .unwrap()
+            .download_bytes(),
+        Some(0),
+        "nothing to fetch is zero bytes, not an unknown amount"
+    );
+
+    // A release published before sizes were recorded: the table count still
+    // answers, the byte total admits that it cannot.
+    edit_release_manifest(&release, |manifest| {
+        for entry in manifest.tables.values_mut() {
+            entry.size_bytes = None;
+        }
+    });
+    let elsewhere = HashStore::at(tmp.path().join("cache-2"));
+    let report = elsewhere.check(&DirFetch(release)).unwrap();
+
+    assert_eq!(report.behind(), 2);
+    assert_eq!(report.download_bytes(), None);
 }

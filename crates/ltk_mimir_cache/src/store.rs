@@ -384,6 +384,8 @@ impl HashStore {
                 fsutil::sha256_file(&dest)?
             };
 
+            let size_bytes = std::fs::metadata(&dest)?.len();
+
             manifest.tables.insert(
                 item.table.id().to_string(),
                 TableEntry {
@@ -391,6 +393,7 @@ impl HashStore {
                     sha256,
                     entries,
                     key_width,
+                    size_bytes: Some(size_bytes),
                     version: item.version.clone(),
                     source: item.source.clone().or_else(|| source.clone()),
                     // We just opened it, and `open` is what enforces the version.

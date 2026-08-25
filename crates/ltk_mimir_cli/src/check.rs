@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use indicatif::HumanBytes;
 use ltk_mimir_cache::{HashStore, ReleaseSource, TableStatus, UreqFetch};
 
 pub struct Options {
@@ -77,7 +78,16 @@ pub fn run(opts: &Options) -> Result<()> {
     if report.is_up_to_date() {
         println!("nothing to download");
     } else {
-        println!("{} table(s) behind - run `mimir update`", report.behind());
+        // A release published before the manifest recorded sizes leaves the
+        // total unknown; the table count is still exact.
+        let size = match report.download_bytes() {
+            Some(bytes) => format!(", {}", HumanBytes(bytes)),
+            None => String::new(),
+        };
+        println!(
+            "{} table(s) behind{size} - run `mimir update`",
+            report.behind()
+        );
     }
 
     Ok(())

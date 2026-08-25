@@ -70,13 +70,17 @@ pub struct Source {
 }
 
 /// The active file for one table plus the metadata a reader/updater needs without
-/// opening it: download checksum, entry count, and key width.
+/// opening it: download checksum, entry count, key width, and download size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableEntry {
     pub file: String,
     pub sha256: String,
     pub entries: u64,
     pub key_width: u8,
+
+    /// The size of `file` in bytes, when the publisher recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
 
     /// The version label this table was published under, e.g. `2026-07-10`.
     ///
@@ -305,6 +309,15 @@ mod tests {
         let manifest = Manifest::from_slice(FROM_THE_FUTURE.as_bytes()).expect("parses");
         assert_eq!(manifest.schema, 99);
         assert_eq!(manifest.entry(Table::Game).unwrap().entries, 3);
+    }
+
+    /// A size-less entry is an old manifest, not a zero-byte table - the two
+    /// must not read the same, since one of them means "fall back to counting
+    /// tables" and the other would mean "this download is free".
+    #[test]
+    fn a_missing_size_reads_as_unknown() {
+        let manifest = Manifest::from_slice(FROM_THE_FUTURE.as_bytes()).expect("parses");
+        assert_eq!(manifest.entry(Table::Game).unwrap().size_bytes, None);
     }
 
     /// Absent means format 1 - the only format that existed before the field.

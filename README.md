@@ -183,8 +183,11 @@ let map = db.load_all();
 
 The crate ships no HTTP client of its own - you hand it a fetcher. `UreqFetch` (feature
 `ureq`) and `ReqwestFetch` (feature `reqwest`, async) cover the common case; both stream
-into the cache rather than buffering a table, and wrapping either one is how you report
-progress or cancel a download (see [docs/CONSUMERS.md](docs/CONSUMERS.md)):
+into the cache rather than buffering a table. Progress is an `UpdateObserver` you hand to
+`UpdateOptions` - it gets the run's whole plan, byte total included, before the first
+connection - and wrapping a fetcher is how you cancel a download in flight (see
+[docs/CONSUMERS.md](docs/CONSUMERS.md)):
+
 
 ```rust
 use ltk_mimir_cache::{HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch};
@@ -228,56 +231,56 @@ straight out of the mapping.
 **`HashDb`** - one `.hashdb` file. Cheap to clone; every clone shares the mapping and the
 frame cache. `Send + Sync`.
 
-| Method | |
-|---|---|
-| `open` · `open_bytes` | mmap a file, or open an in-memory image |
-| `options()` | open-time knobs: `frame_cache_bytes(n)`, `0` disables |
-| `get` | resolve a hash → `Option<PathRef>` |
-| `try_get` | as `get`, but a corrupt arena errors instead of reading as a miss |
-| `get_into` | copy into a reusable `String`; holds no frame afterwards |
-| `contains` | membership, never touches the arena |
-| `get_batch` · `for_each_batch` | bulk resolve, collected or streamed |
-| `iter` · `values` | enumerate in arena order, with keys or without |
-| `prefix` | every entry under a path prefix, by binary search |
-| `load_all` | decode the whole table into an owned map |
-| `hash_path` | hash a string with this table's algorithm and casing |
-| `verify_index` · `verify` | checksum + key order; the same plus a full arena walk |
-| `is_healthy` | sticky flag set by a failed read |
-| `len` · `key_width` · `hash_kind` · `casing` · `is_compressed` · `arena_order_size` | shape |
-| `downgrade` | a `WeakHashDb` for registries that must not pin the table |
+| Method                                                                              |                                                                   |
+| ----------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `open` · `open_bytes`                                                               | mmap a file, or open an in-memory image                           |
+| `options()`                                                                         | open-time knobs: `frame_cache_bytes(n)`, `0` disables             |
+| `get`                                                                               | resolve a hash → `Option<PathRef>`                                |
+| `try_get`                                                                           | as `get`, but a corrupt arena errors instead of reading as a miss |
+| `get_into`                                                                          | copy into a reusable `String`; holds no frame afterwards          |
+| `contains`                                                                          | membership, never touches the arena                               |
+| `get_batch` · `for_each_batch`                                                      | bulk resolve, collected or streamed                               |
+| `iter` · `values`                                                                   | enumerate in arena order, with keys or without                    |
+| `prefix`                                                                            | every entry under a path prefix, by binary search                 |
+| `load_all`                                                                          | decode the whole table into an owned map                          |
+| `hash_path`                                                                         | hash a string with this table's algorithm and casing              |
+| `verify_index` · `verify`                                                           | checksum + key order; the same plus a full arena walk             |
+| `is_healthy`                                                                        | sticky flag set by a failed read                                  |
+| `len` · `key_width` · `hash_kind` · `casing` · `is_compressed` · `arena_order_size` | shape                                                             |
+| `downgrade`                                                                         | a `WeakHashDb` for registries that must not pin the table         |
 
 **`LayeredHashDb`** - an overlay over N ordered bases.
 
-| Method | |
-|---|---|
-| `from_bases` · `push_base` | layer read-only tables, highest priority first |
-| `insert` · `insert_path` · `extend` | write to the overlay, shadowing every base |
-| `get` · `contains` · `get_into` | overlay first, then each base in order |
-| `get_batch` · `for_each_batch` | staged bulk resolve; each base sees only the residual |
-| `iter` · `prefix` | every entry, or those under a prefix; each shadowed key yielded once by the layer that answers it |
-| `bases` · `overlay_len` · `base_len` · `is_healthy` | shape |
+| Method                                              |                                                                                                   |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `from_bases` · `push_base`                          | layer read-only tables, highest priority first                                                    |
+| `insert` · `insert_path` · `extend`                 | write to the overlay, shadowing every base                                                        |
+| `get` · `contains` · `get_into`                     | overlay first, then each base in order                                                            |
+| `get_batch` · `for_each_batch`                      | staged bulk resolve; each base sees only the residual                                             |
+| `iter` · `prefix`                                   | every entry, or those under a prefix; each shadowed key yielded once by the layer that answers it |
+| `bases` · `overlay_len` · `base_len` · `is_healthy` | shape                                                                                             |
 
 **`HashStore`** - the shared cache directory.
 
-| Method | |
-|---|---|
-| `discover` · `at` | resolve the platform cache dir, or point at your own |
-| `open_shared` | open the active version, reusing a handle this store already has |
-| `open` · `open_many` | open a fresh mapping, one table or several |
-| `open_layered` | open several of one universe into a `LayeredHashDb`, reporting per-table errors |
-| `manifest` · `path_for` | what is installed, and where |
-| `check` · `check_async` | what an update *would* do - no download, no lock |
-| `update` · `update_async` | compare → download → verify → install → GC |
-| `commit` · `gc` | publish versions, sweep superseded ones |
-| `try_lock_update` · `lock_update_timeout` · `lock_holder` | take the update lock, wait for it, or ask who has it |
+| Method                                                    |                                                                                 |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `discover` · `at`                                         | resolve the platform cache dir, or point at your own                            |
+| `open_shared`                                             | open the active version, reusing a handle this store already has                |
+| `open` · `open_many`                                      | open a fresh mapping, one table or several                                      |
+| `open_layered`                                            | open several of one universe into a `LayeredHashDb`, reporting per-table errors |
+| `manifest` · `path_for`                                   | what is installed, and where                                                    |
+| `check` · `check_async`                                   | what an update *would* do - no download, no lock                                |
+| `update` · `update_async`                                 | compare → download → verify → install → GC                                      |
+| `commit` · `gc`                                           | publish versions, sweep superseded ones                                         |
+| `try_lock_update` · `lock_update_timeout` · `lock_holder` | take the update lock, wait for it, or ask who has it                            |
 
 **`Table`** - which logical table, and how it hashes.
 
-| Method | |
-|---|---|
-| `ALL` · `id` · `Display` · `FromStr` · serde | the stable spellings (`game`, `binentries`, `rst-xxh3`) |
-| `key_config` · `key_width` · `hash_kind` · `casing` | how this table's keys were produced |
-| `universe` | which hashes it can answer - only same-universe tables may be layered |
+| Method                                              |                                                                       |
+| --------------------------------------------------- | --------------------------------------------------------------------- |
+| `ALL` · `id` · `Display` · `FromStr` · serde        | the stable spellings (`game`, `binentries`, `rst-xxh3`)               |
+| `key_config` · `key_width` · `hash_kind` · `casing` | how this table's keys were produced                                   |
+| `universe`                                          | which hashes it can answer - only same-universe tables may be layered |
 
 **`PathRef`** - a resolved path. `Deref<Target = str>`, plus `as_str`, `is_owned`
 (whether the bytes were copied rather than borrowed), and `into_owned`.
@@ -328,22 +331,22 @@ mimir verify --index-only game.hashdb   # checksum + key order, no arena decode
 
 ## Crates
 
-| Crate | Role |
-|-------|------|
-| `ltk_hashdb` | The `.hashdb` format: `mmap` reader (`HashDb`) + streaming writer |
+| Crate             | Role                                                                               |
+| ----------------- | ---------------------------------------------------------------------------------- |
+| `ltk_hashdb`      | The `.hashdb` format: `mmap` reader (`HashDb`) + streaming writer                  |
 | `ltk_mimir_cache` | Shared cache dir, manifest, versioned publish, update lock, GC, in-process updater |
-| `ltk_mimir_gen` | Hash-discovery ("hunt") engine for still-unknown hashes |
-| `ltk_mimir_cli` | The `mimir` binary |
+| `ltk_mimir_gen`   | Hash-discovery ("hunt") engine for still-unknown hashes                            |
+| `ltk_mimir_cli`   | The `mimir` binary                                                                 |
 
 ## Documentation
 
-| | |
-|---|---|
-| [`docs/DESIGN.md`](docs/DESIGN.md) | Why this exists, how the format works, what it measures |
-| [`docs/FORMAT.md`](docs/FORMAT.md) | Byte-level specification of `.hashdb`, format version 1 |
-| [`docs/CONSUMERS.md`](docs/CONSUMERS.md) | Integration guide: lookup patterns, threading, custom pipelines |
+|                                            |                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------- |
+| [`docs/DESIGN.md`](docs/DESIGN.md)         | Why this exists, how the format works, what it measures          |
+| [`docs/FORMAT.md`](docs/FORMAT.md)         | Byte-level specification of `.hashdb`, format version 1          |
+| [`docs/CONSUMERS.md`](docs/CONSUMERS.md)   | Integration guide: lookup patterns, threading, custom pipelines  |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Frame-size and compression measurements, with reproduction steps |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Planned work, in dependency order |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md)       | Planned work, in dependency order                                |
 
 ## Status
 

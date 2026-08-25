@@ -7,15 +7,16 @@
 //! [`HashStore::update`] in `ltk_mimir_cache`; this module just points its
 //! bundled [`UreqFetch`] at the right release and prints what happened.
 
-use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use ltk_hashdb::FORMAT_VERSION;
 use ltk_mimir_cache::{
-    Fetch, FetchError, HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch,
+    HashStore, PlannedTable, ReleaseSource, Table, UpdateObserver, UpdateOptions, UpdateOutcome,
+    UreqFetch,
 };
 
 pub struct Options {
@@ -43,9 +44,16 @@ pub fn run(opts: &Options) -> Result<()> {
         None => HashStore::discover()?,
     };
 
-    let fetch = Reporting(UreqFetch::new(source));
-    let outcome = store.update(&fetch, UpdateOptions { force: opts.force })?;
-    let report = match outcome {
+    let progress = Progress::default();
+    let mut options = UpdateOptions::default().observed_by(&progress);
+    if opts.force {
+        options = options.forced();
+    }
+
+    let outcome = store.update(&UreqFetch::new(source), options);
+    progress.finish();
+
+    let report = match outcome? {
         UpdateOutcome::Locked => {
             let who = match store.lock_holder()? {
                 Some(holder) => format!("pid {} since {}", holder.pid, holder.since),
@@ -93,63 +101,130 @@ pub fn run(opts: &Options) -> Result<()> {
     Ok(())
 }
 
-/// A fetcher that draws a bar for every table it streams through.
+/// One bar for the whole run, driven by [`UpdateObserver`].
 ///
-/// Progress lives here rather than in the library: `fetch_to` hands the download
-/// to a sink of our choosing, so counting bytes is a wrapper around the sink and
-/// costs the update path nothing.
-struct Reporting<F>(F);
+/// The update tells us the plan before it downloads anything, so the bar has a
+/// length in tables and - as long as the release recorded sizes - a total in
+/// bytes, rather than a spinner per file that only knows how far it has got.
+#[derive(Default)]
+struct Progress {
+    state: Mutex<State>,
+}
 
-impl<F: Fetch> Fetch for Reporting<F> {
-    type Error = F::Error;
+#[derive(Default)]
+struct State {
+    /// Drawn only once there is something to download.
+    bar: Option<ProgressBar>,
 
-    fn fetch_to(
-        &self,
-        filename: &str,
-        sink: &mut (dyn Write + Send),
-    ) -> Result<u64, FetchError<Self::Error>> {
-        // The manifest is a few KB and arrives before anything is worth drawing.
-        if !filename.ends_with(".lhdb") {
-            return self.0.fetch_to(filename, sink);
+    tables: usize,
+
+    installed: usize,
+
+    /// Bytes finished before the table now streaming, so the bar's position is
+    /// run-wide while `progressed` reports per table.
+    base: u64,
+
+    /// Bytes of the current table, kept to fold into `base` when it lands.
+    done: u64,
+}
+
+impl Progress {
+    /// Clear the bar, leaving the lines it printed above it.
+    fn finish(&self) {
+        if let Some(bar) = &self.lock().bar {
+            bar.finish_and_clear();
+        }
+    }
+
+    /// A poisoned progress bar is not worth aborting an update over.
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl UpdateObserver for Progress {
+    fn planned(&self, tables: &[PlannedTable]) {
+        if tables.is_empty() {
+            return;
         }
 
-        // A spinner rather than a bar: the manifest records each table's sha256
-        // and entry count, but not its size, so there is no total to fill.
-        let bar = ProgressBar::new_spinner().with_message(filename.to_owned());
-        bar.set_style(
-            ProgressStyle::with_template("{spinner} {msg}  {bytes} ({bytes_per_sec})")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
+        // `Option` sums to `None` if any table is missing a size - an older
+        // release - which is the cue to count bytes without a total.
+        let total: Option<u64> = tables.iter().map(|table| table.size_bytes).sum();
+        let bar = match total {
+            Some(total) => ProgressBar::new(total).with_style(style(TOTALLED)),
+            None => ProgressBar::new_spinner().with_style(style(COUNTING)),
+        };
         bar.enable_steady_tick(Duration::from_millis(120));
 
-        let mut counting = Counting { sink, bar: &bar };
-        let result = self.0.fetch_to(filename, &mut counting);
-        bar.finish_and_clear();
+        println!(
+            "downloading {} table(s){}",
+            tables.len(),
+            match total {
+                Some(total) => format!(", {}", HumanBytes(total)),
+                None => String::new(),
+            }
+        );
 
-        if let Ok(bytes) = result {
-            println!("downloaded {filename} ({})", indicatif::HumanBytes(bytes));
+        let mut state = self.lock();
+        state.tables = tables.len();
+        state.bar = Some(bar);
+    }
+
+    fn progressed(&self, table: Table, done: u64, _total: Option<u64>) {
+        let mut state = self.lock();
+        state.done = done;
+
+        let position = state.base + done;
+        let message = format!("{table} ({}/{})", state.installed + 1, state.tables);
+        if let Some(bar) = &state.bar {
+            bar.set_position(position);
+            bar.set_message(message);
         }
+    }
 
-        result
+    fn downloaded(&self, table: Table) {
+        let mut state = self.lock();
+        let done = state.done;
+        state.base += done;
+        state.done = 0;
+        state.installed += 1;
+
+        let line = format!("downloaded {table} ({})", HumanBytes(done));
+        match &state.bar {
+            // Through the bar so the line lands above it rather than over it -
+            // except when there is no bar to disturb, which is every redirected
+            // run, where `println` on a hidden bar would print nothing at all.
+            Some(bar) if !bar.is_hidden() => bar.println(line),
+            _ => println!("{line}"),
+        }
     }
 }
 
-/// A sink that forwards to another and tells the bar how far it has got.
-struct Counting<'a> {
-    sink: &'a mut (dyn Write + Send),
+/// The bar when the release recorded every table's size.
+const TOTALLED: &str = "{bar:24} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})  {msg}";
 
-    bar: &'a ProgressBar,
+/// The fallback when it did not: bytes so far, with nothing to fill.
+const COUNTING: &str = "{spinner} {bytes} ({bytes_per_sec})  {msg}";
+
+/// A bar style, falling back to the default rather than failing an update over
+/// a template typo.
+fn style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_bar())
 }
 
-impl Write for Counting<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.sink.write(buf)?;
-        self.bar.inc(n as u64);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.sink.flush()
+    /// `style` swallows a broken template, so nothing else would report one.
+    #[test]
+    fn the_bar_templates_parse() {
+        for template in [TOTALLED, COUNTING] {
+            assert!(
+                ProgressStyle::with_template(template).is_ok(),
+                "{template:?}"
+            );
+        }
     }
 }

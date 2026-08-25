@@ -33,16 +33,22 @@ use crate::{
 /// Any `Fn(&str) -> Result<Vec<u8>, E>` closure whose error type meets the
 /// bounds is a `Fetch` - it just buffers rather than streams.
 ///
-/// Wrapping a fetcher is how progress reporting and cancellation are done: pass
-/// the inner fetcher a sink of your own that counts bytes, and return an error
-/// from it to stop the download where it stands.
+/// Wrapping a fetcher is how a download is stopped early: pass the inner fetcher
+/// a sink of your own and return an error from it to end the transfer where it
+/// stands. Progress needs no wrapper - [`UpdateObserver`] is handed the plan and
+/// the byte counts by [`update`](HashStore::update) itself, which a fetcher
+/// cannot be, since `fetch_to` only ever sees one filename at a time.
 ///
 /// ```
 /// # use std::io::Write;
+/// # use std::sync::atomic::{AtomicBool, Ordering};
 /// # use ltk_mimir_cache::{Fetch, FetchError};
-/// struct Reporting<F>(F);
+/// struct Cancellable<F> {
+///     inner: F,
+///     cancelled: AtomicBool,
+/// }
 ///
-/// impl<F: Fetch> Fetch for Reporting<F> {
+/// impl<F: Fetch> Fetch for Cancellable<F> {
 ///     type Error = F::Error;
 ///
 ///     fn fetch_to(
@@ -50,22 +56,27 @@ use crate::{
 ///         filename: &str,
 ///         sink: &mut (dyn Write + Send),
 ///     ) -> Result<u64, FetchError<Self::Error>> {
-///         let mut counting = Counting { sink, done: 0 };
-///         self.0.fetch_to(filename, &mut counting)
+///         let mut stopping = Stopping {
+///             sink,
+///             cancelled: &self.cancelled,
+///         };
+///         self.inner.fetch_to(filename, &mut stopping)
 ///     }
 /// }
 ///
-/// struct Counting<'a> {
+/// struct Stopping<'a> {
 ///     sink: &'a mut (dyn Write + Send),
-///     done: u64,
+///     cancelled: &'a AtomicBool,
 /// }
 ///
-/// impl Write for Counting<'_> {
+/// impl Write for Stopping<'_> {
 ///     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-///         let n = self.sink.write(buf)?;
-///         self.done += n as u64;
-///         println!("{} bytes", self.done);
-///         Ok(n)
+///         if self.cancelled.load(Ordering::Relaxed) {
+///             // Reaches the caller as `FetchError::Sink`; the partial file goes.
+///             return Err(std::io::Error::other("cancelled"));
+///         }
+///
+///         self.sink.write(buf)
 ///     }
 ///
 ///     fn flush(&mut self) -> std::io::Result<()> {
@@ -211,10 +222,129 @@ where
 }
 
 /// Knobs for [`HashStore::update`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UpdateOptions {
+///
+/// Non-exhaustive: build one from [`default`](UpdateOptions::default) and
+/// narrow it with the setters rather than with a struct literal, so a knob
+/// added later costs callers nothing. The fields stay public to read and to
+/// assign.
+///
+/// ```
+/// # use ltk_mimir_cache::UpdateOptions;
+/// let options = UpdateOptions::default().forced();
+/// assert!(options.force);
+/// ```
+#[derive(Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct UpdateOptions<'a> {
     /// Reinstall every table even when the local copy already matches.
     pub force: bool,
+
+    /// Where to report the run's shape and its progress, if anywhere.
+    pub observer: Option<&'a dyn UpdateObserver>,
+}
+
+impl<'a> UpdateOptions<'a> {
+    /// Reinstall every table, even the ones the cache already matches.
+    #[must_use]
+    pub fn forced(mut self) -> Self {
+        self.force = true;
+        self
+    }
+
+    /// Report the run's shape and its progress to `observer`.
+    #[must_use]
+    pub fn observed_by(mut self, observer: &'a dyn UpdateObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+}
+
+/// Hand-written because an observer is a trait object: naming it says nothing
+/// useful, and requiring `Debug` of every implementor to print it would be a
+/// tax on the wrong side of the API.
+impl std::fmt::Debug for UpdateOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateOptions")
+            .field("force", &self.force)
+            .field("observed", &self.observer.is_some())
+            .finish()
+    }
+}
+
+/// Follows an update run: what it is about to download, and how far it has got.
+///
+/// [`update`](HashStore::update) hands over the whole plan before it opens a
+/// connection, so a progress bar knows its length - and its total in bytes,
+/// where the release recorded sizes - before the first table arrives rather
+/// than after the last one. Wrapping a [`Fetch`] cannot answer either question:
+/// `fetch_to` is handed one filename at a time and never learns how many follow
+/// or how big any of them is.
+///
+/// Every method has a no-op default, so an implementor writes only the ones it
+/// draws. They are called in order, from the thread or task driving the update,
+/// while the single-updater lock is held - so keep them cheap, and do not call
+/// back into the store from one.
+///
+/// ```
+/// use std::sync::Mutex;
+///
+/// use ltk_mimir_cache::{PlannedTable, Table, UpdateObserver};
+///
+/// #[derive(Default)]
+/// struct Bar {
+///     /// Bytes to fetch in the whole run, `None` if the release did not say.
+///     total: Mutex<Option<u64>>,
+/// }
+///
+/// impl UpdateObserver for Bar {
+///     fn planned(&self, tables: &[PlannedTable]) {
+///         // `Option` sums to `None` if any table is missing a size, which is
+///         // the cue to count tables instead of bytes.
+///         *self.total.lock().unwrap() = tables.iter().map(|t| t.size_bytes).sum();
+///     }
+///
+///     fn progressed(&self, table: Table, done: u64, total: Option<u64>) {
+///         match total {
+///             Some(total) => println!("{table}: {done}/{total}"),
+///             None => println!("{table}: {done}"),
+///         }
+///     }
+/// }
+/// ```
+pub trait UpdateObserver: Sync {
+    /// What this run will download, before a byte of it is fetched.
+    ///
+    /// Called once, with an empty slice when the cache is already current -
+    /// which is the cue to dismiss a bar rather than leave it waiting on
+    /// progress that will never come.
+    fn planned(&self, _tables: &[PlannedTable]) {}
+
+    /// How much of one table has been written, out of how much when the release
+    /// recorded a size ([`PlannedTable::size_bytes`]).
+    ///
+    /// Called once at zero bytes as the table starts, then once per chunk the
+    /// transport delivers.
+    fn progressed(&self, _table: Table, _done: u64, _total: Option<u64>) {}
+
+    /// One table finished streaming and matched its checksum.
+    ///
+    /// Downloaded, not yet installed: the manifest flips once, after every
+    /// table in the run is durable.
+    fn downloaded(&self, _table: Table) {}
+}
+
+/// One table an update run is about to download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedTable {
+    /// The table that will be installed.
+    pub table: Table,
+
+    /// The version label it is published under, e.g. `2026-07-10`.
+    pub version: String,
+
+    /// How many bytes the download is, when the release recorded it
+    /// ([`TableEntry::size_bytes`]).
+    pub size_bytes: Option<u64>,
 }
 
 /// What an update run did.
@@ -310,6 +440,24 @@ impl CheckReport {
     pub fn is_up_to_date(&self) -> bool {
         self.behind() == 0
     }
+
+    /// How many bytes an update would download - the "112 MiB" number.
+    ///
+    /// `None` when any table it would install has no
+    /// [`size_bytes`](TableEntry::size_bytes), i.e. against a release published
+    /// before the field existed. A UI draws a byte-exact bar when this answers
+    /// and falls back to [`behind`](CheckReport::behind) when it does not.
+    ///
+    /// This is the plan [`update`](HashStore::update) would make without
+    /// [`force`](UpdateOptions::force); a forced run redownloads every
+    /// supported table.
+    pub fn download_bytes(&self) -> Option<u64> {
+        self.tables
+            .iter()
+            .filter(|diff| diff.status.needs_update())
+            .map(|diff| diff.remote.size_bytes)
+            .sum()
+    }
 }
 
 /// A remote table this build cannot read, and the format version it is in.
@@ -370,6 +518,17 @@ struct PlannedDownload<'a> {
     entry: &'a TableEntry,
 }
 
+impl PlannedDownload<'_> {
+    /// What an observer is told about this download.
+    fn summary(&self) -> PlannedTable {
+        PlannedTable {
+            table: self.table,
+            version: self.version.to_owned(),
+            size_bytes: self.entry.size_bytes,
+        }
+    }
+}
+
 impl HashStore {
     /// Bring the cache up to date with a published release, in-process.
     ///
@@ -387,7 +546,7 @@ impl HashStore {
     pub fn update<F: Fetch + ?Sized>(
         &self,
         remote: &F,
-        options: UpdateOptions,
+        options: UpdateOptions<'_>,
     ) -> Result<UpdateOutcome, UpdateError<F::Error>> {
         let Some(_lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
@@ -396,6 +555,7 @@ impl HashStore {
         let remote_manifest = fetch_manifest(remote)?;
         let mut report = UpdateReport::default();
         let planned = self.plan(&remote_manifest, options, &mut report)?;
+        report_plan(options.observer, &planned);
 
         // Stage a verified download for every planned table; `staged` cleans up
         // on any error.
@@ -404,9 +564,12 @@ impl HashStore {
         for download in &planned {
             let tmp = self.stage_path(download, &mut staged);
             let mut sink = staging_sink(&tmp)?;
-            let sha256 = fetch_into(remote, &download.entry.file, &mut sink)?;
+            let sha256 = fetch_into(remote, download, &mut sink, options.observer)?;
 
             items.push(verified(download, &tmp, sha256)?);
+            if let Some(observer) = options.observer {
+                observer.downloaded(download.table);
+            }
         }
 
         self.finish(items, staged, remote_manifest.last_run.clone(), report)
@@ -429,7 +592,7 @@ impl HashStore {
     pub async fn update_async<F: AsyncFetch + ?Sized>(
         &self,
         remote: &F,
-        options: UpdateOptions,
+        options: UpdateOptions<'_>,
     ) -> Result<UpdateOutcome, UpdateError<F::Error>> {
         let Some(_lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
@@ -437,15 +600,20 @@ impl HashStore {
 
         let remote_manifest = fetch_manifest_async(remote).await?;
         let mut report = UpdateReport::default();
+        let planned = self.plan(&remote_manifest, options, &mut report)?;
+        report_plan(options.observer, &planned);
 
         let mut items = Vec::new();
         let mut staged = Staged(Vec::new());
-        for download in &self.plan(&remote_manifest, options, &mut report)? {
+        for download in &planned {
             let tmp = self.stage_path(download, &mut staged);
             let mut sink = staging_sink(&tmp)?;
-            let sha256 = fetch_into_async(remote, &download.entry.file, &mut sink).await?;
+            let sha256 = fetch_into_async(remote, download, &mut sink, options.observer).await?;
 
             items.push(verified(download, &tmp, sha256)?);
+            if let Some(observer) = options.observer {
+                observer.downloaded(download.table);
+            }
         }
 
         self.finish(items, staged, remote_manifest.last_run.clone(), report)
@@ -545,7 +713,7 @@ impl HashStore {
     fn plan<'a, E>(
         &self,
         remote: &'a Manifest,
-        options: UpdateOptions,
+        options: UpdateOptions<'_>,
         report: &mut UpdateReport,
     ) -> Result<Vec<PlannedDownload<'a>>, UpdateError<E>> {
         let local = self.local_manifest()?;
@@ -711,18 +879,97 @@ fn staging_sink(tmp: &Path) -> std::io::Result<fsutil::HashingWriter<BufWriter<F
     )?)))
 }
 
-/// Stream one asset into `sink` and return its hex sha256.
+/// Tell `observer` what the run will download, building the summary only when
+/// there is someone to hand it to.
+fn report_plan(observer: Option<&dyn UpdateObserver>, planned: &[PlannedDownload<'_>]) {
+    if let Some(observer) = observer {
+        let tables: Vec<PlannedTable> = planned.iter().map(PlannedDownload::summary).collect();
+        observer.planned(&tables);
+    }
+}
+
+/// A sink that forwards to the staging file and tells the observer how far the
+/// download has got.
+///
+/// The counting is ours rather than the transport's, which is what lets a
+/// consumer report progress without wrapping its own fetcher: `fetch_to` is
+/// handed an ordinary `Write` and needs to know nothing about any of this.
+struct Reporting<'a, W> {
+    sink: &'a mut W,
+
+    observer: Option<&'a dyn UpdateObserver>,
+
+    table: Table,
+
+    /// The download's size when the release recorded one, passed on unchanged
+    /// so an observer never has to hold the plan to draw a bar.
+    total: Option<u64>,
+
+    done: u64,
+}
+
+impl<'a, W: Write> Reporting<'a, W> {
+    /// Wrap `sink` on behalf of one planned download.
+    fn new(
+        sink: &'a mut W,
+        download: &PlannedDownload<'_>,
+        observer: Option<&'a dyn UpdateObserver>,
+    ) -> Self {
+        Self {
+            sink,
+            observer,
+            table: download.table,
+            total: download.entry.size_bytes,
+            done: 0,
+        }
+    }
+}
+
+/// Announce a table at zero bytes, so a bar can show it as the one in flight
+/// before its first chunk lands.
+fn report_start(observer: Option<&dyn UpdateObserver>, download: &PlannedDownload<'_>) {
+    if let Some(observer) = observer {
+        observer.progressed(download.table, 0, download.entry.size_bytes);
+    }
+}
+
+impl<W: Write> Write for Reporting<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.sink.write(buf)?;
+        self.done += written as u64;
+        if let Some(observer) = self.observer {
+            observer.progressed(self.table, self.done, self.total);
+        }
+
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+/// Stream one table into `sink`, reporting bytes as they land, and return its
+/// hex sha256.
 fn fetch_into<F: Fetch + ?Sized>(
     remote: &F,
-    filename: &str,
+    download: &PlannedDownload<'_>,
     sink: &mut fsutil::HashingWriter<BufWriter<File>>,
+    observer: Option<&dyn UpdateObserver>,
 ) -> Result<String, UpdateError<F::Error>> {
-    remote
-        .fetch_to(filename, sink)
-        .map_err(|source| UpdateError::Fetch {
-            file: filename.to_string(),
-            source,
-        })?;
+    let filename = &download.entry.file;
+    report_start(observer, download);
+
+    // Scoped so the reborrow ends before `finish` consumes the digest.
+    {
+        let mut reporting = Reporting::new(&mut *sink, download, observer);
+        remote
+            .fetch_to(filename, &mut reporting)
+            .map_err(|source| UpdateError::Fetch {
+                file: filename.clone(),
+                source,
+            })?;
+    }
 
     Ok(sink.finish()?)
 }
@@ -730,16 +977,23 @@ fn fetch_into<F: Fetch + ?Sized>(
 /// Async twin of [`fetch_into`].
 async fn fetch_into_async<F: AsyncFetch + ?Sized>(
     remote: &F,
-    filename: &str,
+    download: &PlannedDownload<'_>,
     sink: &mut fsutil::HashingWriter<BufWriter<File>>,
+    observer: Option<&dyn UpdateObserver>,
 ) -> Result<String, UpdateError<F::Error>> {
-    remote
-        .fetch_to(filename, sink)
-        .await
-        .map_err(|source| UpdateError::Fetch {
-            file: filename.to_string(),
-            source,
-        })?;
+    let filename = &download.entry.file;
+    report_start(observer, download);
+
+    {
+        let mut reporting = Reporting::new(&mut *sink, download, observer);
+        remote
+            .fetch_to(filename, &mut reporting)
+            .await
+            .map_err(|source| UpdateError::Fetch {
+                file: filename.clone(),
+                source,
+            })?;
+    }
 
     Ok(sink.finish()?)
 }

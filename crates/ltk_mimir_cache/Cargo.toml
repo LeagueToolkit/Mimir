@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 ltk_hashdb.workspace = true
 directories.workspace = true

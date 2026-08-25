@@ -121,6 +121,40 @@ for (hash, path) in db.iter() { /* streams in path order, one decompress per fra
 `iter` yields in **arena order** (lexicographic path order, *not* key order), which is
 also the natural order for building tree views or prefix scans.
 
+`values()` is the same walk without reading a key - a name list, an autocomplete
+corpus, a dump:
+
+```rust
+for path in db.values() { /* every path, in path order */ }
+```
+
+### Searching by path prefix
+
+Because the arena is sorted by path, the entries under a directory are one
+contiguous run, and finding it is a binary search rather than a scan:
+
+```rust
+for (hash, path) in db.prefix("assets/characters/ahri/").take(50) {
+    println!("{hash:016x} {path}");
+}
+```
+
+The cost is about `log2(entries)` frames decompressed - single-digit milliseconds
+on the 2.3 M-entry game table, whether the prefix matches 13,000 paths or none.
+The iterator is lazy, so `take(n)` stops the walk instead of filtering a list that
+was already built. An empty prefix is the whole table. `LayeredHashDb::prefix`
+applies the same shadowing rule `iter` does, one binary search per base.
+
+This is the query consumers used to download the CommunityDragon txt list for.
+
+Two caveats. It is only meaningful for a table whose arena is in **path order** -
+the reference writer's layout, and what every published table does, but the format
+permits any layout and the reader cannot check it cheaply. And the first call on a
+table that does not carry the arena-order section pays for a sort (~0.5 s on
+`game`, once per process, shared by every clone); a table built with
+`mimir build --arena-order` reads the order out of the file instead, at ~16 % more
+file. See [BENCHMARKS.md](BENCHMARKS.md).
+
 `load_all()` decodes the whole table into an owned `HashMap<u64, Box<str>>`. This is the
 opt-in "resident mode" for tools that genuinely need map semantics or maximum lookup
 throughput - it forfeits the shared-page-cache benefit and costs the full decompressed
@@ -403,7 +437,8 @@ let report = store.gc()?;
 `open` validates structure only. There are two checks above it:
 
 ```rust
-db.verify_index()?;  // xxh3 checksum over every stored byte, keys strictly ascending
+db.verify_index()?;  // xxh3 checksum over every stored byte, keys strictly ascending,
+                     // and the arena-order section if there is one
 db.verify()?;        // the above, plus every entry in bounds and valid UTF-8
 ```
 

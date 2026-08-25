@@ -1,5 +1,5 @@
-//! The `mimir` CLI. Verbs: build / get / check / update / gen / merge / bundle /
-//! verify / stats.
+//! The `mimir` CLI. Verbs: build / get / ls / check / update / gen / merge /
+//! bundle / verify / stats.
 
 mod bundle;
 mod check;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::builder::TypedValueParser as _;
 use clap::{Parser, Subcommand};
-use ltk_hashdb::{Compression, HashDb, HashDbWriter};
+use ltk_hashdb::{ArenaOrder, Compression, HashDb, HashDbWriter};
 use ltk_mimir_cache::{HashStore, Table};
 use ltk_mimir_gen::guessers::{
     CharacterSkin, CrossReference, ExtensionSwap, NumericRange, PrefixVariants, RegionLocale,
@@ -68,6 +68,36 @@ enum Command {
         /// tables use 19; decompression speed is level-independent.
         #[arg(long, default_value_t = 19, conflicts_with = "raw")]
         level: i32,
+
+        /// Store the arena-order index, so `ls` and full-table walks need no
+        /// sort on first use - at ~16% more file. See docs/BENCHMARKS.md.
+        #[arg(long)]
+        arena_order: bool,
+    },
+
+    /// List the paths under a prefix, from a .hashdb file or the shared cache.
+    Ls {
+        /// Path prefix to list. Empty lists the whole table, in path order.
+        #[arg(default_value = "")]
+        prefix: String,
+
+        /// Look in this .hashdb file directly.
+        #[arg(long, conflicts_with = "table", required_unless_present = "table")]
+        file: Option<PathBuf>,
+
+        /// List from the shared cache's active version of this table instead
+        /// (cache dir: MIMIR_DIR override, else the platform data dir).
+        #[arg(
+            long,
+            conflicts_with = "file",
+            required_unless_present = "file",
+            value_parser = table_parser()
+        )]
+        table: Option<Table>,
+
+        /// Stop after this many paths; 0 lists every match.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
 
     /// Resolve one hash from a .hashdb file or the shared cache.
@@ -248,15 +278,28 @@ fn main() -> Result<()> {
             raw,
             frame_size,
             level,
+            arena_order,
         } => {
             let compression = if raw {
                 Compression::None
             } else {
                 Compression::Zeekstd { frame_size, level }
             };
-            build(input, table, out, compression)
+            let arena_order = if arena_order {
+                ArenaOrder::Stored
+            } else {
+                ArenaOrder::Omitted
+            };
+
+            build(input, table, out, compression, arena_order)
         }
         Command::Get { hash, file, table } => get(&hash, file, table),
+        Command::Ls {
+            prefix,
+            file,
+            table,
+            limit,
+        } => ls(&prefix, file, table, limit),
         Command::Gen {
             known,
             unknown,
@@ -338,8 +381,15 @@ fn read_hash_lines(input: &Path, mut on_entry: impl FnMut(u64, &str, &str)) -> R
     Ok(())
 }
 
-fn build(input: PathBuf, table: Table, out: PathBuf, compression: Compression) -> Result<()> {
-    let mut writer = HashDbWriter::with_key_config(table.key_config(), compression);
+fn build(
+    input: PathBuf,
+    table: Table,
+    out: PathBuf,
+    compression: Compression,
+    arena_order: ArenaOrder,
+) -> Result<()> {
+    let mut writer =
+        HashDbWriter::with_key_config(table.key_config(), compression).arena_order(arena_order);
     read_hash_lines(&input, |hash, _, path| {
         writer.insert(hash, path);
     })?;
@@ -355,6 +405,10 @@ fn build(input: PathBuf, table: Table, out: PathBuf, compression: Compression) -
         stats.arena_compressed_size,
         stats.file_len,
     );
+    if stats.arena_order_size > 0 {
+        println!("  arena order: {} B", stats.arena_order_size);
+    }
+
     Ok(())
 }
 
@@ -514,24 +568,53 @@ fn gen_hashes(
     Ok(())
 }
 
-fn get(hash: &str, file: Option<PathBuf>, table: Option<Table>) -> Result<()> {
-    let hash = parse_hex_hash(hash).with_context(|| format!("bad hex hash {hash:?}"))?;
-
+/// A table named either directly or by its version in the shared cache, plus
+/// what to call it in a message.
+fn open_table(file: Option<PathBuf>, table: Option<Table>) -> Result<(HashDb, String)> {
     // clap guarantees exactly one of `file` / `table` is set.
-    let (db, source) = match (file, table) {
+    match (file, table) {
         (Some(file), _) => {
             let db = HashDb::open(&file).with_context(|| format!("opening {}", file.display()))?;
-            (db, file.display().to_string())
+            Ok((db, file.display().to_string()))
         }
         (None, Some(table)) => {
             let store = HashStore::discover()?;
             let db = store
                 .open(table)
                 .with_context(|| format!("opening {table} from the shared cache"))?;
-            (db, format!("the shared cache ({table})"))
+            Ok((db, format!("the shared cache ({table})")))
         }
         (None, None) => unreachable!("clap requires --file or --table"),
-    };
+    }
+}
+
+fn ls(prefix: &str, file: Option<PathBuf>, table: Option<Table>, limit: usize) -> Result<()> {
+    let (db, source) = open_table(file, table)?;
+    let width = db.key_width().bytes() * 2;
+
+    // `prefix` is lazy, so a limit stops the walk rather than filtering a list
+    // that was already built - which is what makes listing one directory of a
+    // 2.3M-entry table cost the same as listing one of a small one.
+    let mut listed = 0;
+    for (hash, path) in db.prefix(prefix) {
+        println!("{hash:0width$x} {path}");
+        listed += 1;
+        if listed == limit {
+            println!("... (--limit {limit} reached)");
+            return Ok(());
+        }
+    }
+
+    if listed == 0 {
+        bail!("nothing under {prefix:?} in {source}");
+    }
+
+    Ok(())
+}
+
+fn get(hash: &str, file: Option<PathBuf>, table: Option<Table>) -> Result<()> {
+    let hash = parse_hex_hash(hash).with_context(|| format!("bad hex hash {hash:?}"))?;
+    let (db, source) = open_table(file, table)?;
 
     match db.get(hash) {
         Some(path) => {
@@ -581,5 +664,16 @@ fn stats(file: PathBuf) -> Result<()> {
             "raw".to_owned()
         }
     );
+    println!(
+        "arena order: {}",
+        match db.arena_order_size() {
+            Some(bytes) => format!(
+                "{bytes} B stored ({:.1}% of the file)",
+                100.0 * bytes as f64 / file_len as f64
+            ),
+            None => "not stored - the reader sorts for it on first use".to_owned(),
+        }
+    );
+
     Ok(())
 }

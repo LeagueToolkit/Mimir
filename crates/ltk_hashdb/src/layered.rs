@@ -243,6 +243,33 @@ impl LayeredHashDb {
         overlay.chain(bases)
     }
 
+    /// Every entry whose path starts with `prefix`, overlay first and then each
+    /// base in priority order.
+    ///
+    /// [`iter`](Self::iter)'s shadowing rule applied to a search: an entry a
+    /// higher layer answers is yielded once, by that layer. Each base runs its
+    /// own binary search - see [`HashDb::prefix`] - so the cost is per base, not
+    /// per entry. The runs are chained rather than merged, so the result is in
+    /// path order *within* a layer and grouped by layer across them.
+    pub fn prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (u64, PathRef<'a>)> + 'a {
+        let overlay = self
+            .overlay
+            .iter()
+            .filter(move |(_, path)| path.starts_with(prefix))
+            .map(|(&hash, path)| (hash, PathRef::borrowed(path)));
+
+        let bases = self
+            .bases
+            .iter()
+            .enumerate()
+            .flat_map(move |(layer, base)| {
+                base.prefix(prefix)
+                    .filter(move |(hash, _)| !self.shadows(*hash, layer))
+            });
+
+        overlay.chain(bases)
+    }
+
     /// Whether a layer above `layer` already answers `hash`.
     fn shadows(&self, hash: u64, layer: usize) -> bool {
         self.overlay.contains_key(&hash)

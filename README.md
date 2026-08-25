@@ -162,6 +162,18 @@ for (hash, path) in db.iter() {
     println!("{hash:016x} {path}");
 }
 
+// The same walk without reading a key.
+for path in db.values() {
+    println!("{path}");
+}
+
+// The arena is sorted by path, so a directory is one contiguous run and finding it
+// is a binary search - single-digit milliseconds on a 2.3M-entry table. Lazy, so
+// `take` stops the walk rather than filtering a list that was already built.
+for (hash, path) in db.prefix("assets/characters/ahri/").take(50) {
+    println!("{hash:016x} {path}");
+}
+
 // Opt-in resident mode: the whole table as an owned map. Costs the full decompressed
 // size in private memory and forfeits the shared page cache, so reach for it last.
 let map = db.load_all();
@@ -225,11 +237,13 @@ frame cache. `Send + Sync`.
 | `get_into` | copy into a reusable `String`; holds no frame afterwards |
 | `contains` | membership, never touches the arena |
 | `get_batch` · `for_each_batch` | bulk resolve, collected or streamed |
-| `iter` · `load_all` | enumerate in arena order, or decode into an owned map |
+| `iter` · `values` | enumerate in arena order, with keys or without |
+| `prefix` | every entry under a path prefix, by binary search |
+| `load_all` | decode the whole table into an owned map |
 | `hash_path` | hash a string with this table's algorithm and casing |
 | `verify_index` · `verify` | checksum + key order; the same plus a full arena walk |
 | `is_healthy` | sticky flag set by a failed read |
-| `len` · `key_width` · `hash_kind` · `casing` · `is_compressed` | shape |
+| `len` · `key_width` · `hash_kind` · `casing` · `is_compressed` · `arena_order_size` | shape |
 | `downgrade` | a `WeakHashDb` for registries that must not pin the table |
 
 **`LayeredHashDb`** - an overlay over N ordered bases.
@@ -240,7 +254,7 @@ frame cache. `Send + Sync`.
 | `insert` · `insert_path` · `extend` | write to the overlay, shadowing every base |
 | `get` · `contains` · `get_into` | overlay first, then each base in order |
 | `get_batch` · `for_each_batch` | staged bulk resolve; each base sees only the residual |
-| `iter` | every entry, each shadowed key yielded once by the layer that answers it |
+| `iter` · `prefix` | every entry, or those under a prefix; each shadowed key yielded once by the layer that answers it |
 | `bases` · `overlay_len` · `base_len` · `is_healthy` | shape |
 
 **`HashStore`** - the shared cache directory.
@@ -277,6 +291,7 @@ frame cache. `Send + Sync`.
 mimir <COMMAND>
 
 build    Build a .hashdb table from a txt hash list (lines of `<hex-hash> <path>`)
+ls       List the paths under a prefix, from a file or the shared cache
 get      Resolve one hash from a .hashdb file or the shared cache
 check    Say what an update would do, without downloading or locking anything
 update   Download the latest published tables into the shared cache
@@ -290,6 +305,11 @@ stats    Sizes, entry counts, compression ratio of a .hashdb file
 ```sh
 # Build a table from a CDragon txt list
 mimir build --input hashes.game.txt --table game --out game.hashdb
+mimir build --input hashes.game.txt --table game --out game.hashdb --arena-order
+
+# List the paths under a prefix (empty lists the table, in path order)
+mimir ls assets/characters/ahri/ --file game.lhdb
+mimir ls data/ --table game --limit 20
 
 # Resolve a hash, from a file or from the shared cache
 mimir get 0x1234abcd --file game.hashdb

@@ -5,9 +5,10 @@ use std::io::{Seek, Write};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::header::{
-    Header, OffsetWidth, FLAG_ARENA_COMPRESSED, FLAG_CASE_INSENSITIVE, HEADER_SIZE,
+    arena_order_width, ArenaOrderRef, Header, OffsetWidth, FLAG_ARENA_COMPRESSED,
+    FLAG_CASE_INSENSITIVE, HEADER_SIZE,
 };
-use crate::{BuildError, Casing, Compression, HashKind, KeyConfig, KeyWidth};
+use crate::{ArenaOrder, BuildError, Casing, Compression, HashKind, KeyConfig, KeyWidth};
 
 /// Collects `(key, path)` pairs, then [`HashDbWriter::build`] sorts by key, dedups,
 /// assigns arena offsets, and writes the file.
@@ -16,6 +17,7 @@ pub struct HashDbWriter {
     compression: Compression,
     hash_kind: HashKind,
     casing: Casing,
+    arena_order: ArenaOrder,
     entries: Vec<(u64, Box<str>)>,
 }
 
@@ -23,8 +25,14 @@ pub struct HashDbWriter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildStats {
     pub entries: usize,
+
     pub arena_decompressed_size: u64,
+
     pub arena_compressed_size: u64,
+
+    /// Bytes spent on the arena-order section, `0` when it was omitted.
+    pub arena_order_size: u64,
+
     pub file_len: u64,
 }
 
@@ -38,6 +46,7 @@ impl HashDbWriter {
             compression,
             hash_kind: HashKind::Unspecified,
             casing: Casing::Sensitive,
+            arena_order: ArenaOrder::Omitted,
             entries: Vec::new(),
         }
     }
@@ -63,6 +72,17 @@ impl HashDbWriter {
     /// all League tables) or the path as given. Defaults to [`Casing::Sensitive`].
     pub fn casing(mut self, casing: Casing) -> Self {
         self.casing = casing;
+        self
+    }
+
+    /// Write the arena-order section, or leave it out (the default).
+    ///
+    /// The writer already knows the permutation - it is the sort it does to lay
+    /// the arena out - so storing it costs build time nothing and file size
+    /// [`ArenaOrder::Stored`]'s documented share. See that variant for what a
+    /// reader does with it and what it does without it.
+    pub fn arena_order(mut self, arena_order: ArenaOrder) -> Self {
+        self.arena_order = arena_order;
         self
     }
 
@@ -167,6 +187,26 @@ impl HashDbWriter {
             flags |= FLAG_CASE_INSENSITIVE;
         }
 
+        // `by_path` *is* the arena-order permutation - entry indices in the order
+        // their paths sit in the arena - so the section is a repacking of a sort
+        // that already happened, not a second one.
+        let order = match self.arena_order {
+            ArenaOrder::Omitted => None,
+            ArenaOrder::Stored => {
+                let width = arena_order_width(self.entries.len() as u64);
+                let mut packed = Vec::with_capacity(by_path.len() * width + 8);
+                for &i in &by_path {
+                    push_uint(&mut packed, i as u64, width);
+                }
+
+                let mut hasher = Xxh3::new();
+                hasher.update(&packed);
+                packed.extend_from_slice(&hasher.digest().to_le_bytes());
+
+                Some((packed, width))
+            }
+        };
+
         // Section offsets. The offsets section is padded to its own width; that only
         // bites when a u32-key table has an odd entry count and spills to u64 offsets.
         let keys_offset = HEADER_SIZE as u64;
@@ -174,7 +214,11 @@ impl HashDbWriter {
             (keys_offset + keys.len() as u64).next_multiple_of(offset_width.bytes() as u64);
         let pad = (offsets_offset - keys_offset) as usize - keys.len();
         let arena_offset = offsets_offset + offsets.len() as u64 + lengths.len() as u64;
+        let arena_end = arena_offset + stored_arena.len() as u64;
 
+        // The header's checksum stays keys‖offsets‖lengths‖arena, exactly as a
+        // reader built before the arena-order section computes it; the section
+        // carries its own digest instead.
         let mut hasher = Xxh3::new();
         hasher.update(&keys);
         hasher.update(&offsets);
@@ -193,6 +237,10 @@ impl HashDbWriter {
             arena_decompressed_size,
             arena_compressed_size: stored_arena.len() as u64,
             checksum: hasher.digest(),
+            arena_order: order.as_ref().map(|&(_, width)| ArenaOrderRef {
+                offset: arena_end,
+                width,
+            }),
         };
 
         out.write_all(&header.encode())?;
@@ -201,13 +249,21 @@ impl HashDbWriter {
         out.write_all(&offsets)?;
         out.write_all(&lengths)?;
         out.write_all(&stored_arena)?;
+        let arena_order_size = match &order {
+            Some((packed, _)) => {
+                out.write_all(packed)?;
+                packed.len() as u64
+            }
+            None => 0,
+        };
         out.flush()?;
 
         Ok(BuildStats {
             entries: self.entries.len(),
             arena_decompressed_size,
             arena_compressed_size: stored_arena.len() as u64,
-            file_len: arena_offset + stored_arena.len() as u64,
+            arena_order_size,
+            file_len: arena_end + arena_order_size,
         })
     }
 }

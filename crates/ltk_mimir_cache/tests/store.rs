@@ -6,20 +6,40 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ltk_hashdb::{Compression, HashDbWriter, KeyWidth};
+use ltk_hashdb::{Compression, HashDbWriter};
 use ltk_mimir_cache::{
     CommitError, CommitItem, HashStore, HashUniverse, ManifestError, OpenError, Source, Table,
+    UpdateLock,
 };
 use tempfile::tempdir;
 
-/// Build a raw `.lhdb` at `path` from `entries`, returning the path.
+/// Build a raw `.lhdb` at `path` from `entries` with the `game`/`lcu` key
+/// config, returning the path.
 fn build_table(path: &Path, entries: &[(u64, &str)]) -> PathBuf {
-    let mut writer = HashDbWriter::new(KeyWidth::U64, Compression::None);
+    build_table_with(path, Table::Game, entries)
+}
+
+/// Build a raw `.lhdb` at `path` with `table`'s key config.
+fn build_table_with(path: &Path, table: Table, entries: &[(u64, &str)]) -> PathBuf {
+    let mut writer = HashDbWriter::with_key_config(table.key_config(), Compression::None);
     for &(hash, p) in entries {
         writer.insert(hash, p);
     }
     writer.build(File::create(path).unwrap()).unwrap();
     path.to_path_buf()
+}
+
+/// Take the update lock, which `commit` and `gc` require.
+fn lock(store: &HashStore) -> UpdateLock {
+    store.try_lock_update().unwrap().expect("no other updater")
+}
+
+/// A `Source` naming a repo and commit (`Source` is non-exhaustive).
+fn source(repo: Option<String>, commit: Option<String>) -> Source {
+    let mut source = Source::default();
+    source.repo = repo;
+    source.commit = commit;
+    source
 }
 
 const ENTRIES: &[(u64, &str)] = &[
@@ -35,7 +55,11 @@ fn commit_open_roundtrip() {
 
     let src = build_table(&tmp.path().join("game-build.lhdb"), ENTRIES);
     let manifest = store
-        .commit(&[CommitItem::new(Table::Game, "2026-07-08", &src)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "2026-07-08", &src)],
+            None,
+        )
         .unwrap();
 
     // Manifest records the versioned filename + derived metadata.
@@ -64,7 +88,11 @@ fn commit_new_version_supersedes_and_gc_reclaims() {
 
     let v1 = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &v1)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &v1)],
+            None,
+        )
         .unwrap();
     let v1_file = tmp.path().join("game-v1.lhdb");
     assert!(v1_file.exists());
@@ -72,7 +100,11 @@ fn commit_new_version_supersedes_and_gc_reclaims() {
     // A second commit flips the pointer to a new immutable filename.
     let v2 = build_table(&tmp.path().join("g2.lhdb"), ENTRIES);
     let manifest = store
-        .commit(&[CommitItem::new(Table::Game, "v2", &v2)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v2", &v2)],
+            None,
+        )
         .unwrap();
     assert_eq!(manifest.entry(Table::Game).unwrap().file, "game-v2.lhdb");
     // Old version still on disk until GC, new one active.
@@ -80,7 +112,7 @@ fn commit_new_version_supersedes_and_gc_reclaims() {
     assert!(tmp.path().join("game-v2.lhdb").exists());
 
     // GC (no readers hold v1) reclaims the superseded file, keeps the active one.
-    let report = store.gc().unwrap();
+    let report = store.gc(&lock(&store)).unwrap();
     assert!(report.deleted.contains(&v1_file), "v1 should be collected");
     assert!(!v1_file.exists());
     assert!(tmp.path().join("game-v2.lhdb").exists());
@@ -93,7 +125,7 @@ fn commit_new_version_supersedes_and_gc_reclaims() {
 fn gc_without_manifest_is_a_noop() {
     let tmp = tempdir().unwrap();
     let store = HashStore::at(tmp.path());
-    let report = store.gc().unwrap();
+    let report = store.gc(&lock(&store)).unwrap();
     assert!(report.deleted.is_empty());
     assert!(report.retained.is_empty());
 }
@@ -112,7 +144,11 @@ fn open_missing_manifest_and_table_error() {
     // Manifest exists but lacks the requested table.
     let src = build_table(&tmp.path().join("g.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &src)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &src)],
+            None,
+        )
         .unwrap();
     assert!(matches!(
         store.open(Table::Lcu),
@@ -130,6 +166,7 @@ fn open_layered_skips_missing_and_respects_order() {
     let lcu = &[(0xAAAA_u64, "lcu/shared"), (0x2222, "lcu/only")][..];
     store
         .commit(
+            &lock(&store),
             &[
                 CommitItem::new(
                     Table::Game,
@@ -172,6 +209,7 @@ fn open_layered_reports_missing_table_but_stays_usable() {
     // Only Game is committed; Lcu is absent.
     store
         .commit(
+            &lock(&store),
             &[CommitItem::new(
                 Table::Game,
                 "v1",
@@ -230,6 +268,7 @@ fn open_many_pairs_each_table_with_its_result() {
     let store = HashStore::at(tmp.path());
     store
         .commit(
+            &lock(&store),
             &[CommitItem::new(
                 Table::Game,
                 "v1",
@@ -277,9 +316,13 @@ fn invalid_version_is_rejected() {
     let store = HashStore::at(tmp.path());
     let src = build_table(&tmp.path().join("g.lhdb"), ENTRIES);
 
-    for bad in ["", "a/b", "a\\b"] {
+    for bad in ["", "a/b", "a\\b", "x:y", ".hidden", "a b"] {
         assert!(matches!(
-            store.commit(&[CommitItem::new(Table::Game, bad, &src)], None),
+            store.commit(
+                &lock(&store),
+                &[CommitItem::new(Table::Game, bad, &src)],
+                None
+            ),
             Err(CommitError::InvalidVersion(_))
         ));
     }
@@ -294,14 +337,22 @@ fn reused_version_with_different_content_is_rejected() {
 
     let v1 = build_table(&tmp.path().join("a.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &v1)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &v1)],
+            None,
+        )
         .unwrap();
 
     // The same version label with different bytes violates immutability: commit must
     // refuse rather than rename over the existing file (a reader may have it mmap'd).
     let different = build_table(&tmp.path().join("b.lhdb"), &ENTRIES[..2]);
     let err = store
-        .commit(&[CommitItem::new(Table::Game, "v1", &different)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &different)],
+            None,
+        )
         .unwrap_err();
     assert!(
         matches!(
@@ -325,7 +376,11 @@ fn recommit_identical_version_is_idempotent() {
 
     let v1 = build_table(&tmp.path().join("a.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &v1)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &v1)],
+            None,
+        )
         .unwrap();
     let dest = tmp.path().join("game-v1.lhdb");
     let before = std::fs::metadata(&dest).unwrap().modified().unwrap();
@@ -334,7 +389,11 @@ fn recommit_identical_version_is_idempotent() {
     // succeed without rewriting the immutable file, so a reader's mapping is safe.
     let same = build_table(&tmp.path().join("c.lhdb"), ENTRIES);
     let manifest = store
-        .commit(&[CommitItem::new(Table::Game, "v1", &same)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &same)],
+            None,
+        )
         .unwrap();
     assert_eq!(manifest.entry(Table::Game).unwrap().file, "game-v1.lhdb");
     let after = std::fs::metadata(&dest).unwrap().modified().unwrap();
@@ -349,19 +408,23 @@ fn commit_overwrites_the_stale_run_record() {
     let store = HashStore::at(tmp.path());
 
     let src = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);
-    let source = Source {
-        repo: Some("owner/repo".into()),
-        commit: Some("abc123".into()),
-        inputs_sha256: None,
-    };
+    let source = source(Some("owner/repo".into()), Some("abc123".into()));
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &src)], Some(source))
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &src)],
+            Some(source),
+        )
         .unwrap();
     assert!(store.manifest().unwrap().last_run.is_some());
 
     let src2 = build_table(&tmp.path().join("g2.lhdb"), ENTRIES);
     let manifest = store
-        .commit(&[CommitItem::new(Table::Game, "v2", &src2)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v2", &src2)],
+            None,
+        )
         .unwrap();
     assert!(
         manifest.last_run.is_none(),
@@ -377,14 +440,11 @@ fn a_partial_commit_leaves_other_tables_provenance_alone() {
     let store = HashStore::at(tmp.path());
     let src = build_table(&tmp.path().join("t.lhdb"), ENTRIES);
 
-    let from = |commit: &str| Source {
-        repo: Some("owner/repo".into()),
-        commit: Some(commit.into()),
-        inputs_sha256: None,
-    };
+    let from = |commit: &str| source(Some("owner/repo".into()), Some(commit.into()));
 
     store
         .commit(
+            &lock(&store),
             &[
                 CommitItem::new(Table::Game, "v1", &src),
                 CommitItem::new(Table::Lcu, "v1", &src),
@@ -396,6 +456,7 @@ fn a_partial_commit_leaves_other_tables_provenance_alone() {
     // A second run rebuilds only `game`, from a different upstream commit.
     let manifest = store
         .commit(
+            &lock(&store),
             &[CommitItem::new(Table::Game, "v2", &src)],
             Some(from("bbbb")),
         )
@@ -428,19 +489,12 @@ fn an_item_can_override_the_run_wide_source() {
     let store = HashStore::at(tmp.path());
     let src = build_table(&tmp.path().join("t.lhdb"), ENTRIES);
 
-    let run = Source {
-        repo: Some("owner/repo".into()),
-        commit: Some("aaaa".into()),
-        inputs_sha256: None,
-    };
-    let mirror = Source {
-        repo: Some("mirror/repo".into()),
-        commit: Some("bbbb".into()),
-        inputs_sha256: None,
-    };
+    let run = source(Some("owner/repo".into()), Some("aaaa".into()));
+    let mirror = source(Some("mirror/repo".into()), Some("bbbb".into()));
 
     let manifest = store
         .commit(
+            &lock(&store),
             &[
                 CommitItem::new(Table::Game, "v1", &src),
                 CommitItem::new(Table::Lcu, "v1", &src).with_source(mirror),
@@ -473,7 +527,11 @@ fn readers_never_break_during_commit() {
     // Seed an initial version so readers have something to open immediately.
     let seed = build_table(&tmp.path().join("seed.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v0", &seed)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v0", &seed)],
+            None,
+        )
         .unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -502,7 +560,11 @@ fn readers_never_break_during_commit() {
     for i in 1..=40 {
         let src = build_table(&tmp.path().join(format!("pub{i}.lhdb")), ENTRIES);
         store
-            .commit(&[CommitItem::new(Table::Game, format!("v{i}"), &src)], None)
+            .commit(
+                &lock(&store),
+                &[CommitItem::new(Table::Game, format!("v{i}"), &src)],
+                None,
+            )
             .unwrap();
     }
 
@@ -525,7 +587,11 @@ fn gc_handles_mapped_superseded_file() {
 
     let v1 = build_table(&tmp.path().join("g1.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &v1)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &v1)],
+            None,
+        )
         .unwrap();
 
     // Hold a mapping of the v1 file across the commit + GC.
@@ -534,11 +600,15 @@ fn gc_handles_mapped_superseded_file() {
 
     let v2 = build_table(&tmp.path().join("g2.lhdb"), ENTRIES);
     store
-        .commit(&[CommitItem::new(Table::Game, "v2", &v2)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v2", &v2)],
+            None,
+        )
         .unwrap();
 
     let v1_file = tmp.path().join("game-v1.lhdb");
-    let report = store.gc().unwrap();
+    let report = store.gc(&lock(&store)).unwrap();
 
     // Every v1 outcome is one of the two graceful paths, and they agree with the fs.
     let deleted = report.deleted.contains(&v1_file);
@@ -565,7 +635,11 @@ fn open_shared_reuses_handles_until_the_version_changes() {
 
     let one = build_table(&tmp.path().join("game-1.build"), &[(1, "assets/one.bin")]);
     store
-        .commit(&[CommitItem::new(Table::Game, "1", &one)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "1", &one)],
+            None,
+        )
         .unwrap();
 
     let first = store.open_shared(Table::Game).unwrap();
@@ -580,7 +654,11 @@ fn open_shared_reuses_handles_until_the_version_changes() {
         &[(1, "assets/one.bin"), (2, "assets/two.bin")],
     );
     store
-        .commit(&[CommitItem::new(Table::Game, "2", &two)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "2", &two)],
+            None,
+        )
         .unwrap();
 
     let after = store.open_shared(Table::Game).unwrap();
@@ -603,6 +681,7 @@ fn commit_moves_a_staged_file_instead_of_copying_it() {
 
     let manifest = store
         .commit(
+            &lock(&store),
             &[CommitItem::staged(Table::Game, "v1", &staged, &sha256)],
             None,
         )
@@ -634,7 +713,11 @@ fn commit_copies_a_file_it_was_not_handed() {
     build_table(&built, ENTRIES);
 
     store
-        .commit(&[CommitItem::new(Table::Game, "v1", &built)], None)
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &built)],
+            None,
+        )
         .unwrap();
 
     assert!(built.is_file(), "the caller's file is left where it was");
@@ -737,4 +820,73 @@ fn a_bounded_wait_takes_a_lock_that_frees_up() {
     assert!(taken.is_some(), "the wait outlasted the holder");
 
     releaser.join().unwrap();
+}
+
+#[test]
+fn commit_rejects_wrong_key_config() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+
+    // A u32 bin table offered as `game`.
+    let src = build_table_with(&tmp.path().join("b.lhdb"), Table::BinEntries, &[(1, "x")]);
+    let err = store
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &src)],
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CommitError::WrongKeyConfig {
+                table: Table::Game,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(store.manifest().is_err(), "nothing was committed");
+}
+
+#[test]
+fn open_rejects_wrong_key_config_and_bad_filenames() {
+    let tmp = tempdir().unwrap();
+    let store = HashStore::at(tmp.path());
+    let src = build_table(&tmp.path().join("g.lhdb"), ENTRIES);
+    store
+        .commit(
+            &lock(&store),
+            &[CommitItem::new(Table::Game, "v1", &src)],
+            None,
+        )
+        .unwrap();
+
+    // Point the manifest at a u32 table written outside `commit`.
+    build_table_with(
+        &tmp.path().join("game-v9.lhdb"),
+        Table::BinEntries,
+        &[(1, "x")],
+    );
+    let mut manifest = store.manifest().unwrap();
+    manifest.tables.get_mut("game").unwrap().file = "game-v9.lhdb".into();
+    manifest.write_atomic(store.manifest_path()).unwrap();
+    assert!(matches!(
+        store.open(Table::Game),
+        Err(OpenError::WrongKeyConfig {
+            table: Table::Game,
+            ..
+        })
+    ));
+
+    // A filename that is not `game-<version>.lhdb` is refused before any open.
+    manifest.tables.get_mut("game").unwrap().file = "../game-v1.lhdb".into();
+    manifest.write_atomic(store.manifest_path()).unwrap();
+    assert!(matches!(
+        store.path_for(Table::Game),
+        Err(OpenError::InvalidFilename {
+            table: Table::Game,
+            ..
+        })
+    ));
 }

@@ -105,6 +105,11 @@ by CI.
 - A `.hashdb` file is **immutable once published**; updates ship as new versioned files.
 - Files are **untrusted** (downloaded): the header + section bounds are validated on `open`,
   and every read bounds-checks its own extent. `verify()` (checksum + full scan) is opt-in.
+  Frames above `MAX_FRAME_SIZE` are rejected on open, which bounds what one lookup allocates.
+- Published crates (`ltk_hashdb`, `ltk_mimir_cache`) keep public enums and structs with
+  public fields `#[non_exhaustive]` and enable the `missing_docs` and
+  `missing_debug_implementations` lints (CI fails on warnings). Don't expose dependency
+  types like `zeekstd::Error` in their APIs.
 - **A lookup miss must never touch the arena** - it's decided by binary search over the keys.
   There is a `decompressions` counter and a unit test asserting misses don't bump it; keep
   that invariant when changing the reader.

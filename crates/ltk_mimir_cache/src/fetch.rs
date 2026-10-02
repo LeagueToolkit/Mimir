@@ -10,17 +10,37 @@
 //! plumbing the [`Fetch::Error`](crate::Fetch::Error) `Sized` bound would
 //! otherwise force.
 //!
-//! - `ureq` feature → [`UreqFetch`], a blocking [`Fetch`](crate::Fetch).
-//! - `reqwest` feature → [`ReqwestFetch`], an async
+//! - `ureq` feature: [`UreqFetch`], a blocking [`Fetch`](crate::Fetch).
+//! - `reqwest` feature: [`ReqwestFetch`], an async
 //!   [`AsyncFetch`](crate::AsyncFetch).
+//!
+//! Both use a 30 s connect timeout and a 60 s read timeout, so a stalled server
+//! fails the update instead of holding the update lock indefinitely, and both
+//! refuse a file larger than [`DEFAULT_MAX_ASSET_SIZE`] unless configured
+//! otherwise.
 //!
 //! Both fetchers stream into the caller's sink rather than buffering a whole
 //! table, and both are silent by design: per-file progress and cancellation stay
 //! with the caller, who wraps the fetcher and passes a sink of their own (see
 //! [`Fetch`](crate::Fetch)).
 
+use std::time::Duration;
+
 /// Default `User-Agent` for the bundled fetchers, matching the mimir CLI.
 const USER_AGENT: &str = concat!("mimir/", env!("CARGO_PKG_VERSION"));
+
+/// Time allowed to establish a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time allowed between two reads of the response body.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default largest file the bundled fetchers download, in bytes (512 MiB).
+///
+/// Downloads stream to disk, so this bounds the disk space a misbehaving server
+/// or mirror can fill before the sha256 check rejects the file. Published tables
+/// are far smaller.
+pub const DEFAULT_MAX_ASSET_SIZE: u64 = 512 << 20;
 
 /// Where release assets live: a GitHub repo's latest release, or an explicit
 /// base URL (a mirror). Shared by the blocking and async fetchers.
@@ -53,21 +73,41 @@ impl ReleaseSource {
     }
 }
 
+/// Errors from the bundled HTTP fetchers.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HttpFetchError {
-    /// The request never produced an HTTP response (DNS, connect, TLS, or a
-    /// mid-body read failure).
+    /// The request did not complete: DNS, connect, TLS, timeout, or a failure
+    /// while reading the body.
     #[error("fetching {url}")]
     Transport {
+        /// The requested URL.
         url: String,
 
+        /// The HTTP client's error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// The server answered, but with a non-success status.
+    /// The server answered with a non-success status.
     #[error("unexpected HTTP {status} for {url}")]
-    Status { status: u16, url: String },
+    Status {
+        /// The HTTP status code.
+        status: u16,
+
+        /// The requested URL.
+        url: String,
+    },
+
+    /// The file is larger than the fetcher's size limit.
+    #[error("{url} is larger than the {limit}-byte limit")]
+    TooLarge {
+        /// The requested URL.
+        url: String,
+
+        /// The limit, in bytes.
+        limit: u64,
+    },
 }
 
 /// The read buffer both fetchers pump through. Large enough that a 38 MiB table
@@ -79,23 +119,53 @@ const CHUNK: usize = 64 * 1024;
 mod ureq_impl {
     use std::io::{Read, Write};
 
-    use super::{HttpFetchError, ReleaseSource, CHUNK, USER_AGENT};
+    use super::{
+        HttpFetchError, ReleaseSource, CHUNK, CONNECT_TIMEOUT, DEFAULT_MAX_ASSET_SIZE,
+        READ_TIMEOUT, USER_AGENT,
+    };
     use crate::{Fetch, FetchError};
 
-    /// A blocking [`Fetch`] over `ureq`, pulling assets from a [`ReleaseSource`].
+    /// A blocking [`Fetch`] over `ureq`, downloading from a [`ReleaseSource`].
+    ///
+    /// Requires the `ureq` feature.
+    #[derive(Debug)]
     pub struct UreqFetch {
         source: ReleaseSource,
 
         agent: ureq::Agent,
+
+        max_size: u64,
     }
 
     impl UreqFetch {
-        /// A fetcher for `source`, using a fresh agent with the mimir
-        /// `User-Agent`.
+        /// A fetcher for `source` with the mimir `User-Agent`, a 30 s connect
+        /// timeout, and a 60 s read timeout.
         pub fn new(source: ReleaseSource) -> Self {
-            let agent = ureq::AgentBuilder::new().user_agent(USER_AGENT).build();
+            let agent = ureq::AgentBuilder::new()
+                .user_agent(USER_AGENT)
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout_read(READ_TIMEOUT)
+                .build();
 
-            Self { source, agent }
+            Self::with_agent(source, agent)
+        }
+
+        /// A fetcher for `source` that sends requests through `agent`, for
+        /// custom proxies, TLS, or timeouts.
+        pub fn with_agent(source: ReleaseSource, agent: ureq::Agent) -> Self {
+            Self {
+                source,
+                agent,
+                max_size: DEFAULT_MAX_ASSET_SIZE,
+            }
+        }
+
+        /// Set the largest file this fetcher downloads, in bytes. Defaults to
+        /// [`DEFAULT_MAX_ASSET_SIZE`].
+        #[must_use]
+        pub fn max_size(mut self, bytes: u64) -> Self {
+            self.max_size = bytes;
+            self
         }
     }
 
@@ -126,6 +196,16 @@ mod ureq_impl {
                 }
             };
 
+            let declared = response
+                .header("Content-Length")
+                .and_then(|len| len.parse::<u64>().ok());
+            if declared.is_some_and(|len| len > self.max_size) {
+                return Err(FetchError::Transport(HttpFetchError::TooLarge {
+                    url,
+                    limit: self.max_size,
+                }));
+            }
+
             // Hand-rolled rather than `io::copy`, which would fold a mid-body
             // read failure and the caller's sink refusing a chunk into one error.
             let mut reader = response.into_reader();
@@ -142,8 +222,15 @@ mod ureq_impl {
                     return Ok(total);
                 }
 
-                sink.write_all(&buf[..read]).map_err(FetchError::Sink)?;
+                // Content-Length can be absent or wrong, so count while reading.
                 total += read as u64;
+                if total > self.max_size {
+                    return Err(FetchError::Transport(HttpFetchError::TooLarge {
+                        url,
+                        limit: self.max_size,
+                    }));
+                }
+                sink.write_all(&buf[..read]).map_err(FetchError::Sink)?;
             }
         }
     }
@@ -157,24 +244,59 @@ mod reqwest_impl {
     use std::future::Future;
     use std::io::Write;
 
-    use super::{HttpFetchError, ReleaseSource, USER_AGENT};
+    use super::{
+        HttpFetchError, ReleaseSource, CONNECT_TIMEOUT, DEFAULT_MAX_ASSET_SIZE, READ_TIMEOUT,
+        USER_AGENT,
+    };
     use crate::{AsyncFetch, FetchError};
 
+    /// An async [`AsyncFetch`] over `reqwest`, downloading from a
+    /// [`ReleaseSource`].
+    ///
+    /// Requires the `reqwest` feature.
+    #[derive(Debug, Clone)]
     pub struct ReqwestFetch {
         source: ReleaseSource,
 
         client: reqwest::Client,
+
+        max_size: u64,
     }
 
     impl ReqwestFetch {
-        /// A fetcher for `source`, using a client with the mimir `User-Agent`.
-        pub fn new(source: ReleaseSource) -> Self {
+        /// A fetcher for `source` with the mimir `User-Agent`, a 30 s connect
+        /// timeout, and a 60 s read timeout.
+        ///
+        /// # Errors
+        ///
+        /// The `reqwest` error if the client cannot be built, for example when
+        /// the TLS backend fails to initialize.
+        pub fn new(source: ReleaseSource) -> Result<Self, reqwest::Error> {
             let client = reqwest::Client::builder()
                 .user_agent(USER_AGENT)
-                .build()
-                .unwrap_or_default();
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .build()?;
 
-            Self { source, client }
+            Ok(Self::with_client(source, client))
+        }
+
+        /// A fetcher for `source` that sends requests through `client`, for
+        /// custom proxies, TLS, or timeouts.
+        pub fn with_client(source: ReleaseSource, client: reqwest::Client) -> Self {
+            Self {
+                source,
+                client,
+                max_size: DEFAULT_MAX_ASSET_SIZE,
+            }
+        }
+
+        /// Set the largest file this fetcher downloads, in bytes. Defaults to
+        /// [`DEFAULT_MAX_ASSET_SIZE`].
+        #[must_use]
+        pub fn max_size(mut self, bytes: u64) -> Self {
+            self.max_size = bytes;
+            self
         }
     }
 
@@ -189,6 +311,7 @@ mod reqwest_impl {
             // Own what the request needs; only the sink is borrowed.
             let url = self.source.asset_url(filename);
             let client = self.client.clone();
+            let limit = self.max_size;
 
             async move {
                 let transport = |err: reqwest::Error, url: &str| {
@@ -212,15 +335,29 @@ mod reqwest_impl {
                     }));
                 }
 
+                if response.content_length().is_some_and(|len| len > limit) {
+                    return Err(FetchError::Transport(HttpFetchError::TooLarge {
+                        url,
+                        limit,
+                    }));
+                }
+
                 // `chunk` rather than `bytes`, so the body never has to exist in
                 // memory all at once. It also keeps the transport failure and the
-                // sink failure apart.
+                // sink failure apart. Content-Length can be absent or wrong, so
+                // the limit is also checked while reading.
                 let mut total = 0;
                 while let Some(chunk) =
                     response.chunk().await.map_err(|err| transport(err, &url))?
                 {
-                    sink.write_all(&chunk).map_err(FetchError::Sink)?;
                     total += chunk.len() as u64;
+                    if total > limit {
+                        return Err(FetchError::Transport(HttpFetchError::TooLarge {
+                            url,
+                            limit,
+                        }));
+                    }
+                    sink.write_all(&chunk).map_err(FetchError::Sink)?;
                 }
 
                 Ok(total)
@@ -291,7 +428,7 @@ mod tests {
         let payload = b"lhdb-bytes".to_vec();
         let (base, server) = serve(payload.clone(), "/game-1.lhdb".to_string(), 2);
 
-        // Two fetchers → two connections, matching the server's count.
+        // Two fetchers, two connections, matching the server's count.
         // Straight into a caller's sink - no whole-table buffer anywhere.
         let ok = UreqFetch::new(ReleaseSource::base_url(&base));
         let mut sink = Vec::new();
@@ -322,7 +459,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let ok = ReqwestFetch::new(ReleaseSource::base_url(&base));
+            let ok = ReqwestFetch::new(ReleaseSource::base_url(&base)).unwrap();
             let mut sink = Vec::new();
             assert_eq!(
                 ok.fetch_to("game-1.lhdb", &mut sink).await.unwrap(),
@@ -330,10 +467,52 @@ mod tests {
             );
             assert_eq!(sink, payload);
 
-            let missing = ReqwestFetch::new(ReleaseSource::base_url(&base));
+            let missing = ReqwestFetch::new(ReleaseSource::base_url(&base)).unwrap();
             match missing.fetch("nope.lhdb").await {
                 Err(FetchError::Transport(HttpFetchError::Status { status: 404, .. })) => {}
                 other => panic!("expected a 404 status error, got {other:?}"),
+            }
+        });
+
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn ureq_fetch_enforces_max_size() {
+        let (base, server) = serve(vec![7u8; 32], "/game-1.lhdb".to_string(), 2);
+
+        let at_limit = UreqFetch::new(ReleaseSource::base_url(&base)).max_size(32);
+        assert_eq!(at_limit.fetch("game-1.lhdb").unwrap().len(), 32);
+
+        let below = UreqFetch::new(ReleaseSource::base_url(&base)).max_size(16);
+        match below.fetch("game-1.lhdb") {
+            Err(FetchError::Transport(HttpFetchError::TooLarge { limit: 16, .. })) => {}
+            other => panic!("expected a too-large error, got {other:?}"),
+        }
+
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn reqwest_fetch_enforces_max_size() {
+        let (base, server) = serve(vec![7u8; 32], "/game-1.lhdb".to_string(), 2);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let source = ReleaseSource::base_url(&base);
+            let at_limit = ReqwestFetch::new(source.clone()).unwrap().max_size(32);
+            assert_eq!(at_limit.fetch("game-1.lhdb").await.unwrap().len(), 32);
+
+            let below = ReqwestFetch::new(source).unwrap().max_size(16);
+            match below.fetch("game-1.lhdb").await {
+                Err(FetchError::Transport(HttpFetchError::TooLarge { limit: 16, .. })) => {}
+                other => panic!("expected a too-large error, got {other:?}"),
             }
         });
 

@@ -21,13 +21,28 @@ use crate::ParseTableError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Table {
+    /// Game WAD paths (`hashes.game.txt`).
     Game,
+
+    /// League client WAD paths (`hashes.lcu.txt`).
     Lcu,
+
+    /// Bin entry names (`hashes.binentries.txt`).
     BinEntries,
+
+    /// Bin class names (`hashes.bintypes.txt`).
     BinTypes,
+
+    /// Bin field names (`hashes.binfields.txt`).
     BinFields,
+
+    /// Bin hash values (`hashes.binhashes.txt`).
     BinHashes,
+
+    /// RST string table keys, XXH64 (`hashes.rst.xxh64.txt`).
     Rst,
+
+    /// RST string table keys, XXH3 (`hashes.rst.xxh3.txt`).
     RstXxh3,
 }
 

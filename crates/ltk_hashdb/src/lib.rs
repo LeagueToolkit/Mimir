@@ -1,12 +1,18 @@
-//! The `.hashdb` binary format: a read-only, mmap-backed table mapping integer
-//! keys to string values (paths, in the League Toolkit case), laid out as:
+//! The `.hashdb` binary format: a read-only table mapping integer keys to
+//! string values (paths, in the League Toolkit case), laid out as:
 //!
 //! - a fixed 80-byte header
 //! - a sorted, binary-searchable array of keys
 //! - per-entry offset and length arrays
 //! - a string arena (raw or zeekstd-seekable), path-ordered so similar paths share frames
 //!
-//! See `docs/FORMAT.md` for the byte-level spec.
+//! See `docs/FORMAT.md` in the repository for the byte-level spec.
+//!
+//! Every opener validates the untrusted header and section bounds, and one
+//! lookup allocates at most a few [`MAX_FRAME_SIZE`] frames whatever the file
+//! claims. [`HashDb::verify`] runs the full checksum pass.
+
+#![warn(missing_docs, missing_debug_implementations)]
 
 mod cache;
 mod error;
@@ -17,13 +23,21 @@ mod path;
 mod reader;
 mod writer;
 
-pub use error::{BuildError, KeyConfigMismatch, OpenError, VerifyError};
+pub use error::{BuildError, CompressionError, KeyConfigMismatch, OpenError, VerifyError};
 pub use hash::{Casing, HashKind, KeyConfig};
 pub use header::{FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use layered::LayeredHashDb;
 pub use path::PathRef;
 pub use reader::{HashDb, HashDbOptions, WeakHashDb, DEFAULT_FRAME_CACHE_BYTES};
 pub use writer::{BuildStats, HashDbWriter};
+
+/// Largest decompressed zeekstd frame, in bytes, that the writer produces and
+/// the reader accepts (1 MiB).
+///
+/// Lookups decompress whole frames, so this bounds what one lookup can allocate
+/// on an untrusted file; the seekable format itself allows frames of up to
+/// 1 GiB. Published tables use 16 KiB frames.
+pub const MAX_FRAME_SIZE: u32 = 1 << 20;
 
 /// Width of the integer keys in a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,16 +69,20 @@ impl std::fmt::Display for KeyWidth {
 }
 
 /// Arena compression strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Compression {
-    /// Raw concatenated arena, borrowed directly from the mmap.
+    /// Raw concatenated arena, read directly from the file's bytes.
     None,
 
     /// Zstandard Seekable Format arena, one frame decompressed per hit.
-    ///
-    /// - `frame_size`: decompressed frame size in bytes
-    /// - `level`: zstd compression level (decompression speed is independent of it)
-    Zeekstd { frame_size: u32, level: i32 },
+    Zeekstd {
+        /// Decompressed frame size in bytes, `1..=`[`MAX_FRAME_SIZE`].
+        frame_size: u32,
+
+        /// zstd compression level. Decompression speed does not depend on it.
+        level: i32,
+    },
 }
 
 /// Whether a table carries the arena-order index in the file.
@@ -83,7 +101,8 @@ pub enum Compression {
 /// [`HashDb::prefix`]: crate::HashDb::prefix
 /// [`HashDb::iter`]: crate::HashDb::iter
 /// [`HashDb::verify`]: crate::HashDb::verify
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum ArenaOrder {
     /// Leave it out; the reader rebuilds it the first time it is needed.
     ///
@@ -105,7 +124,7 @@ pub enum ArenaOrder {
 }
 
 impl Default for Compression {
-    /// Publishing config: 16 KiB frames (the size/latency knee) at level 19.
+    /// The publishing config: 16 KiB frames at level 19 (see `docs/BENCHMARKS.md`).
     fn default() -> Self {
         Self::Zeekstd {
             frame_size: 16 << 10,
@@ -113,3 +132,8 @@ impl Default for Compression {
         }
     }
 }
+
+/// Compiles the README's code blocks as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

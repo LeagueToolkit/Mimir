@@ -68,6 +68,7 @@ pub fn run(opts: &Options) -> Result<()> {
             return Ok(());
         }
         UpdateOutcome::Completed(report) => report,
+        other => anyhow::bail!("unexpected update outcome: {other:?}"),
     };
 
     for id in &report.unknown_tables {

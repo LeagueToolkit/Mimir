@@ -6,19 +6,19 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use ltk_hashdb::{Compression, HashDbWriter, HashKind, KeyWidth};
+use ltk_hashdb::{Compression, HashDbWriter};
 use ltk_mimir_cache::{
     CommitItem, FetchError, HashStore, Manifest, Source, Table, UpdateOutcome, UpdateReport,
 };
 
-/// Build a tiny raw `.lhdb` and return its path.
-fn build_table(dir: &Path, name: &str, entries: &[(u64, &str)]) -> PathBuf {
-    let mut writer = HashDbWriter::new(KeyWidth::U64, Compression::None).hash_kind(HashKind::Xxh64);
+/// Build a tiny raw `.lhdb` with `table`'s key config and return its path.
+fn build_table(dir: &Path, table: Table, entries: &[(u64, &str)]) -> PathBuf {
+    let mut writer = HashDbWriter::with_key_config(table.key_config(), Compression::None);
     for (hash, path) in entries {
         writer.insert(*hash, path);
     }
 
-    let path = dir.join(name);
+    let path = dir.join(format!("{}.lhdb", table.id()));
     writer.build(fs::File::create(&path).unwrap()).unwrap();
     path
 }
@@ -33,16 +33,16 @@ pub fn make_release(dir: &Path, version: &str, tables: &[(Table, &[(u64, &str)])
     let items: Vec<CommitItem> = tables
         .iter()
         .map(|(table, entries)| {
-            let built = build_table(&build, &format!("{}.lhdb", table.id()), entries);
+            let built = build_table(&build, *table, entries);
             CommitItem::new(*table, version, built)
         })
         .collect();
-    let source = Source {
-        repo: Some("test/data".into()),
-        commit: Some("deadbeef".into()),
-        inputs_sha256: None,
-    };
-    HashStore::at(dir).commit(&items, Some(source)).unwrap();
+    let mut source = Source::default();
+    source.repo = Some("test/data".into());
+    source.commit = Some("deadbeef".into());
+    let store = HashStore::at(dir);
+    let lock = store.try_lock_update().unwrap().unwrap();
+    store.commit(&lock, &items, Some(source)).unwrap();
     fs::copy(dir.join("manifest.json"), dir.join(channel_asset())).unwrap();
 
     fs::remove_dir_all(&build).unwrap();
@@ -68,7 +68,7 @@ pub fn edit_release_manifest(dir: &Path, edit: impl FnOnce(&mut Manifest)) {
 pub fn completed(outcome: UpdateOutcome) -> UpdateReport {
     match outcome {
         UpdateOutcome::Completed(report) => report,
-        UpdateOutcome::Locked => panic!("expected a completed run, got Locked"),
+        other => panic!("expected a completed run, got {other:?}"),
     }
 }
 

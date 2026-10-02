@@ -22,6 +22,7 @@ const OLDEST_SCHEMA: u32 = 1;
 /// The `manifest.json` document: schema version, generation timestamp, optional input
 /// provenance, and one [`TableEntry`] per published table keyed by [`Table::id`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Manifest {
     /// The schema the writer used. Informational - see
     /// [`from_slice`](Manifest::from_slice) for what is actually gated.
@@ -37,6 +38,7 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_reader_schema: Option<u32>,
 
+    /// When the manifest was written, as an RFC 3339 UTC timestamp.
     pub generated_at: String,
 
     /// The inputs the most recent commit to this cache drew on.
@@ -48,12 +50,22 @@ pub struct Manifest {
     #[serde(default, alias = "source", skip_serializing_if = "Option::is_none")]
     pub last_run: Option<Source>,
 
+    /// The active file per table, keyed by [`Table::id`]. Ids this build does
+    /// not know are kept as they are.
     #[serde(default)]
     pub tables: BTreeMap<String, TableEntry>,
 }
 
-/// Provenance of the inputs one table - or one publishing run - was built from.
+/// Provenance of the inputs one table, or one publishing run, was built from.
+///
+/// Build one from [`Source::default`] and set the fields:
+///
+/// ```
+/// let mut source = ltk_mimir_cache::Source::default();
+/// source.repo = Some("CommunityDragon/Data".into());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Source {
     /// Where the txt hash lists came from: a git URL or a GitHub `owner/repo`
     /// (canonically `CommunityDragon/Data`).
@@ -72,10 +84,18 @@ pub struct Source {
 /// The active file for one table plus the metadata a reader/updater needs without
 /// opening it: download checksum, entry count, key width, and download size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TableEntry {
+    /// Filename in the cache directory, `<table>-<version>.lhdb`.
     pub file: String,
+
+    /// sha256 of the file, lowercase hex.
     pub sha256: String,
+
+    /// Number of entries in the table.
     pub entries: u64,
+
+    /// Key width in bytes (4 or 8).
     pub key_width: u8,
 
     /// The size of `file` in bytes, when the publisher recorded it.
@@ -215,7 +235,8 @@ impl Manifest {
     }
 
     /// Read and parse the manifest at `path`.
-    pub fn read(path: &Path) -> Result<Self, ManifestError> {
+    pub fn read(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
+        let path = path.as_ref();
         match std::fs::read(path) {
             Ok(bytes) => Self::from_slice(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -226,7 +247,8 @@ impl Manifest {
     }
 
     /// Serialize (pretty, trailing newline) and atomically swap the manifest at `path`.
-    pub fn write_atomic(&self, path: &Path) -> Result<(), ManifestError> {
+    pub fn write_atomic(&self, path: impl AsRef<Path>) -> Result<(), ManifestError> {
+        let path = path.as_ref();
         let mut json = serde_json::to_vec_pretty(self)?;
         json.push(b'\n');
         fsutil::atomic_write(path, &json)?;

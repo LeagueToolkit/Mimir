@@ -41,8 +41,13 @@
 
 use crate::{Casing, HashKind, KeyWidth, OpenError};
 
+/// The 8 bytes every `.hashdb` file starts with.
 pub const MAGIC: [u8; 8] = *b"HASHDB\0\0";
+
+/// The format version this build reads and writes.
 pub const FORMAT_VERSION: u16 = 1;
+
+/// Size of the fixed file header, in bytes.
 pub const HEADER_SIZE: usize = 80;
 
 /// Header flag: the arena is a zeekstd seekable stream rather than raw bytes.
@@ -195,6 +200,11 @@ impl Header {
             8 => KeyWidth::U64,
             _ => return Err(OpenError::MalformedHeader("key_width must be 4 or 8")),
         };
+        if key_width == KeyWidth::U32 && hash_kind.is_64_bit() {
+            return Err(OpenError::MalformedHeader(
+                "64-bit hash_kind in a u32-key table",
+            ));
+        }
         let offset_width = match buf[13] {
             4 => OffsetWidth::U32,
             8 => OffsetWidth::U64,

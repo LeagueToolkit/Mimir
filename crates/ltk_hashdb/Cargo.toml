@@ -1,8 +1,12 @@
 [package]
 name = "ltk_hashdb"
-description = "The .hashdb binary format: an mmap-backed read-only integer-keyed string table (reader + streaming writer)"
+description = "The .hashdb binary format: a read-only table mapping integer hashes to strings, with a reader and a writer"
+readme = "README.md"
+keywords = ["league-of-legends", "hash", "lookup-table", "mmap", "zstd"]
+categories = ["data-structures", "encoding", "game-development"]
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

@@ -1,14 +1,17 @@
 //! Streaming builder for `.hashdb` files.
 
-use std::io::{Seek, Write};
+use std::io::Write;
 
 use xxhash_rust::xxh3::Xxh3;
 
+use crate::error::ZeekstdResultExt;
 use crate::header::{
     arena_order_width, ArenaOrderRef, Header, OffsetWidth, FLAG_ARENA_COMPRESSED,
     FLAG_CASE_INSENSITIVE, HEADER_SIZE,
 };
-use crate::{ArenaOrder, BuildError, Casing, Compression, HashKind, KeyConfig, KeyWidth};
+use crate::{
+    ArenaOrder, BuildError, Casing, Compression, HashKind, KeyConfig, KeyWidth, MAX_FRAME_SIZE,
+};
 
 /// Collects `(key, path)` pairs, then [`HashDbWriter::build`] sorts by key, dedups,
 /// assigns arena offsets, and writes the file.
@@ -21,18 +24,37 @@ pub struct HashDbWriter {
     entries: Vec<(u64, Box<str>)>,
 }
 
+impl std::fmt::Debug for HashDbWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashDbWriter")
+            .field("key_width", &self.key_width)
+            .field("compression", &self.compression)
+            .field("hash_kind", &self.hash_kind)
+            .field("casing", &self.casing)
+            .field("arena_order", &self.arena_order)
+            .field("entries", &self.entries.len())
+            .finish()
+    }
+}
+
 /// Sizes reported by a successful [`HashDbWriter::build`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BuildStats {
+    /// Number of entries written, after duplicates were removed.
     pub entries: usize,
 
+    /// Total length of the stored paths, in bytes.
     pub arena_decompressed_size: u64,
 
+    /// Size of the arena on disk, in bytes. Equal to `arena_decompressed_size`
+    /// for [`Compression::None`].
     pub arena_compressed_size: u64,
 
     /// Bytes spent on the arena-order section, `0` when it was omitted.
     pub arena_order_size: u64,
 
+    /// Size of the whole file, in bytes.
     pub file_len: u64,
 }
 
@@ -62,7 +84,7 @@ impl HashDbWriter {
     }
 
     /// Record the algorithm the keys were hashed with, so readers can hash new
-    /// paths via `HashDb::hash_path`.
+    /// paths with [`HashDb::hash_path`](crate::HashDb::hash_path).
     pub fn hash_kind(mut self, kind: HashKind) -> Self {
         self.hash_kind = kind;
         self
@@ -86,20 +108,45 @@ impl HashDbWriter {
         self
     }
 
+    /// Add one entry.
     pub fn insert(&mut self, key: u64, path: &str) {
         self.entries.push((key, path.into()));
     }
 
+    /// Add several entries.
     pub fn extend<'a>(&mut self, it: impl IntoIterator<Item = (u64, &'a str)>) {
         self.entries
             .extend(it.into_iter().map(|(k, p)| (k, Box::from(p))));
     }
 
-    /// Sort by key, dedup, assign offsets, and write
-    /// header + keys + offsets + lengths + arena.
+    /// Sort by key, remove duplicates, assign offsets, and write the header,
+    /// keys, offsets, lengths, arena, and (optionally) arena-order section to
+    /// `out`. The whole file is assembled in memory before anything is written.
     ///
-    /// A key mapped to two different paths is a [`BuildError::DuplicateKey`].
-    pub fn build<W: Write + Seek>(mut self, mut out: W) -> Result<BuildStats, BuildError> {
+    /// # Errors
+    ///
+    /// - [`BuildError::DuplicateKey`] if a key was inserted with two different paths
+    /// - [`BuildError::KeyOutOfRange`] if a key does not fit a [`KeyWidth::U32`] table
+    /// - [`BuildError::PathTooLong`] if a path exceeds 65535 bytes
+    /// - [`BuildError::InvalidFrameSize`] if the zeekstd frame size is outside
+    ///   `1..=`[`MAX_FRAME_SIZE`]
+    /// - [`BuildError::HashKindTooWide`] if a 64-bit [`HashKind`] is recorded
+    ///   for a [`KeyWidth::U32`] table
+    /// - [`BuildError::Io`] / [`BuildError::Compression`] if writing or
+    ///   compressing fails
+    pub fn build<W: Write>(mut self, mut out: W) -> Result<BuildStats, BuildError> {
+        if self.key_width == KeyWidth::U32 && self.hash_kind.is_64_bit() {
+            return Err(BuildError::HashKindTooWide {
+                hash_kind: self.hash_kind,
+                key_width: self.key_width,
+            });
+        }
+        if let Compression::Zeekstd { frame_size, .. } = self.compression {
+            if frame_size == 0 || frame_size > MAX_FRAME_SIZE {
+                return Err(BuildError::InvalidFrameSize { frame_size });
+            }
+        }
+
         self.entries.sort_unstable();
         self.entries.dedup();
         if let Some(w) = self.entries.windows(2).find(|w| w[0].0 == w[1].0) {
@@ -170,16 +217,14 @@ impl HashDbWriter {
         let (stored_arena, mut flags) = match self.compression {
             Compression::None => (arena, 0),
             Compression::Zeekstd { frame_size, level } => {
-                if frame_size == 0 {
-                    return Err(BuildError::ZeroFrameSize);
-                }
                 let mut compressed = Vec::new();
                 let mut encoder = zeekstd::EncodeOptions::new()
                     .compression_level(level)
                     .frame_size_policy(zeekstd::FrameSizePolicy::Uncompressed(frame_size))
-                    .into_encoder(&mut compressed)?;
+                    .into_encoder(&mut compressed)
+                    .zeek()?;
                 encoder.write_all(&arena)?;
-                encoder.finish()?;
+                encoder.finish().zeek()?;
                 (compressed, FLAG_ARENA_COMPRESSED)
             }
         };

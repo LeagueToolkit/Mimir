@@ -1,4 +1,4 @@
-//! Read-only, mmap-backed `.hashdb` hash table.
+//! Read-only `.hashdb` hash table over a memory map or an in-memory image.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -14,8 +14,11 @@ use xxhash_rust::xxh3::Xxh3;
 use zeekstd::SeekTable;
 
 use crate::cache::{Frame, FrameCache};
+use crate::error::ZeekstdResultExt;
 use crate::header::{arena_order_width, Header, ARENA_ORDER_CHECKSUM_SIZE};
-use crate::{Casing, HashKind, KeyConfig, KeyWidth, OpenError, PathRef, VerifyError};
+use crate::{
+    Casing, HashKind, KeyConfig, KeyWidth, OpenError, PathRef, VerifyError, MAX_FRAME_SIZE,
+};
 
 /// Decompressed frame bytes a table caches by default: 4 MiB, i.e. 256 frames at the
 /// published 16 KiB frame size.
@@ -47,6 +50,7 @@ impl Default for HashDbOptions {
 }
 
 impl HashDbOptions {
+    /// The default options: a [`DEFAULT_FRAME_CACHE_BYTES`] frame cache.
     pub fn new() -> Self {
         Self::default()
     }
@@ -342,20 +346,20 @@ impl HashDb {
         // frame offsets can be trusted on later reads.
         let seek_table = if header.arena_compressed() {
             let mut cursor = std::io::Cursor::new(&data[arena.clone()]);
-            let st = SeekTable::from_seekable(&mut cursor)?;
+            let st = SeekTable::from_seekable(&mut cursor).zeek()?;
             let total = match st.num_frames() {
                 0 => 0,
-                n => st.frame_end_decomp(n - 1)?,
+                n => st.frame_end_decomp(n - 1).zeek()?,
             };
             if total != header.arena_decompressed_size {
                 return Err(OpenError::Malformed(
                     "seek table decompressed size disagrees with header",
                 ));
             }
-            if st.max_frame_size_decomp() as usize > zeekstd::SEEKABLE_MAX_FRAME_SIZE {
-                return Err(OpenError::Malformed(
-                    "frame exceeds seekable-format maximum",
-                ));
+            // A lookup decompresses whole frames, so this bounds what one lookup
+            // allocates. The seek table is untrusted and may claim up to 1 GiB.
+            if st.max_frame_size_decomp() > u64::from(MAX_FRAME_SIZE) {
+                return Err(OpenError::Malformed("frame exceeds MAX_FRAME_SIZE"));
             }
             Some(st)
         } else {
@@ -530,18 +534,22 @@ impl HashDb {
         }
     }
 
+    /// Number of entries.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    /// Whether the table has no entries.
     pub fn is_empty(&self) -> bool {
         self.inner.header.entry_count == 0
     }
 
+    /// Width of the stored keys.
     pub fn key_width(&self) -> KeyWidth {
         self.inner.header.key_width
     }
 
+    /// The algorithm recorded in the header (may be [`HashKind::Unspecified`]).
     pub fn hash_kind(&self) -> HashKind {
         self.inner.header.hash_kind
     }
@@ -909,7 +917,7 @@ impl Inner {
         let first = seek_table.frame_index_decomp(start);
         let last = seek_table.frame_index_decomp(end - 1);
         let frame = self.frame(first)?;
-        let frame_start = seek_table.frame_start_decomp(first)?;
+        let frame_start = seek_table.frame_start_decomp(first).zeek()?;
         let offset = (start - frame_start) as usize;
 
         if first == last {
@@ -936,7 +944,7 @@ impl Inner {
 
         for index in first + 1..=last {
             let frame = self.frame(index)?;
-            let frame_start = seek_table.frame_start_decomp(index)?;
+            let frame_start = seek_table.frame_start_decomp(index).zeek()?;
             let take = (end - frame_start).min(frame.bytes().len() as u64) as usize;
             let tail = frame.bytes().get(..take).ok_or(VerifyError::Malformed(
                 "frame shorter than the seek table says",
@@ -1069,15 +1077,15 @@ impl Inner {
     fn decompress(&self, index: u32) -> Result<Vec<u8>, VerifyError> {
         let seek_table = self.seek_table.as_ref().expect("compressed arena");
         let arena = &self.backing.bytes()[self.arena.clone()];
-        let start = seek_table.frame_start_comp(index)? as usize;
-        let end = seek_table.frame_end_comp(index)? as usize;
-        let size = seek_table.frame_size_decomp(index)? as usize;
+        let start = seek_table.frame_start_comp(index).zeek()? as usize;
+        let end = seek_table.frame_end_comp(index).zeek()? as usize;
+        let size = seek_table.frame_size_decomp(index).zeek()? as usize;
         let compressed = arena
             .get(start..end)
             .ok_or(VerifyError::Malformed("frame extent out of arena bounds"))?;
 
-        // Cap the capacity hint at the (header-pinned) arena size so a corrupt seek
-        // table can't force a huge allocation.
+        // `size` is at most MAX_FRAME_SIZE (checked on open), so this allocation
+        // stays small whatever the file claims.
         let capacity = size.min(self.header.arena_decompressed_size as usize);
         let mut buffer = self.cache.take_buffer(capacity);
 

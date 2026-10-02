@@ -198,6 +198,7 @@ let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir"));
 match store.update(&remote, UpdateOptions::default())? {
     UpdateOutcome::Completed(report) => println!("installed {:?}", report.installed),
     UpdateOutcome::Locked => println!("another process is already updating"),
+    _ => {}
 }
 ```
 
@@ -271,7 +272,7 @@ frame cache. `Send + Sync`.
 | `manifest` · `path_for`                                   | what is installed, and where                                                    |
 | `check` · `check_async`                                   | what an update *would* do - no download, no lock                                |
 | `update` · `update_async`                                 | compare → download → verify → install → GC                                      |
-| `commit` · `gc`                                           | publish versions, sweep superseded ones                                         |
+| `commit` · `gc`                                           | publish versions, delete superseded ones (both take the update lock)            |
 | `try_lock_update` · `lock_update_timeout` · `lock_holder` | take the update lock, wait for it, or ask who has it                            |
 
 **`Table`** - which logical table, and how it hashes.

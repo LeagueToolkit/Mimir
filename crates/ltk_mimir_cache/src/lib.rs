@@ -81,6 +81,7 @@
 //!             Some(holder) => println!("pid {} has been updating since {}", holder.pid, holder.since),
 //!             None => println!("another process is updating"),
 //!         },
+//!         _ => {} // `UpdateOutcome` is non-exhaustive
 //!     }
 //!
 //!     Ok(())
@@ -108,20 +109,21 @@
 //! [`commit`](HashStore::commit) is the write primitive underneath `update`, and
 //! what a builder calls directly: it installs files under immutable
 //! `<table>-<version>.lhdb` names and flips the manifest last, each step a temp
-//! file, an fsync and a rename. Hold the update lock across it, then
-//! [`gc`](HashStore::gc) to unlink superseded versions nothing still has open:
+//! file, an fsync and a rename. Both it and [`gc`](HashStore::gc), which
+//! deletes superseded versions, take the update lock:
 //!
 //! ```no_run
 //! use ltk_mimir_cache::{CommitItem, HashStore, Table};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let store = HashStore::discover()?;
-//! let Some(_lock) = store.try_lock_update()? else {
+//! let Some(lock) = store.try_lock_update()? else {
 //!     return Ok(()); // someone else is publishing
 //! };
 //!
-//! store.commit(&[CommitItem::new(Table::Game, "2026-08-24", "game.lhdb")], None)?;
-//! println!("swept {} superseded files", store.gc()?.deleted.len());
+//! let items = [CommitItem::new(Table::Game, "2026-08-24", "game.lhdb")];
+//! store.commit(&lock, &items, None)?;
+//! println!("removed {} superseded files", store.gc(&lock)?.deleted.len());
 //! # Ok(())
 //! # }
 //! ```
@@ -153,6 +155,8 @@
 //! - **`reqwest`** - `ReqwestFetch`, an [`AsyncFetch`] for
 //!   [`update_async`](HashStore::update_async).
 
+#![warn(missing_docs, missing_debug_implementations)]
+
 mod dir;
 mod error;
 #[cfg(any(feature = "ureq", feature = "reqwest"))]
@@ -164,6 +168,8 @@ mod store;
 mod table;
 mod update;
 
+pub use ltk_hashdb;
+
 pub use error::{
     CheckError, CommitError, FetchError, GcError, ManifestError, NoCacheDirError, OpenError,
     ParseTableError, UniverseMismatch, UpdateError,
@@ -173,7 +179,7 @@ pub use fetch::ReqwestFetch;
 #[cfg(feature = "ureq")]
 pub use fetch::UreqFetch;
 #[cfg(any(feature = "ureq", feature = "reqwest"))]
-pub use fetch::{HttpFetchError, ReleaseSource};
+pub use fetch::{HttpFetchError, ReleaseSource, DEFAULT_MAX_ASSET_SIZE};
 pub use lock::{LockHolder, UpdateLock};
 pub use manifest::{Manifest, Source, TableEntry, SCHEMA_VERSION};
 pub use store::{CommitItem, GcReport, HashStore};
@@ -182,3 +188,8 @@ pub use update::{
     AsyncFetch, CheckReport, Fetch, PlannedTable, TableDiff, TableStatus, UnsupportedTable,
     UpdateObserver, UpdateOptions, UpdateOutcome, UpdateReport,
 };
+
+/// Compiles the README's code blocks as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

@@ -134,12 +134,15 @@ pub fn run(opts: &Options) -> Result<()> {
         items.push(CommitItem::new(spec.table, &version, path));
     }
 
-    let source = Source {
-        repo: Some(opts.source_repo.clone()),
-        commit: opts.source_commit.clone(),
-        inputs_sha256: Some(inputs_sha256),
-    };
-    let manifest = HashStore::at(&opts.out).commit(&items, Some(source))?;
+    let mut source = Source::default();
+    source.repo = Some(opts.source_repo.clone());
+    source.commit = opts.source_commit.clone();
+    source.inputs_sha256 = Some(inputs_sha256);
+    let store = HashStore::at(&opts.out);
+    let lock = store
+        .try_lock_update()?
+        .with_context(|| format!("{} is locked by another process", opts.out.display()))?;
+    let manifest = store.commit(&lock, &items, Some(source))?;
     fs::remove_dir_all(&build_dir).with_context(|| format!("removing {}", build_dir.display()))?;
 
     // The same document under a format-specific name. A build asks for its own

@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 use ltk_hashdb::{
     ArenaOrder, BuildError, Casing, Compression, HashDb, HashDbWriter, HashKind, KeyWidth,
-    LayeredHashDb, OpenError, VerifyError,
+    LayeredHashDb, OpenError, VerifyError, MAX_FRAME_SIZE,
 };
 
 fn build_with(
@@ -319,16 +319,64 @@ fn compressed_corruption_detected_by_verify() {
 }
 
 #[test]
-fn zero_frame_size_rejected() {
-    let mut w = HashDbWriter::new(
+fn out_of_range_frame_size_rejected() {
+    for frame_size in [0, MAX_FRAME_SIZE + 1] {
+        let mut w = HashDbWriter::new(
+            KeyWidth::U64,
+            Compression::Zeekstd {
+                frame_size,
+                level: 3,
+            },
+        );
+        w.insert(1, "a");
+        let err = w.build(Cursor::new(Vec::new())).unwrap_err();
+        assert!(matches!(err, BuildError::InvalidFrameSize { frame_size: f } if f == frame_size));
+    }
+}
+
+#[test]
+fn wide_hash_kind_in_u32_table_rejected() {
+    let w = HashDbWriter::new(KeyWidth::U32, Compression::None).hash_kind(HashKind::Xxh64);
+    let err = w.build(Cursor::new(Vec::new())).unwrap_err();
+    assert!(matches!(err, BuildError::HashKindTooWide { .. }));
+}
+
+/// A seek table may claim frames of up to 1 GiB while the compressed data is
+/// tiny. `open` must reject frames above `MAX_FRAME_SIZE`, or a single lookup
+/// would allocate the claimed size.
+#[test]
+fn oversized_frame_claim_rejected_on_open() {
+    let mut bytes = build_with(
         KeyWidth::U64,
+        HashKind::Xxh64,
         Compression::Zeekstd {
-            frame_size: 0,
+            frame_size: 64,
             level: 3,
         },
+        GAME_ENTRIES,
     );
-    w.insert(1, "a");
-    assert!(w.build(Cursor::new(Vec::new())).is_err());
+
+    // The seek table footer is the last 9 bytes: frame count (u32), descriptor
+    // (u8), magic (u32). The last entry sits right before it; its second u32 is
+    // the frame's decompressed size.
+    let len = bytes.len();
+    assert_eq!(bytes[len - 4..], 0x8F92_EAB1u32.to_le_bytes());
+    let entry_size = if bytes[len - 5] & 0x80 != 0 { 12 } else { 8 };
+    let d_size_at = len - 9 - entry_size + 4;
+    let old = u32::from_le_bytes(bytes[d_size_at..d_size_at + 4].try_into().unwrap());
+    let claimed = 0x4000_0000u32;
+    bytes[d_size_at..d_size_at + 4].copy_from_slice(&claimed.to_le_bytes());
+
+    // Keep the header's arena size consistent with the seek table, so only the
+    // frame-size check can reject the file.
+    let arena_size = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+    let patched = arena_size - u64::from(old) + u64::from(claimed);
+    bytes[48..56].copy_from_slice(&patched.to_le_bytes());
+
+    assert!(matches!(
+        HashDb::open_bytes(bytes),
+        Err(OpenError::Malformed(_))
+    ));
 }
 
 #[test]

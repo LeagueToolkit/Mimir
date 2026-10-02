@@ -46,6 +46,7 @@ impl fmt::Display for Casing {
 /// recorded separately (see [`Casing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum HashKind {
     /// Not recorded. [`HashKind::hash`] falls back on key width:
     /// u64 → [`HashKind::Xxh64`], u32 → [`HashKind::Fnv1a32`].
@@ -76,10 +77,9 @@ impl HashKind {
     /// Hash `path` with this algorithm under `casing`. `key_width` resolves the
     /// [`HashKind::Unspecified`] fallback.
     ///
-    /// Insensitive hashing is allocation-free for paths up to 512 bytes - every
-    /// path League ships - which lowercase into a stack buffer; longer ones pay
-    /// one allocation. This sits on the hunt engine's hot path, millions of
-    /// candidates per round, where the stack path measures ~2-3× faster.
+    /// Case-insensitive hashing does not allocate for paths up to 512 bytes,
+    /// which covers every path League ships: they are lowercased in a stack
+    /// buffer. Longer paths allocate once.
     pub fn hash(self, path: &str, casing: Casing, key_width: KeyWidth) -> u64 {
         let kind = match self {
             Self::Unspecified => match key_width {
@@ -107,6 +107,12 @@ impl HashKind {
                 kind.hash_bytes(&lowered)
             }
         }
+    }
+
+    /// Whether this algorithm's output needs 64-bit keys, so it cannot key a
+    /// [`KeyWidth::U32`] table.
+    pub(crate) fn is_64_bit(self) -> bool {
+        matches!(self, Self::Xxh64 | Self::Xxh3)
     }
 
     /// `self` must be a concrete algorithm ([`HashKind::Unspecified`] already
@@ -155,14 +161,17 @@ impl KeyConfig {
         }
     }
 
+    /// Width of the keys.
     pub const fn key_width(self) -> KeyWidth {
         self.key_width
     }
 
+    /// The algorithm the keys are hashed with.
     pub const fn hash_kind(self) -> HashKind {
         self.hash_kind
     }
 
+    /// Whether paths are lowercased before hashing.
     pub const fn casing(self) -> Casing {
         self.casing
     }

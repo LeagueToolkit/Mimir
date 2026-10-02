@@ -82,21 +82,37 @@ proptest! {
         let _ = HashDb::open_bytes(bytes);
     }
 
-    /// Random corruption of a valid file: open either errors or yields a db whose
-    /// verify()/get() don't panic.
+    /// Random corruption of a valid file, raw or compressed: open either errors
+    /// or yields a db whose lookups (hits included), verify, and iteration
+    /// don't panic.
     #[test]
     fn corrupted_valid_file_never_panics(
-        entries in prop::collection::btree_map(any::<u64>(), ".{0,20}", 1..16),
+        entries in prop::collection::btree_map(any::<u64>(), ".{0,40}", 1..32),
+        compressed in any::<bool>(),
+        frame_size in 1u32..256,
         flips in prop::collection::vec((any::<prop::sample::Index>(), 1u8..=255), 1..8),
         probe in any::<u64>(),
     ) {
-        let mut bytes = build_bytes(KeyWidth::U64, &entries);
+        let compression = if compressed {
+            Compression::Zeekstd { frame_size, level: 3 }
+        } else {
+            Compression::None
+        };
+        let mut bytes = build_bytes_with(KeyWidth::U64, compression, &entries);
         for (idx, mask) in flips {
             let i = idx.index(bytes.len());
             bytes[i] ^= mask;
         }
         if let Ok(db) = HashDb::open_bytes(bytes) {
-            let _ = db.get(probe);
+            // Probe the real keys too: a random key almost always misses and
+            // never reaches the arena.
+            let mut probes: Vec<u64> = entries.keys().copied().collect();
+            probes.push(probe);
+            for &k in &probes {
+                let _ = db.get(k);
+                let _ = db.try_get(k);
+            }
+            let _ = db.get_batch(&probes).count();
             let _ = db.verify();
             let _ = db.iter().count();
         }

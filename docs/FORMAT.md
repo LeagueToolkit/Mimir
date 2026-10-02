@@ -205,11 +205,13 @@ On open, before trusting any offset:
 
 - magic, `version == 1`, `key_width ∈ {4,8}`, `offset_width ∈ {4,8}`,
   known `flags` bits only (`opt_flags` is *not* checked - see above),
-  known `hash_kind`;
+  known `hash_kind`, and no 64-bit `hash_kind` (XXH64, XXH3) with 4-byte keys;
 - for raw arenas, `arena_compressed_size == arena_decompressed_size`;
 - for compressed arenas: the trailing seek table parses, its total decompressed size
-  equals `arena_decompressed_size`, and no frame's decompressed size exceeds the
-  seekable-format maximum (1 GiB);
+  equals `arena_decompressed_size`, and no frame's decompressed size exceeds
+  `MAX_FRAME_SIZE` (1 MiB). A lookup decompresses whole frames, so this bounds what
+  one lookup allocates; the seekable format itself allows frames of up to 1 GiB.
+  Writers must use frame sizes of at most 1 MiB;
 - all section extents in bounds (overflow-checked);
 - if `arena_order_offset != 0`: `arena_order_width` is `1..=8` and wide enough for
   `entry_count`, and the section is in bounds. Its *contents* are not read at open -

@@ -271,11 +271,12 @@ let fetch = |filename: &str| -> Result<Vec<u8>, MyClientError> {
 };
 
 match store.update(&fetch, UpdateOptions::default())? {
-    UpdateOutcome::Locked => {}     // another process is updating; leave it to them
+    UpdateOutcome::Locked => {}     // another process is updating
     UpdateOutcome::Completed(report) => {
         if report.is_up_to_date() { /* nothing changed */ }
         for table in &report.installed { /* log the refresh */ }
     }
+    _ => {}                         // `UpdateOutcome` is non-exhaustive
 }
 ```
 
@@ -391,6 +392,7 @@ let fetch = |filename: &str| {
 match store.update_async(&fetch, UpdateOptions::default()).await? {
     UpdateOutcome::Locked => {}
     UpdateOutcome::Completed(report) => { /* as above */ }
+    _ => {}
 }
 ```
 
@@ -469,8 +471,9 @@ use ltk_mimir_cache::{CommitItem, HashStore, Source, Table};
 
 let store = HashStore::discover()?;
 
-// Become the single updater, or leave it to whoever already is.
-let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
+// Take the update lock, or stop if another process holds it.
+// `commit` and `gc` require it.
+let Some(lock) = store.try_lock_update()? else { return Ok(()) };
 
 // Install atomically: files are copied durable first, the manifest pointer
 // swaps last, so a concurrent reader never sees a half-written table.
@@ -479,14 +482,17 @@ let Some(_lock) = store.try_lock_update()? else { return Ok(()) };
 // `last_run`. Tables the call does not mention keep the provenance they were
 // installed with; pass `CommitItem::with_source` when one table came from
 // somewhere else.
+let mut source = Source::default();   // `Source` is non-exhaustive
+source.repo = Some("CommunityDragon/Data".into());
 store.commit(
+    &lock,
     &[CommitItem::new(Table::Game, "2026-07-10", built_game_path)],
-    Some(Source { repo: Some("CommunityDragon/Data".into()), commit, inputs_sha256 }),
+    Some(source),
 )?;
 
-// Clean up superseded versions. Files still mapped by a reader are skipped
-// (reported in `retained`) and retried on a later run - never an error.
-let report = store.gc()?;
+// Remove superseded versions. Files a reader still has mapped are skipped,
+// listed in `retained`, and retried on a later run.
+let report = store.gc(&lock)?;
 ```
 
 ### Verifying a table

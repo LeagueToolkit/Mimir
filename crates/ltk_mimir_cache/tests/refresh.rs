@@ -321,19 +321,14 @@ fn unknown_remote_table_is_skipped() {
 
     // A future mimir publishes a ninth table this build doesn't know.
     edit_release_manifest(&release, |manifest| {
-        manifest.tables.insert(
-            "shiny-new".into(),
-            ltk_mimir_cache::TableEntry {
-                file: "shiny-new-1.lhdb".into(),
-                sha256: "0".repeat(64),
-                entries: 0,
-                key_width: 8,
-                size_bytes: Some(4096),
-                version: "1".into(),
-                source: None,
-                format_version: ltk_hashdb::FORMAT_VERSION,
-            },
-        );
+        let mut entry = manifest.tables["game"].clone();
+        entry.file = "shiny-new-1.lhdb".into();
+        entry.sha256 = "0".repeat(64);
+        entry.entries = 0;
+        entry.size_bytes = Some(4096);
+        entry.version = "1".into();
+        entry.source = None;
+        manifest.tables.insert("shiny-new".into(), entry);
     });
 
     let store = HashStore::at(&cache);
@@ -495,13 +490,9 @@ fn a_manifest_from_the_future_installs_what_it_can() {
 
     assert_eq!(report.installed, [Table::Game], "the readable table lands");
     assert_eq!(report.unknown_tables, ["shiny-new"]);
-    assert_eq!(
-        report.unsupported_tables,
-        [ltk_mimir_cache::UnsupportedTable {
-            table: Table::Lcu,
-            format_version: 99,
-        }]
-    );
+    assert_eq!(report.unsupported_tables.len(), 1);
+    assert_eq!(report.unsupported_tables[0].table, Table::Lcu);
+    assert_eq!(report.unsupported_tables[0].format_version, 99);
     assert!(
         store.open(Table::Lcu).is_err(),
         "a table this build cannot read is never installed"

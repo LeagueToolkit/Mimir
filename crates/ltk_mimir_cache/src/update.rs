@@ -16,7 +16,7 @@ use crate::manifest::version_of;
 use crate::store::MANIFEST_FILE;
 use crate::{
     fsutil, CheckError, CommitItem, FetchError, GcReport, HashStore, Manifest, ManifestError,
-    Source, Table, TableEntry, UpdateError,
+    Source, Table, TableEntry, UpdateError, UpdateLock,
 };
 
 /// Fetch one release asset by filename (`manifest.json`,
@@ -335,6 +335,7 @@ pub trait UpdateObserver: Sync {
 
 /// One table an update run is about to download.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlannedTable {
     /// The table that will be installed.
     pub table: Table,
@@ -349,6 +350,7 @@ pub struct PlannedTable {
 
 /// What an update run did.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UpdateOutcome {
     /// Another process holds the update lock; nothing was done.
     Locked,
@@ -359,6 +361,7 @@ pub enum UpdateOutcome {
 
 /// What an update would do to one table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TableStatus {
     /// The cache already holds exactly this file.
     Current,
@@ -400,6 +403,7 @@ impl std::fmt::Display for TableStatus {
 
 /// One table as the release publishes it, next to what the cache holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TableDiff {
     /// The table this describes.
     pub table: Table,
@@ -419,6 +423,7 @@ pub struct TableDiff {
 /// Shaped like [`UpdateReport`] on purpose - the same run, described before it
 /// happens rather than after.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CheckReport {
     /// One diff per remote table this build knows, in manifest order.
     pub tables: Vec<TableDiff>,
@@ -462,6 +467,7 @@ impl CheckReport {
 
 /// A remote table this build cannot read, and the format version it is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UnsupportedTable {
     /// The table the release published.
     pub table: Table,
@@ -472,6 +478,7 @@ pub struct UnsupportedTable {
 
 /// What a completed update run installed and cleaned up.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct UpdateReport {
     /// Tables that were downloaded, verified, and installed.
     pub installed: Vec<Table>,
@@ -548,7 +555,7 @@ impl HashStore {
         remote: &F,
         options: UpdateOptions<'_>,
     ) -> Result<UpdateOutcome, UpdateError<F::Error>> {
-        let Some(_lock) = self.try_lock_update()? else {
+        let Some(lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
         };
 
@@ -572,7 +579,13 @@ impl HashStore {
             }
         }
 
-        self.finish(items, staged, remote_manifest.last_run.clone(), report)
+        self.finish(
+            &lock,
+            items,
+            staged,
+            remote_manifest.last_run.clone(),
+            report,
+        )
     }
 
     /// Async twin of [`update`](HashStore::update): the same compare →
@@ -594,7 +607,7 @@ impl HashStore {
         remote: &F,
         options: UpdateOptions<'_>,
     ) -> Result<UpdateOutcome, UpdateError<F::Error>> {
-        let Some(_lock) = self.try_lock_update()? else {
+        let Some(lock) = self.try_lock_update()? else {
             return Ok(UpdateOutcome::Locked);
         };
 
@@ -616,7 +629,13 @@ impl HashStore {
             }
         }
 
-        self.finish(items, staged, remote_manifest.last_run.clone(), report)
+        self.finish(
+            &lock,
+            items,
+            staged,
+            remote_manifest.last_run.clone(),
+            report,
+        )
     }
 
     /// Compare the cache against a published release without changing either.
@@ -771,6 +790,7 @@ impl HashStore {
     /// [`update_async`](HashStore::update_async).
     fn finish<E>(
         &self,
+        lock: &UpdateLock,
         items: Vec<CommitItem>,
         staged: Staged,
         source: Option<Source>,
@@ -778,7 +798,7 @@ impl HashStore {
     ) -> Result<UpdateOutcome, UpdateError<E>> {
         // Install atomically - table files first, manifest pointer last.
         if !items.is_empty() {
-            self.commit(&items, source)?;
+            self.commit(lock, &items, source)?;
             report.installed = items.iter().map(|item| item.table).collect();
         }
 
@@ -786,7 +806,9 @@ impl HashStore {
         // in-flight `.tmp` files.
         drop(staged);
 
-        report.gc = self.gc().unwrap_or_default();
+        // A GC failure does not undo a successful install, so it leaves the
+        // report empty rather than failing the run.
+        report.gc = self.gc(lock).unwrap_or_default();
 
         Ok(UpdateOutcome::Completed(report))
     }

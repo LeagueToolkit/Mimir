@@ -4,6 +4,8 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
+# std `File::try_lock` (the cache's update lock) was stabilized in 1.89.
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/LeagueToolkit/mimir"
 authors = ["Crauzer <0xcrauzer@proton.me>", "League Toolkit contributors"]
@@ -31,7 +33,7 @@ serde_json = "1"
 directories = "5"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 ureq = "2"
 
 # CLI

@@ -16,6 +16,9 @@ git_release_enable = true
 git_tag_name = "{{ package }}-v{{ version }}"
 git_release_name = "{{ package }} v{{ version }}"
 git_release_body = "{{ changelog }}"
+# `releases/latest` is the download URL of the tables, so a crate release must
+# never take it.
+git_release_latest = false
 pr_labels = ["release"]
 
 [[package]]

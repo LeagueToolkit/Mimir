@@ -164,9 +164,9 @@ jobs:
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Same-day re-run (e.g. --force): replace the existing assets in place.
             gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --latest --notes-file notes.md
           else
-            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" \
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --latest \
               --title "Hash tables $version" --notes-file notes.md
           fi
 

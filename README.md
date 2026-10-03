@@ -193,7 +193,7 @@ connection - and wrapping a fetcher is how you cancel a download in flight (see
 use ltk_mimir_cache::{HashStore, ReleaseSource, UpdateOptions, UpdateOutcome, UreqFetch};
 
 let store = HashStore::discover()?;
-let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir"));
+let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir-tables"));
 
 match store.update(&remote, UpdateOptions::default())? {
     UpdateOutcome::Completed(report) => println!("installed {:?}", report.installed),

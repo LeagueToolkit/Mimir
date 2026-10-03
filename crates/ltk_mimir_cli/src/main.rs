@@ -124,7 +124,7 @@ enum Command {
     /// Say what an update would do, without downloading or locking anything.
     Check {
         /// GitHub repository whose latest release ships the tables.
-        #[arg(long, default_value = "LeagueToolkit/mimir")]
+        #[arg(long, default_value = "LeagueToolkit/mimir-tables")]
         repo: String,
 
         /// Base URL serving `manifest.json` and the `.lhdb` assets (a mirror);
@@ -139,7 +139,7 @@ enum Command {
 
     Update {
         /// GitHub repository whose latest release ships the tables.
-        #[arg(long, default_value = "LeagueToolkit/mimir")]
+        #[arg(long, default_value = "LeagueToolkit/mimir-tables")]
         repo: String,
 
         /// Base URL serving `manifest.json` and the `.lhdb` assets (a mirror);

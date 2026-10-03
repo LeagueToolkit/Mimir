@@ -244,8 +244,10 @@ miss stays in your tool - mimir returns `Option`, it never invents a hex string.
 
 ## Getting and updating tables
 
-Tables are published as GitHub release assets: each release carries every table as an
-immutable `<table>-<version>.lhdb` plus the `manifest.json` describing them
+Tables are published as GitHub release assets of
+[LeagueToolkit/mimir-tables](https://github.com/LeagueToolkit/mimir-tables): each release
+carries every table as an immutable `<table>-<version>.lhdb` plus the `manifest.json`
+describing them
 (per-table filename, sha256, entry count, key width, download size, and input
 provenance). `releases/latest/download/manifest.json` is the stable URL for the
 current set.
@@ -265,7 +267,7 @@ use ltk_mimir_cache::{HashStore, UpdateOptions, UpdateOutcome};
 let store = HashStore::discover()?;
 let fetch = |filename: &str| -> Result<Vec<u8>, MyClientError> {
     let url = format!(
-        "https://github.com/LeagueToolkit/mimir/releases/latest/download/{filename}"
+        "https://github.com/LeagueToolkit/mimir-tables/releases/latest/download/{filename}"
     );
     my_http_get(&url)   // reqwest, ureq, curl - your choice; your error type
 };
@@ -381,7 +383,7 @@ cannot borrow the filename, so build owned state before the `async move` block:
 ```rust
 let fetch = |filename: &str| {
     let url = format!(
-        "https://github.com/LeagueToolkit/mimir/releases/latest/download/{filename}"
+        "https://github.com/LeagueToolkit/mimir-tables/releases/latest/download/{filename}"
     );
     async move {
         let response = client.get(&url).send().await?.error_for_status()?;
@@ -436,7 +438,7 @@ while another process is midway through an update.
 use ltk_mimir_cache::{HashStore, ReleaseSource, UreqFetch};
 
 let store = HashStore::discover()?;
-let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir"));
+let remote = UreqFetch::new(ReleaseSource::github("LeagueToolkit/mimir-tables"));
 
 let report = store.check(&remote)?;
 if !report.is_up_to_date() {
